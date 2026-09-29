@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>owctl — OpenWrt control</title>
+<style>
+:root{--bg:#0f1420;--panel:#161d2e;--panel2:#1c2540;--tx:#dbe4f5;--mut:#8b98b8;--acc:#4da3ff;--ok:#39c07f;--warn:#f5b544;--bad:#f4636e;--crit:#ff5470;--line:#26314f}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
+header{display:flex;align-items:center;gap:14px;padding:14px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:17px;margin:0;font-weight:600}
+header h1 span{color:var(--acc)}
+nav{display:flex;gap:4px;margin-left:20px}
+nav button{background:none;border:0;color:var(--mut);padding:8px 12px;cursor:pointer;border-radius:8px;font-size:14px}
+nav button.on{background:var(--panel2);color:var(--tx)}
+main{padding:18px 20px;max-width:1200px;margin:0 auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.card h3{margin:0 0 8px;font-size:15px;display:flex;justify-content:space-between;align-items:center}
+.kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dashed #222c47;font-size:13px}
+.kv span:first-child{color:var(--mut)}
+.badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:600}
+.b-online{background:#123527;color:var(--ok)} .b-offline{background:#3a1520;color:var(--bad)}
+.b-unknown{background:#2a2f42;color:var(--mut)}
+.b-INFO{background:#2a2f42;color:var(--mut)} .b-LOW{background:#123527;color:var(--ok)}
+.b-MEDIUM{background:#3a2f12;color:var(--warn)} .b-HIGH{background:#3a1520;color:var(--bad)}
+.b-CRITICAL{background:#4a1020;color:var(--crit)}
+button.act{background:var(--panel2);color:var(--tx);border:1px solid var(--line);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:13px}
+button.act:hover{border-color:var(--acc)}
+button.pri{background:#1c4d8f;border-color:#2f6fc0}
+input,select{background:#0d1322;border:1px solid var(--line);color:var(--tx);padding:7px 10px;border-radius:8px;font-size:13px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+label{color:var(--mut);font-size:12px;display:block;margin-bottom:3px}
+.fsec{margin-top:10px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid #222c47}
+th{color:var(--mut);font-weight:500}
+.small{color:var(--mut);font-size:12px}
+.finding{border-left:3px solid var(--acc);padding:8px 12px;background:var(--panel2);border-radius:8px;margin:8px 0}
+.finding.MEDIUM{border-color:var(--warn)} .finding.HIGH{border-color:var(--bad)} .finding.CRITICAL{border-color:var(--crit)} .finding.INFO,.finding.LOW{border-color:var(--mut)}
+pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;font-size:12px;max-height:300px}
+.muted{color:var(--mut)}
+.pill{font-size:11px;color:var(--mut)}
+#toast{position:fixed;right:16px;bottom:16px;background:var(--panel2);border:1px solid var(--line);padding:10px 16px;border-radius:10px;display:none;z-index:9}
+</style>
+</head>
+<body>
+<header>
+  <h1>ow<span>ctl</span> <span class="pill">OpenWrt control + threat watch</span></h1>
+  <nav>
+    <button data-tab="devices" class="on">Devices</button>
+    <button data-tab="threats">Threats</button>
+    <button data-tab="sweep">Sweep</button>
+    <button data-tab="alerts">Alerting</button>
+  </nav>
+</header>
+<main>
+  <section id="tab-devices"></section>
+  <section id="tab-threats" style="display:none"></section>
+  <section id="tab-sweep" style="display:none"></section>
+  <section id="tab-alerts" style="display:none"></section>
+</main>
+<div id="toast"></div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let TOKEN=localStorage.getItem('owctl_token')||'';
+async function api(path,opts={}){
+  opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+  if(TOKEN)opts.headers['Authorization']='Bearer '+TOKEN;
+  const r=await fetch('/api'+path,opts);
+  if(r.status===401){const t=prompt('owctl token:');if(t){TOKEN=t;localStorage.setItem('owctl_token',t);return api(path,opts)}throw new Error('unauthorized')}
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(j.detail||j.error||r.status);
+  return j;
+}
+function toast(m,bad){const t=$('#toast');t.textContent=m;t.style.display='block';t.style.borderColor=bad?'var(--bad)':'var(--line)';setTimeout(()=>t.style.display='none',4000)}
+const navBtns=[...document.querySelectorAll('nav button')];
+navBtns.forEach(b=>b.onclick=()=>{
+  navBtns.forEach(x=>x.classList.toggle('on',x===b));
+  for(const t of ['devices','threats','sweep','alerts'])$('#tab-'+t).style.display=(t===b.dataset.tab)?'':'none';
+  render(b.dataset.tab);
+});
+function render(tab){
+  if(tab==='devices')return renderDevices();
+  if(tab==='threats')return renderThreats();
+  if(tab==='sweep')return renderSweep();
+  if(tab==='alerts')return renderAlerts();
+}
+function fmtUptime(s){if(!s&&s!==0)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
+function fmtKB(k){return k>1048576?(k/1048576).toFixed(1)+' GB':(k/1024).toFixed(0)+' MB'}
+
+async function renderDevices(){
+  const devs=await api('/devices');
+  const host=document.getElementById('tab-devices');
+  let html=`<div class="row" style="justify-content:space-between;margin-bottom:12px">
+    <strong>Devices (${devs.length})</strong>
+    <div class="row"><button class="act" onclick="renderDevices()">Refresh</button>
+    <button class="act pri" onclick="promptAdd()">+ Add device</button></div></div>`;
+  if(!devs.length)html+=`<p class="muted">No devices yet. Add one manually, or run a <button class="act" onclick="goSweep()">LAN sweep</button>.</p>`;
+  html+=`<div class="grid">`;
+  for(const d of devs){
+    const badge=`<span class="badge b-${d.status}">${d.status}</span>`;
+    html+=`<div class="card" id="dev-${d.id}">
+      <h3>${esc(d.name)} <span>${badge}<span class="pill"> ${esc(d.host)} · ${esc(d.role||'')} · ${esc(d.access)}</span></span></h3>
+      <div class="kv"><span>Last checked</span><span class="small">${esc(d.last_checked||'never')}</span></div>
+      <div id="devinfo-${d.id}"></div>
+      <div class="row fsec">
+        <button class="act" onclick="testDev(${d.id})">Test</button>
+        ${d.access==='ssh'?'<button class="act" onclick="pushKey('+d.id+')">Push SSH key</button>':''}
+        <button class="act" onclick="chk(${d.id})">Check now</button>
+        <button class="act" onclick="backup(${d.id})">Backup</button>
+        <button class="act" onclick="openUpgrades(${d.id})">Updates</button>
+        <button class="act" onclick="reboot(${d.id})">Reboot</button>
+        <button class="act" onclick="editDev(${d.id})">Edit</button>
+        <button class="act" onclick="delDev(${d.id})">Delete</button>
+      </div>
+    </div>`;
+  }
+  html+=`</div>`;
+  host.innerHTML=html;
+}
+function goSweep(){document.querySelector('nav button[data-tab=sweep]').click()}
+async function chk(id){
+  toast('Checking…');
+  try{
+    const r=await api(`/devices/${id}/check`,{method:'POST'});
+    showDevInfo(id,r.status);
+    toast(`Checked. ${r.findings.length} finding(s).`);
+    setTimeout(renderDevices,1200);
+  }catch(e){toast(String(e),true)}
+}
+function showDevInfo(id,st){
+  const el=document.getElementById('devinfo-'+id);if(!el)return;
+  const rows=[
+    ['Firmware',st.firmware||'—'],['Model',st.model||'—'],
+    ['Uptime',fmtUptime(st.uptime_s)],['Load',(st.load||[]).join(' ')||'—'],
+    ['Memory',st.mem_total_kb?`${fmtKB(st.mem_total_kb-st.mem_free_kb)} / ${fmtKB(st.mem_total_kb)}`:'—'],
+    ['WAN',st.wan_up===false?'DOWN':(st.wan_up===true?'UP':'—')+(st.wan_ip?' ('+st.wan_ip+')':'')],
+    ['Clients',st.clients==null?'—':st.clients],
+    ['FW in/fwd/out',st.fw_in&&`${st.fw_in}/${st.fw_fwd}/${st.fw_out}`||'—'],
+    ['Listeners',(st.listeners||[]).join(', ')||'—'],
+  ];
+  el.innerHTML=rows.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`).join('');
+}
+async function promptAdd(){
+  const name=prompt('Name (e.g. main-router):');if(!name)return;
+  const host=prompt('Host IPv4 (e.g. 192.168.1.1):');if(!host)return;
+  const role=prompt('Role (router / AP / mesh / other):')||'router';
+  const access=prompt('Access: ssh (default) or luci:')||'ssh';
+  let d={name,host,role,access};
+  if(access==='ssh'){
+    d.ssh_port=parseInt(prompt('SSH port:','22'))||22;
+    d.ssh_user=prompt('SSH user:','root')||'root';
+    d.ssh_password=prompt('SSH password (leave empty for key):')||'';
+  }else{d.luci_user=prompt('LuCI user:','root')||'root';d.luci_pass=prompt('LuCI password:')||'';}
+  try{const r=await api('/devices',{method:'POST',body:JSON.stringify(d)});const id=r.id;toast('Added — testing connection…');
+    const t=await api(`/devices/${id}/test`,{method:'POST'});
+    if(t.ok){toast('Connected: '+(t.detail||'ok'))}else{toast('Added, but connect test failed: '+t.detail,true)}
+    renderDevices()}catch(e){toast(String(e),true)}
+}
+async function testDev(id){
+  toast('Testing connection…');
+  try{const t=await api(`/devices/${id}/test`,{method:'POST'});
+    if(t.ok){toast('Connected: '+(t.detail||'ok'))}else{toast('Connect failed: '+t.detail,true)}}
+  catch(e){toast(String(e),true)}
+}
+async function pushKey(id){
+  if(!confirm('Install owctl SSH key on this device? (uses current credentials once)'))return;
+  toast('Pushing key…');
+  try{const r=await api(`/devices/${id}/push-key`,{method:'POST'});
+    if(r.ok){toast('Key installed — key-only auth now works')}else{toast('Key pushed but key-auth test failed: '+(r.detail||''),true)}
+  }catch(e){toast(String(e),true)}
+}
+async function editDev(id){
+  const d=(await api('/devices')).find(x=>x.id===id);if(!d)return;
+  const name=prompt('Name:',d.name);if(name===null)return;
+  const host=prompt('Host:',d.host);
+  const access=prompt('Access (ssh/luci):',d.access);
+  const body={name:name||d.name,host:host||d.host,access:access||d.access,
+    ssh_port:d.ssh_port||22,ssh_user:d.ssh_user||'root',luci_user:d.luci_user||'root'};
+  if(access==='ssh')body.ssh_password=prompt('SSH password (empty=keep):')||d.ssh_password||'';
+  if(access==='luci')body.luci_pass=prompt('LuCI password (empty=keep):')||d.luci_pass||'';
+  try{await api(`/devices/${id}`,{method:'PUT',body:JSON.stringify(body)});toast('Saved');renderDevices()}catch(e){toast(String(e),true)}
+}
+async function delDev(id){if(!confirm('Delete this device?'))return;await api(`/devices/${id}`,{method:'DELETE'});renderDevices()}
+async function backup(id){
+  try{const r=await api(`/devices/${id}/backup`,{method:'POST'});toast('Backup saved: '+r.backup)}catch(e){toast(String(e),true)}
+}
+async function reboot(id){if(!confirm('Reboot this device now?'))return;try{await api(`/devices/${id}/reboot`,{method:'POST'});toast('Reboot sent')}catch(e){toast(String(e),true)}}
+async function openUpgrades(id){
+  try{
+    const r=await api(`/devices/${id}/check`,{method:'POST'});
+    const up=r.status.upgradable||[];
+    if(!up.length){toast('No package updates available'+(r.status.sysupgrade_available?' (firmware update IS available)':''));return}
+    let html=`<strong>Upgradable packages</strong>
+      <table>${up.map(p=>`<tr><td><input type="checkbox" value="${esc(p.pkg)}" checked> ${esc(p.pkg)}</td><td class="small">${esc(p.installed)}</td><td class="small">→ ${esc(p.available)}</td></tr>`).join('')}</table>
+      <div class="row fsec"><button class="act pri" id="ug-run">Apply selected</button><button class="act" onclick="document.getElementById('ug').remove()">Close</button></div>`;
+    const div=document.createElement('div');div.className='finding MEDIUM';div.id='ug';div.innerHTML=html;
+    document.querySelector('#tab-devices .grid').appendChild(div);
+    document.getElementById('ug-run').onclick=async()=>{
+      const sel=[...div.querySelectorAll('input:checked')].map(x=>x.value);
+      if(!confirm(`Upgrade ${sel.length} package(s)?`))return;
+      toast('Upgrading… (may take a while)');
+      try{const rr=await api(`/devices/${id}/upgrade`,{method:'POST',body:JSON.stringify({packages:sel})});
+        div.innerHTML+=`<pre>${esc(rr.output)}</pre>`;toast('Upgrade finished');
+      }catch(e){toast(String(e),true)}
+    };
+    div.scrollIntoView({behavior:'smooth'});
+  }catch(e){toast(String(e),true)}
+}
+
+async function renderThreats(){
+  const f=await api('/findings');
+  const el=document.getElementById('tab-threats');
+  const act=(f.active||[]).filter(a=>a.severity!=='INFO');
+  const order={CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3,INFO:4};
+  act.sort((a,b)=>(order[a.severity]??9)-(order[b.severity]??9));
+  let html=`<h2>Threats & findings</h2>`;
+  if(!act.length)html+=`<p class="muted">No active findings. Run a device check or wait for the scheduler.</p>`;
+  for(const a of act){
+    html+=`<div class="finding ${a.severity}"><div class="row" style="justify-content:space-between">
+      <span class="badge b-${a.severity}">${a.severity}</span><strong>${esc(a.device_name)} (${esc(a.device_id)})</strong></div>
+      <div style="margin:4px 0">${esc(a.message)}${a.detail?`<div class="small muted">${esc(a.detail)}</div>`:''}</div>
+      ${a.rec?`<div class="small">→ ${esc(a.rec)}</div>`:''}
+      <div class="row fsec"><button class="act" onclick="ack(${a.device_id},'${esc(a.rule_id)}')">Acknowledge</button></div></div>`;
+  }
+  const hist=(f.history||[]).slice(0,50);
+  if(hist.length){
+    html+=`<h3>History</h3><table><tr><th>Time</th><th>Device</th><th>Severity</th><th>Finding</th></tr>`+
+      hist.map(h=>`<tr><td class="small">${esc(h.ts)}</td><td>${esc(h.device_name)}</td><td><span class="badge b-${h.severity}">${h.severity}</span></td><td>${esc(h.message)}</td></tr>`).join('')+`</table>`;
+  }
+  el.innerHTML=html;
+}
+async function ack(did,rule){await api('/findings/ack',{method:'POST',body:JSON.stringify({device_id:did,rule_id:rule})});renderThreats()}
+
+async function renderSweep(){
+  const el=document.getElementById('tab-sweep');
+  el.innerHTML=`<h2>LAN sweep</h2>
+  <p class="muted">Scans a user-defined IPv4 range (CIDR, a-b list, or comma list) for live hosts and hints at OpenWrt devices. Max 4096 addresses per run.</p>
+  <div class="row"><input id="sweep-spec" placeholder="192.168.1.0/24  or  192.168.1.1-192.168.1.250" style="min-width:320px">
+  <button class="act pri" id="sweep-go">Sweep</button></div>
+  <div id="sweep-out"></div>`;
+  document.getElementById('sweep-go').onclick=async()=>{
+    const spec=document.getElementById('sweep-spec').value.trim();
+    if(!spec)return;
+    const out=document.getElementById('sweep-out');
+    out.innerHTML='<p class="muted">Sweeping '+esc(spec)+' …</p>';
+    try{
+      const r=await api('/sweep',{method:'POST',body:JSON.stringify({spec})});
+      let html=`<p>${r.found}/${r.requested} hosts up. Likely OpenWrt: ${r.openwrt.map(esc).join(', ')||'none detected'}</p>
+        <table><tr><th>IP</th><th>Ports</th><th>Hints</th><th></th></tr>`+
+        r.candidates.map(c=>`<tr><td>${esc(c.host)}</td><td>${(c.ports||[]).join(', ')}</td>
+          <td class="small muted">${(c.hints||[]).map(esc).join(' · ')||'—'}</td>
+          <td><button class="act" onclick="addFromSweep('${esc(c.host)}')">${c.likely_openwrt?'Add device':'Add'}</button></td></tr>`).join('')+`</table>`;
+      out.innerHTML=html;
+    }catch(e){out.innerHTML='<p class="muted" style="color:var(--bad)">'+esc(e.message)+'</p>'}
+  };
+}
+async function addFromSweep(host){
+  const name=prompt('Name for '+host+':',host);if(!name)return;
+  const access=prompt('Access (ssh/luci):')||'ssh';
+  let d={name,host,role:'router',access};
+  if(access==='ssh'){d.ssh_user=prompt('SSH user:','root');d.ssh_password=prompt('SSH password (empty=key):')||''}
+  else{d.luci_user=prompt('LuCI user:','root');d.luci_pass=prompt('LuCI password:')||''}
+  try{await api('/devices',{method:'POST',body:JSON.stringify(d)});toast('Added '+host)}catch(e){toast(String(e),true)}
+}
+
+async function renderAlerts(){
+  const el=document.getElementById('tab-alerts');
+  const cfg=await api('/alerts/config');
+  const ch=cfg.channels||{};
+  el.innerHTML=`<h2>Alerting</h2>
+  <div class="card"><h3>Threshold</h3>
+    <label>Minimum severity to alert on</label>
+    <select id="al-min">${['INFO','LOW','MEDIUM','HIGH','CRITICAL'].map(s=>`<option ${s===cfg.min_severity?'selected':''}>${s}</option>`).join('')}</select>
+  </div>
+  <div class="card fsec"><h3>Dashboard <label style="margin-left:8px"><input type="checkbox" id="al-dash" ${ch.dashboard?'checked':''}> enabled</label></h3></div>
+  <div class="card fsec"><h3>Email</h3>
+    <label><input type="checkbox" id="al-em-en" ${ch.email&&ch.email.enabled?'checked':''}> enabled</label>
+    <div class="row" style="margin-top:8px">
+      <div><label>SMTP host</label><input id="al-em-host" value="${esc(ch.email&&ch.email.smtp_host)}" placeholder="smtp.example.com"></div>
+      <div><label>Port</label><input id="al-em-port" value="${ch.email?ch.email.smtp_port:587}" style="width:80px"></div>
+      <div><label>User</label><input id="al-em-user" value="${esc(ch.email&&ch.email.user)}"></div>
+      <div><label>Password</label><input id="al-em-pass" type="password" value="${esc(ch.email&&ch.email.password)}"></div>
+      <div><label>From</label><input id="al-em-from" value="${esc(ch.email&&ch.email.from)}"></div>
+      <div><label>To</label><input id="al-em-to" value="${esc(ch.email&&ch.email.to)}" placeholder="you@example.com"></div>
+    </div>
+  </div>
+  <div class="card fsec"><h3>Telegram</h3>
+    <label><input type="checkbox" id="al-tg-en" ${ch.telegram&&ch.telegram.enabled?'checked':''}> enabled</label>
+    <div class="row" style="margin-top:8px">
+      <div><label>Bot token</label><input id="al-tg-token" value="${esc(ch.telegram&&ch.telegram.token)}" placeholder="1234:ABC"></div>
+      <div><label>Chat ID</label><input id="al-tg-chat" value="${esc(ch.telegram&&ch.telegram.chat_id)}"></div>
+    </div>
+  </div>
+  <div class="card fsec"><h3>Webhook (POST JSON)</h3>
+    <label><input type="checkbox" id="al-wh-en" ${ch.webhook&&ch.webhook.enabled?'checked':''}> enabled</label>
+    <div class="row" style="margin-top:8px"><div style="flex:1"><label>URL</label><input id="al-wh-url" value="${esc(ch.webhook&&ch.webhook.url)}" placeholder="https://example.com/hook"></div></div>
+  </div>
+  <div class="row fsec"><button class="act pri" id="al-save">Save alerting config</button></div>
+  <h3 style="margin-top:20px">Recent alerts</h3><div id="al-log"></div>`;
+  const v=id=>document.getElementById(id).value;
+  document.getElementById('al-save').onclick=async()=>{
+    const b=id=>document.getElementById(id).checked;
+    const next={min_severity:v('al-min'),channels:{
+      dashboard:b('al-dash'),
+      email:{enabled:b('al-em-en'),smtp_host:v('al-em-host'),smtp_port:parseInt(v('al-em-port'))||587,use_tls:true,user:v('al-em-user'),password:v('al-em-pass'),from:v('al-em-from'),to:v('al-em-to')},
+      telegram:{enabled:b('al-tg-en'),token:v('al-tg-token'),chat_id:v('al-tg-chat')},
+      webhook:{enabled:b('al-wh-en'),url:v('al-wh-url')}}};
+    await api('/alerts/config',{method:'PUT',body:JSON.stringify(next)});
+    toast('Alerting config saved');
+  };
+  (async()=>{const log=await api('/alerts/log');
+    document.getElementById('al-log').innerHTML=log.length?
+      `<table><tr><th>Time</th><th>Device</th><th>Severity</th><th>Message</th><th>Channels</th></tr>`+
+      log.map(l=>`<tr><td class="small">${esc(l.ts)}</td><td>${esc(l.device)}</td><td><span class="badge b-${l.severity}">${l.severity}</span></td><td>${esc(l.message)}</td><td class="small">${esc(l.channels)}</td></tr>`).join('')+`</table>`
+      :'<p class="muted">No alerts logged yet.</p>'})();
+}
+
+render('devices');
+</script>
+</body>
+</html>

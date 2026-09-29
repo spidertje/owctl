@@ -1,0 +1,7 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+owctl.log
+data/
+.DS_Store
