@@ -741,7 +741,7 @@ def list_devices():
 
 
 @app.post("/api/devices")
-async def add_device(request):
+async def add_device(request: Request):
     d = await request.json()
     host = (d.get("host") or "").strip()
     if not re.fullmatch(r"[\d.]+", host):
@@ -761,7 +761,7 @@ async def add_device(request):
 
 
 @app.put("/api/devices/{did}")
-async def update_device(request, did: int):
+async def update_device(request: Request, did: int):
     d = await request.json()
     cur = q("SELECT * FROM devices WHERE id=?", (did,))
     if not cur:
@@ -839,7 +839,7 @@ def device_backup(did: int):
 
 
 @app.post("/api/devices/{did}/upgrade")
-async def device_upgrade(request, did: int):
+async def device_upgrade(request: Request, did: int):
     cur = q("SELECT * FROM devices WHERE id=?", (did,))
     if not cur:
         raise HTTPException(404, "device not found")
@@ -867,7 +867,7 @@ def device_reboot(did: int):
 
 
 @app.post("/api/sweep")
-async def sweep(request):
+async def sweep(request: Request):
     d = await request.json()
     try:
         return run_sweep(d.get("spec", ""))
@@ -882,7 +882,7 @@ def findings():
 
 
 @app.post("/api/findings/ack")
-async def ack_finding(request):
+async def ack_finding(request: Request):
     d = await request.json()
     did, rule = int(d["device_id"]), d["rule_id"]
     execute("UPDATE active_findings SET severity='INFO' WHERE device_id=? AND rule_id=?", (did, rule))
@@ -895,7 +895,7 @@ def alerts_get():
 
 
 @app.put("/api/alerts/config")
-async def alerts_put(request):
+async def alerts_put(request: Request):
     set_alert_cfg(await request.json())
     return {"ok": True}
 
@@ -917,7 +917,7 @@ def settings_get():
 
 
 @app.put("/api/settings")
-async def settings_put(request):
+async def settings_put(request: Request):
     d = await request.json()
     if "audit_interval_min" in d:
         set_setting("audit_interval_min", str(int(d["audit_interval_min"])))
