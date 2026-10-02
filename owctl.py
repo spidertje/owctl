@@ -1269,7 +1269,7 @@ async def apply_vlan(request: Request):
 
 @app.post("/api/devices/{did}/guest-wifi")
 async def device_guest_wifi(request: Request, did: int):
-    """Create guest WiFi on a device."""
+    """Create or update guest WiFi on a device."""
     cur = q("SELECT * FROM devices WHERE id=?", (did,))
     if not cur:
         raise HTTPException(404, "device not found")
@@ -1277,6 +1277,25 @@ async def device_guest_wifi(request: Request, did: int):
     ssid = d.get("ssid", "")
     password = d.get("password", "")
     vlan_id = d.get("vlan_id")
+    method = d.get("method", "create")
+    if method == "delete":
+        # Delete guest WiFi config
+        c = _ssh_connect(cur[0])
+        try:
+            iface_name = f"guest_{ssid.replace(' ', '_').replace('-', '_')}" if ssid else None
+            if not iface_name:
+                # Try to find existing guest interface
+                stdin, stdout, stderr = c.exec_command("uci show wireless | grep -E 'guest|ssid' | grep -v default", timeout=10)
+                out = stdout.read().decode()
+                if 'wifi-iface' in out:
+                    for line in out.strip().split('\n'):
+                        if '=' in line:
+                            iface = line.split('=')[0].strip()
+                            c.exec_command(f"uci delete {iface}")
+                c.exec_command("uci commit wireless")
+        finally:
+            c.close()
+        return {"ok": True, "action": "deleted"}
     if not ssid or not password:
         raise HTTPException(400, "ssid and password required")
     try:
@@ -1285,6 +1304,42 @@ async def device_guest_wifi(request: Request, did: int):
         raise
     except Exception as e:
         raise HTTPException(502, f"guest WiFi failed: {e}")
+
+
+@app.get("/api/devices/{did}/wifi-config")
+def get_wifi_config(did: int):
+    """Get current WiFi configuration for a device."""
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    dev = cur[0]
+    c = _ssh_connect(dev)
+    try:
+        stdin, stdout, stderr = c.exec_command("uci show wireless 2>/dev/null | grep -E 'guest|ssid|key'", timeout=10)
+        out = stdout.read().decode()
+        if not out or 'wifi-iface' not in out:
+            return {"ssid": None, "encryption": None, "vlan_id": None, "last_check": datetime.now(timezone.utc).isoformat()}
+        lines = out.strip().split('\n')
+        ssid = None
+        encryption = None
+        vlan_id = None
+        for line in lines:
+            if '.ssid=' in line and 'guest' in line.lower():
+                ssid = line.split("=")[1].strip("'\"")
+            elif '.encryption=' in line and 'guest' in line.lower():
+                encryption = line.split("=")[1].strip("'\"")
+            elif '.network=' in line and 'guest' in line.lower():
+                net = line.split("=")[1].strip("'\"")
+                if net.startswith('vlan_'):
+                    vlan_id = net.replace('vlan_', '')
+        return {
+            "ssid": ssid,
+            "encryption": encryption,
+            "vlan_id": vlan_id,
+            "last_check": datetime.now(timezone.utc).isoformat()
+        }
+    finally:
+        c.close()
 
 
 @app.post("/api/devices/{did}/upgrade")

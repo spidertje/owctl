@@ -55,6 +55,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
     <button data-tab="sweep">Sweep</button>
     <button data-tab="alerts">Alerting</button>
     <button data-tab="map">Network Map</button>
+    <button data-tab="wifi">WiFi</button>
     <button data-tab="vlans">VLANs</button>
     <button data-tab="logs">Device Logs</button>
   </nav>
@@ -66,6 +67,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <section id="tab-sweep" style="display:none"></section>
   <section id="tab-alerts" style="display:none"></section>
   <section id="tab-map" style="display:none"></section>
+  <section id="tab-wifi" style="display:none"></section>
   <section id="tab-vlans" style="display:none"></section>
   <section id="tab-logs" style="display:none"></section>
 </main>
@@ -102,6 +104,7 @@ function render(tab){
   if(tab==='map')return renderMap();
   if(tab==='logs')return renderLogs();
   if(tab==='vlans')return renderVlans();
+  if(tab==='wifi')return renderWifi();
 }
 function fmtUptime(s){if(!s&&s!==0)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
 function fmtKB(k){return k>1048576?(k/1048576).toFixed(1)+' GB':(k/1024).toFixed(0)+' MB'}
@@ -147,7 +150,6 @@ async function renderDevices(){
         <button class="act" onclick="backup(${d.id})">Backup</button>
         <button class="act" onclick="openUpgrades(${d.id})">Updates</button>
         <button class="act" onclick="reboot(${d.id})">Reboot</button>
-        <button class="act" onclick="showGuestWifi(${d.id})">Guest WiFi</button>
         <button class="act" onclick="restore(${d.id})">Restore</button>
         <button class="act" onclick="showConfigHistory(${d.id})">Config History</button>
         <button class="act" onclick="editDev(${d.id})">Edit</button>
@@ -848,36 +850,84 @@ async function applyVlan(){
     toast(String(e),true);
   }
 }
-async function showGuestWifi(did){
+async function renderWifi(){
+  const el=document.getElementById('tab-wifi');
+  const devs=await api('/devices');
+  const vlans=await api('/vlans').catch(()=>[]);
+  let html=`<h2>WiFi Configuration</h2>
+    <p class="muted">Configure guest WiFi networks on each wireless-capable device. Set SSID, password, and optionally bind to a VLAN.</p>
+    <div class="grid">`;
+  for(const d of devs){
+    html+=`<div class="card">
+      <h3>${esc(d.name)} <span class="badge b-${d.status}">${d.status}</span></h3>
+      <div class="kv"><span>IP</span><span>${esc(d.host)}</span></div>
+      <div id="wifi-config-${d.id}"><p class="small muted">Loading…</p></div>
+      <button class="act pri" style="margin-top:12px" onclick="editWifi(${d.id})">Configure WiFi</button>
+    </div>`;
+  }
+  html+=`</div>`;
+  el.innerHTML=html;
+  // Pre-load current config for each device
+  for(const d of devs){
+    try{
+      const cfg=await api(`/devices/${d.id}/wifi-config`);
+      const el=document.getElementById(`wifi-config-${d.id}`);
+      if(el){
+        if(cfg&&cfg.ssid){
+          el.innerHTML=`<div class="kv"><span>Current SSID</span><span>${esc(cfg.ssid)}</span></div>
+            <div class="kv"><span>Encrypted</span><span>${cfg.encryption||'no'}</span></div>
+            ${cfg.vlan_id?`<div class="kv"><span>VLAN</span><span>${esc(cfg.vlan_id)}</span></div>`:''}
+            <div class="small muted">Last checked: ${esc(cfg.last_check)}</div>`;
+        }else{
+          el.innerHTML='<p class="small muted">No guest WiFi configured</p>';
+        }
+      }
+    }catch(e){
+      const el=document.getElementById(`wifi-config-${d.id}`);
+      if(el)el.innerHTML='<p class="small muted">Unable to fetch config</p>';
+    }
+  }
+}
+async function editWifi(did){
   const devs=await api('/devices');
   const d=devs.find(x=>x.id===did);
   if(!d)return;
+  const vlans=await api('/vlans').catch(()=>[]);
   const modal=document.createElement('div');
   modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center';
   modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;min-width:350px;max-width:450px">
-    <h3 style="margin:0 0 16px">Create Guest WiFi</h3>
-    <div style="margin-bottom:12px"><label>SSID (network name)</label><input id="gw-ssid" placeholder="e.g. Guest-Network" style="width:100%"></div>
-    <div style="margin-bottom:12px"><label>Password</label><input id="gw-pwd" type="password" placeholder="WPA2 password" style="width:100%"></div>
-    <div style="margin-bottom:12px"><label>VLAN (optional)</label><select id="gw-vlan" style="width:100%"><option value="">— none —</option></select></div>
+    <h3 style="margin:0 0 16px">Configure WiFi: ${esc(d.name)}</h3>
+    <div style="margin-bottom:12px"><label>SSID (network name)</label><input id="wifi-ssid" placeholder="e.g. Guest-Network" style="width:100%"></div>
+    <div style="margin-bottom:12px"><label>Password (WPA2)</label><input id="wifi-pwd" type="password" placeholder="Minimum 8 characters" style="width:100%"></div>
+    <div style="margin-bottom:12px"><label>VLAN (optional)</label><select id="wifi-vlan" style="width:100%"><option value="">— no VLAN (LAN) —</option>${vlans.map(v=>`<option value="${v.id}">VLAN ${v.id}</option>`).join('')}</select></div>
     <div class="row" style="justify-content:flex-end;gap:8px">
       <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
-      <button class="act pri" id="gw-apply">Create</button>
+      <button class="act pri" id="wifi-save">Save</button>
+      <button class="act" id="wifi-delete" style="color:var(--bad)">Delete</button>
     </div></div>`;
   document.body.appendChild(modal);
-  try{const vlans=await api('/vlans');modal.querySelector('#gw-vlan').innerHTML=vlans.map(v=>`<option value="${v.id}">VLAN ${v.id}</option>`).join('');}catch(e){}
-  modal.querySelector('#gw-apply').onclick=async()=>{
-    const ssid=modal.querySelector('#gw-ssid').value.trim();
-    const pwd=modal.querySelector('#gw-pwd').value.trim();
-    const vlan_id=modal.querySelector('#gw-vlan').value||null;
+  modal.querySelector('#wifi-save').onclick=async()=>{
+    const ssid=modal.querySelector('#wifi-ssid').value.trim();
+    const pwd=modal.querySelector('#wifi-pwd').value.trim();
+    const vlan_id=modal.querySelector('#wifi-vlan').value||null;
     if(!ssid||!pwd){toast('SSID and password required',true);return}
     try{
-      toast('Creating guest WiFi...');
+      toast('Applying WiFi config…');
       const r=await api(`/devices/${did}/guest-wifi`,{method:'POST',body:JSON.stringify({ssid,password:pwd,vlan_id})});
-      toast('Guest WiFi created: '+ssid);
+      toast('WiFi config saved');
       modal.remove();
+      renderWifi();
     }catch(e){toast(String(e),true)}
   };
-  modal.querySelector('button').addEventListener('click',()=>modal.remove());
+  modal.querySelector('#wifi-delete').onclick=async()=>{
+    if(!confirm(`Delete guest WiFi on ${d.name}?`))return;
+    try{
+      await api(`/devices/${did}/guest-wifi`,{method:'DELETE'});
+      toast('Guest WiFi deleted');
+      modal.remove();
+      renderWifi();
+    }catch(e){toast(String(e),true)}
+  };
   modal.onclick=e=>{if(e.target===modal)modal.remove()};
 }
 </script>
