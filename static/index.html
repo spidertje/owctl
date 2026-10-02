@@ -853,11 +853,18 @@ async function applyVlan(){
 async function renderWifi(){
   const el=document.getElementById('tab-wifi');
   const devs=await api('/devices');
+  // Filter: only show devices that have wireless capability (role='AP' or have wifi data)
+  const wifi_devs = devs.filter(d => d.role === 'AP');
   const vlans=await api('/vlans').catch(()=>[]);
   let html=`<h2>WiFi Configuration</h2>
-    <p class="muted">Configure guest WiFi networks on each wireless-capable device. Set SSID, password, and optionally bind to a VLAN.</p>
-    <div class="grid">`;
-  for(const d of devs){
+    <p class="muted">Configure guest WiFi networks on each wireless-capable device. Set SSID, password, and optionally bind to a VLAN.</p>`;
+  if(!wifi_devs.length){
+    html+=`<p class="muted">No wireless-capable devices found. Add an AP device to configure WiFi.</p>`;
+    el.innerHTML=html;
+    return;
+  }
+  html+=`<div class="grid">`;
+  for(const d of wifi_devs){
     html+=`<div class="card">
       <h3>${esc(d.name)} <span class="badge b-${d.status}">${d.status}</span></h3>
       <div class="kv"><span>IP</span><span>${esc(d.host)}</span></div>

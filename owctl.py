@@ -287,6 +287,7 @@ def _build_status(dev, backend, s):
         band = "2.4GHz" if chan and int(chan.split()[0]) <= 14 else "5GHz"
         ap_list.append({"essid": essid, "channel": chan, "band": band, "encryption": enc if enc else "open"})
     st["wifi"] = ap_list
+    st["wifi_capable"] = len(ap_list) > 0
     # Parse stations: ESSID\tclient_count
     st["stations"] = {}
     for line in s.get("stations", "").splitlines():
