@@ -395,52 +395,55 @@ function showMapDevInfo(id){
 function showDevInfo(id,st,fromMap=false){
   const el=document.getElementById('devinfo-'+id);if(!el)return;
   if(!st)return;
-  const rows=[
-    ['Firmware',st.firmware||'—'],['Model',st.model||'—'],
-    ['Uptime',fmtUptime(st.uptime_s)],['Load',(st.load||[]).join(' ')||'—'],
-    ['Memory',st.mem_total_kb?`${fmtKB(st.mem_total_kb-st.mem_free_kb)} / ${fmtKB(st.mem_total_kb)}`:'—'],
-    ['WAN',st.wan_up===false?'DOWN':(st.wan_up===true?'UP':'—')+(st.wan_ip?' ('+st.wan_ip+')':'')],
-    ['Clients',st.clients==null?'—':st.clients],
-    ['FW in/fwd/out',st.fw_in&&`${st.fw_in}/${st.fw_fwd}/${st.fw_out}`||'—'],
-    ['Listeners',(st.listeners||[]).join(', ')||'—'],
-  ];
-  // Interfaces
-  if(st.interfaces){
-    const ifaces=Object.values(st.interfaces);
-    ifaces.forEach(iface=>{
-      rows.push([`${iface.name} (${iface.ip})`, iface.cidr]);
-    });
-  }
-  // WiFi
-  if(st.wifi&&st.wifi.length){
-    rows.push(['WiFi','']);
-    st.wifi.forEach(ap=>{
-      rows.push([`  ${ap.essid}`, `${ap.band} ch${ap.channel} ${ap.encryption}`]);
-    });
-  }
-  // DHCP clients
-  if(st.dhcp&&st.dhcp.length){
-    rows.push(['DHCP Clients',`${st.dhcp.length} connected`]);
-    st.dhcp.slice(0,8).forEach(c=>{
-      rows.push([`  ${c.hostname||c.mac}`, c.ip]);
-    });
-  }
-  // Config changes
-  if(st.config_changed){
-    rows.push(['Config',`<span style="color:var(--warn)">${esc(st.config_changed)}</span>`]);
-  }
-  try{
-    const bw=await api(`/devices/${id}/bandwidth`);
-    if(bw.ifaces&&Object.keys(bw.ifaces).length){
-      rows.push(['Bandwidth','']);
-      Object.entries(bw.ifaces).forEach(([iface,b])=>{
-        rows.push([`  ${iface}`,`RX ${b.rx_mbps} / TX ${b.tx_mbps} Mbps`]);
+  (async()=>{
+    const rows=[
+      ['Firmware',st.firmware||'—'],['Model',st.model||'—'],
+      ['Uptime',fmtUptime(st.uptime_s)],['Load',(st.load||[]).join(' ')||'—'],
+      ['Memory',st.mem_total_kb?`${fmtKB(st.mem_total_kb-st.mem_free_kb)} / ${fmtKB(st.mem_total_kb)}`:'—'],
+      ['WAN',st.wan_up===false?'DOWN':(st.wan_up===true?'UP':'—')+(st.wan_ip?' ('+st.wan_ip+')':'')],
+      ['Clients',st.clients==null?'—':st.clients],
+      ['FW in/fwd/out',st.fw_in&&`${st.fw_in}/${st.fw_fwd}/${st.fw_out}`||'—'],
+      ['Listeners',(st.listeners||[]).join(', ')||'—'],
+    ];
+    // Interfaces
+    if(st.interfaces){
+      const ifaces=Object.values(st.interfaces);
+      ifaces.forEach(iface=>{
+        rows.push([`${iface.name} (${iface.ip})`, iface.cidr]);
       });
     }
-  }catch(e){}
-  el.innerHTML=rows.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${v}</span></div>`).join('')+
-    '<canvas id="dev-chart-'+id+'" width="300" height="80" style="margin-top:8px;border:1px solid var(--line);border-radius:4px;display:block">';
-  fetchTrafficChart(id);
+    // WiFi
+    if(st.wifi&&st.wifi.length){
+      rows.push(['WiFi','']);
+      st.wifi.forEach(ap=>{
+        rows.push([`  ${ap.essid}`, `${ap.band} ch${ap.channel} ${ap.encryption}`]);
+      });
+    }
+    // DHCP clients
+    if(st.dhcp&&st.dhcp.length){
+      rows.push(['DHCP Clients',`${st.dhcp.length} connected`]);
+      st.dhcp.slice(0,8).forEach(c=>{
+        rows.push([`  ${c.hostname||c.mac}`, c.ip]);
+      });
+    }
+    // Config changes
+    if(st.config_changed){
+      rows.push(['Config',`<span style="color:var(--warn)">${esc(st.config_changed)}</span>`]);
+    }
+    // Bandwidth display
+    try{
+      const bw=await api(`/devices/${id}/bandwidth`);
+      if(bw.ifaces&&Object.keys(bw.ifaces).length){
+        rows.push(['Bandwidth','']);
+        Object.entries(bw.ifaces).forEach(([iface,b])=>{
+          rows.push([`  ${iface}`,`RX ${b.rx_mbps} / TX ${b.tx_mbps} Mbps`]);
+        });
+      }
+    }catch(e){}
+    el.innerHTML=rows.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${v}</span></div>`).join('')+
+      '<canvas id="dev-chart-'+id+'" width="300" height="80" style="margin-top:8px;border:1px solid var(--line);border-radius:4px;display:block">';
+    fetchTrafficChart(id);
+  })();
 }
 async function fetchTrafficChart(id){
   const canvas=document.getElementById('dev-chart-'+id);
