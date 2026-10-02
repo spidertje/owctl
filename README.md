@@ -5,6 +5,8 @@ OpenWrt boxes over **SSH** (primary) or the **LuCI API** (fallback), with
 config-hygiene threat auditing, package upgrades, config backups, LAN sweep,
 and configurable alerting.
 
+![Devices dashboard](docs/screenshot.png)
+
 ## Run
 
 ```bash
