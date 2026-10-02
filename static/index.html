@@ -795,6 +795,7 @@ async function loadLogs(){
       logs.map(l=>`<tr><td class="small">${esc(l.ts)}</td><td style="font-family:monospace;font-size:11px">${esc(l.message)}</td></tr>`).join('')+
       '</table>';
   }catch(e){out.innerHTML=`<p style="color:var(--bad)">Error: ${esc(e.message)}</p>`}
+}
 
 async function renderVlans(){
   const el=document.getElementById('tab-vlans');
@@ -845,7 +846,6 @@ async function applyVlan(){
     document.getElementById('vlan-results').innerHTML=`<div class="card" style="border-color:var(--bad)"><strong>Failed</strong><br>${esc(String(e))}</div>`;
     toast(String(e),true);
   }
-}
 }
 </script>
 </body>
