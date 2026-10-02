@@ -1133,12 +1133,15 @@ def get_bandwidth(did: int):
     for iface, samples in by_iface.items():
         if len(samples) < 2:
             continue
-        a, b = samples[0], samples[1]
-        dt = (datetime.fromisoformat(b["ts"]) - datetime.fromisoformat(a["ts"])).total_seconds()
+        # samples are sorted DESC by ts, so samples[0] is newest
+        latest, prev = samples[0], samples[1]
+        t_new = datetime.fromisoformat(latest["ts"])
+        t_old = datetime.fromisoformat(prev["ts"])
+        dt = (t_new - t_old).total_seconds()
         if dt <= 0:
             continue
-        rx_mbps = ((b["rx_bytes"] - a["rx_bytes"]) * 8) / (dt * 1_000_000)
-        tx_mbps = ((b["tx_bytes"] - a["tx_bytes"]) * 8) / (dt * 1_000_000)
+        rx_mbps = ((latest["rx_bytes"] - prev["rx_bytes"]) * 8) / (dt * 1_000_000)
+        tx_mbps = ((latest["tx_bytes"] - prev["tx_bytes"]) * 8) / (dt * 1_000_000)
         result[iface] = {"rx_mbps": round(rx_mbps, 2), "tx_mbps": round(tx_mbps, 2)}
     return {"ifaces": result}
 
