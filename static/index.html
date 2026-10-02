@@ -53,6 +53,8 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
     <button data-tab="threats">Threats</button>
     <button data-tab="sweep">Sweep</button>
     <button data-tab="alerts">Alerting</button>
+    <button data-tab="map">Network Map</button>
+    <button data-tab="logs">Device Logs</button>
   </nav>
 </header>
 <main>
@@ -60,6 +62,8 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <section id="tab-threats" style="display:none"></section>
   <section id="tab-sweep" style="display:none"></section>
   <section id="tab-alerts" style="display:none"></section>
+  <section id="tab-map" style="display:none"></section>
+  <section id="tab-logs" style="display:none"></section>
 </main>
 <div id="toast"></div>
 <script>
@@ -79,7 +83,11 @@ function toast(m,bad){const t=$('#toast');t.textContent=m;t.style.display='block
 const navBtns=[...document.querySelectorAll('nav button')];
 navBtns.forEach(b=>b.onclick=()=>{
   navBtns.forEach(x=>x.classList.toggle('on',x===b));
-  for(const t of ['devices','threats','sweep','alerts'])$('#tab-'+t).style.display=(t===b.dataset.tab)?'':'none';
+  navBtns.forEach(btn=>{
+    const tabId='tab-'+btn.dataset.tab;
+    const tab=document.getElementById(tabId);
+    if(tab)tab.style.display=(btn===b)?'':'none';
+  });
   render(b.dataset.tab);
 });
 function render(tab){
@@ -87,6 +95,8 @@ function render(tab){
   if(tab==='threats')return renderThreats();
   if(tab==='sweep')return renderSweep();
   if(tab==='alerts')return renderAlerts();
+  if(tab==='map')return renderMap();
+  if(tab==='logs')return renderLogs();
 }
 function fmtUptime(s){if(!s&&s!==0)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
 function fmtKB(k){return k>1048576?(k/1048576).toFixed(1)+' GB':(k/1024).toFixed(0)+' MB'}
@@ -96,14 +106,26 @@ async function renderDevices(){
   const host=document.getElementById('tab-devices');
   let html=`<div class="row" style="justify-content:space-between;margin-bottom:12px">
     <strong>Devices (${devs.length})</strong>
-    <div class="row"><button class="act" onclick="renderDevices()">Refresh</button>
-    <button class="act pri" onclick="promptAdd()">+ Add device</button></div></div>`;
+    <div class="row">
+      <input type="checkbox" id="bulk-all" onchange="toggleAll(this.checked)">
+      <label for="bulk-all" class="small muted">Select all</label>
+      <button class="act bulk-action-btn" onclick="bulkAction('check')" disabled>Check Selected</button>
+      <button class="act bulk-action-btn" onclick="bulkAction('backup')" disabled>Backup Selected</button>
+      <button class="act" onclick="renderDevices()">Refresh</button>
+      <button class="act pri" onclick="promptAdd()">+ Add device</button>
+    </div></div>`;
   if(!devs.length)html+=`<p class="muted">No devices yet. Add one manually, or run a <button class="act" onclick="goSweep()">LAN sweep</button>.</p>`;
   html+=`<div class="grid">`;
   for(const d of devs){
     const badge=`<span class="badge b-${d.status}">${d.status}</span>`;
+    const hs=d.health_score!=null?`<span class="badge ${d.health_score>=80?'b-online':d.health_score>=50?'b-MEDIUM':'b-CRITICAL'}" style="margin-left:6px">${d.health_score}</span>`:'';
+    const tags=d.tags?`<span style="color:var(--mut);font-size:11px;margin-left:8px">#${esc(d.tags)}</span>`:'';
     html+=`<div class="card" id="dev-${d.id}">
-      <h3>${esc(d.name)} <span>${badge}<span class="pill"> ${esc(d.host)} · ${esc(d.role||'')} · ${esc(d.access)}</span></span></h3>
+      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px">
+        <input type="checkbox" class="bulk-cb" data-id="${d.id}" onchange="updateBulkBtn()">
+        <span class="small muted">${esc(d.host)}</span>
+      </div>
+      <h3>${esc(d.name)} <span>${badge}${hs}${tags}</span></h3>
       <div class="kv"><span>Last checked</span><span class="small">${esc(d.last_checked||'never')}</span></div>
       <div id="devinfo-${d.id}"></div>
       <div class="row fsec">
@@ -113,6 +135,7 @@ async function renderDevices(){
         <button class="act" onclick="backup(${d.id})">Backup</button>
         <button class="act" onclick="openUpgrades(${d.id})">Updates</button>
         <button class="act" onclick="reboot(${d.id})">Reboot</button>
+        <button class="act" onclick="showConfigHistory(${d.id})">Config History</button>
         <button class="act" onclick="editDev(${d.id})">Edit</button>
         <button class="act" onclick="delDev(${d.id})">Delete</button>
       </div>
@@ -128,11 +151,233 @@ async function chk(id){
     const r=await api(`/devices/${id}/check`,{method:'POST'});
     showDevInfo(id,r.status);
     toast(`Checked. ${r.findings.length} finding(s).`);
-    setTimeout(renderDevices,1200);
   }catch(e){toast(String(e),true)}
 }
-function showDevInfo(id,st){
+async function renderMap(){
+  const el=document.getElementById('tab-map');
+  el.innerHTML='<h2 style="margin:16px 20px 8px">Network Map</h2><div id="map-container" style="padding:0 20px 20px"><svg id="map-svg" style="width:100%;height:700px;display:block;margin:0 auto"></svg></div>';
+  try{
+    const devs=await api('/devices');
+    const results=[];
+    for(const d of devs){
+      try{const r=await api(`/devices/${d.id}/check`,{method:'POST'});results.push({device:d,status:r.status,error:null})}
+      catch(e){results.push({device:d,status:null,error:e.message})}
+    }
+    const routerResult=results.find(r=>r.device.role==='router')||results[0];
+    const otherResults=results.filter(r=>r!==routerResult);
+    const ipMap={};
+    for(const r of results){if(r.status?.ips)r.status.ips.forEach(ip=>ipMap[ip]=r)}
+    const connections=[];
+    for(const r of results){
+      if(!r.status?.neighbors)continue;
+      for(const nb of r.status.neighbors){
+        if(nb.ip==='loopback'||nb.ip.startsWith('127.'))continue;
+        const other=ipMap[nb.ip];
+        if(other&&other.device.host!==r.device.host){
+          const key=[r.device.id,other.device.id].sort().join('-');
+          if(!connections.find(c=>c.key===key))connections.push({from:r,to:other,key,iface:nb.iface});
+        }
+      }
+    }
+    const W=960,H=700;
+    let html=`<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="${H}" viewBox="0 0 ${W} ${H}">`;
+    html+=`<defs>
+      <filter id="glow"><feGaussianBlur stdDeviation="4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      <linearGradient id="wan-grad" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" style="stop-color:#f5b544"/><stop offset="100%" style="stop-color:#4da3ff"/></linearGradient>
+      <linearGradient id="dev-body" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" style="stop-color:#2a3a5c"/><stop offset="100%" style="stop-color:#1a2540"/></linearGradient>
+    </defs>`;
+    const CX=W/2;
+    // LAYOUT
+    const I_Y=35; // Internet center Y
+    const R_TOP=110; // Router top Y
+    const R_H=70; // Router height
+    const R_BOT=R_TOP+R_H; // Router bottom Y
+    const LAN_Y=R_BOT+25; // LAN backbone Y
+    const AP_TOP=LAN_Y+55; // AP top Y
+    const AP_H=55; // AP height
+    const AP_BOT=AP_TOP+AP_H; // AP bottom Y
+    const PORT_ROW_Y=AP_BOT+20; // Port labels row Y
+    const SPACING=180; // AP horizontal spacing
+    const START_X=CX-(otherResults.length-1)*SPACING/2;
+    const devicePositions={};
+    // Draw all connections first (behind devices)
+    // WAN: Internet -> router left side (wan port)
+    html+=`<line x1="${CX}" y1="${I_Y+30}" x2="${CX-75}" y2="${R_TOP+15}" stroke="url(#wan-grad)" stroke-width="3" stroke-dasharray="8,4"/>`;
+    // Device-to-device connections
+    for(const conn of connections){
+      const fp=devicePositions[conn.from.device.id]||{x:CX,y:R_BOT};
+      const tp=devicePositions[conn.to.device.id]||{x:START_X,y:AP_BOT};
+      const fx=conn.from===routerResult?CX:fp.x;
+      const fy=conn.from===routerResult?R_BOT:fp.y+AP_H;
+      const tx=conn.to===routerResult?CX:tp.x;
+      const ty=conn.to===routerResult?R_TOP:tp.y;
+      const mx=(fx+tx)/2,my=(fy+ty)/2;
+      html+=`<line x1="${fx}" y1="${fy}" x2="${tx}" y2="${ty}" stroke="#39c07f" stroke-width="2" stroke-dasharray="5,3" opacity="0.7"/>`;
+      html+=`<rect x="${mx-26}" y="${my-10}" width="52" height="16" rx="3" fill="#161d2e" stroke="#26314f"/>`;
+      html+=`<text x="${mx}" y="${my+3}" text-anchor="middle" fill="#4da3ff" font-size="8" font-weight="600">${esc(conn.iface)}</text>`;
+    }
+    // LAN backbone
+    html+=`<line x1="${CX-230}" y1="${LAN_Y}" x2="${CX+230}" y2="${LAN_Y}" stroke="#26314f" stroke-width="6" stroke-linecap="round"/>`;
+    html+=`<text x="${CX}" y="${LAN_Y+16}" text-anchor="middle" fill="#4da3ff" font-size="10" font-weight="500">LAN Backbone</text>`;
+    // Router to LAN
+    html+=`<line x1="${CX}" y1="${R_BOT}" x2="${CX}" y2="${LAN_Y}" stroke="#4da3ff" stroke-width="2"/>`;
+    // Internet cloud
+    html+=`<ellipse cx="${CX}" cy="${I_Y}" rx="60" ry="28" fill="#0d1525" stroke="#4da3ff" stroke-width="2" filter="url(#glow)"/>`;
+    html+=`<text x="${CX}" y="${I_Y-4}" text-anchor="middle" fill="#dbe4f5" font-size="13" font-weight="600">Internet</text>`;
+    html+=`<text x="${CX}" y="${I_Y+14}" text-anchor="middle" fill="#4da3ff" font-size="14">☁</text>`;
+    // Render router
+    const r=routerResult,online=r.status&&r.status.online;
+    html+=`<g transform="translate(${CX},${R_TOP})">`;
+    // Antennas
+    html+=`<line x1="-20" y1="-6" x2="-40" y2="-38" stroke="#4da3ff" stroke-width="2" opacity="0.7"/>`;
+    html+=`<line x1="20" y1="-6" x2="40" y2="-38" stroke="#4da3ff" stroke-width="2" opacity="0.7"/>`;
+    html+=`<circle cx="-40" cy="-38" r="4" fill="#4da3ff" opacity="0.9"/>`;
+    html+=`<circle cx="40" cy="-38" r="4" fill="#4da3ff" opacity="0.9"/>`;
+    // Main body
+    html+=`<rect x="-80" y="0" width="160" height="${R_H}" rx="7" fill="url(#dev-body)" stroke="${online?'#39c07f':'#f4636e'}" stroke-width="2.5" filter="url(#glow)"/>`;
+    // Top panel
+    html+=`<rect x="-75" y="3" width="150" height="16" rx="3" fill="#0d1525"/>`;
+    // LEDs
+    html+=`<circle cx="-60" cy="11" r="3.5" fill="${online?'#39c07f':'#f4636e'}" filter="url(#glow)"/>`;
+    html+=`<circle cx="-48" cy="11" r="3.5" fill="#4da3ff"/>`;
+    html+=`<circle cx="-36" cy="11" r="3.5" fill="#f5b544"/>`;
+    // Name
+    html+=`<text x="0" y="36" text-anchor="middle" fill="#dbe4f5" font-size="12" font-weight="600">${esc(r.device.name)}</text>`;
+    // IP + role
+    html+=`<text x="0" y="52" text-anchor="middle" fill="#8b98b8" font-size="9">${esc(r.status?.ips?.[0]||r.device.host)} · ${esc(r.device.role||'router')}</text>`;
+    // WAN IP label (right side)
+    if(r.status?.ips&&r.status.ips.length>1){
+      html+=`<text x="${80+8}" y="16" fill="#f5b544" font-size="9" font-weight="500">${esc(r.status.ips[r.status.ips.length-1])}</text>`;
+    }
+    html+=`</g>`;
+    // Render APs
+    for(let i=0;i<otherResults.length;i++){
+      const dr=otherResults[i];
+      const dx=START_X+i*SPACING;
+      devicePositions[dr.device.id]={x:dx,y:AP_TOP};
+      const dor=dr.status&&dr.status.online;
+      // Vertical line from LAN to AP
+      html+=`<line x1="${dx}" y1="${LAN_Y}" x2="${dx}" y2="${AP_TOP}" stroke="#4da3ff" stroke-width="2" opacity="0.7"/>`;
+      // AP box
+      html+=`<g transform="translate(${dx},${AP_TOP})">`;
+      html+=`<rect x="-60" y="0" width="120" height="${AP_H}" rx="7" fill="url(#dev-body)" stroke="${dor?'#39c07f':'#f4636e'}" stroke-width="2" filter="url(#glow)"/>`;
+      html+=`<circle cx="-48" cy="16" r="5" fill="${dor?'#39c07f':'#f4636e'}" filter="url(#glow)"/>`;
+      html+=`<text x="0" y="20" text-anchor="middle" fill="#dbe4f5" font-size="11" font-weight="600">${esc(dr.device.name)}</text>`;
+      html+=`<text x="0" y="37" text-anchor="middle" fill="#8b98b8" font-size="9">${esc(dr.status?.ips?.[0]||dr.device.host)}</text>`;
+      html+=`<text x="0" y="49" text-anchor="middle" fill="#6b7898" font-size="8">${esc(dr.device.role||'device')}</text>`;
+      html+=`</g>`;
+    }
+    // Port labels row - ALL ports in one horizontal line below devices
+    // PORT ROWS - one per device, aligned under each device
+    const PORT_W=42, PORT_H=16, PORT_GAP=55;
+    // Collect ports per device
+    const routerPorts=[];
+    if(routerResult.status?.interfaces){
+      Object.values(routerResult.status.interfaces).forEach(iface=>{
+        if(iface.name!=='lo'&&iface.name!=='br-lan')routerPorts.push(iface.name);
+      });
+    }
+    const apPortMap={};
+    for(let i=0;i<otherResults.length;i++){
+      const dx=START_X+i*SPACING;
+      const dr=otherResults[i];
+      const names=[];
+      if(dr.status?.interfaces){
+        Object.values(dr.status.interfaces).forEach(iface=>{
+          if(iface.name!=='lo'&&iface.name!=='br-lan')names.push(iface.name);
+        });
+      }
+      apPortMap[i]={x:dx,names};
+    }
+    // Draw router ports (between router and LAN)
+    const RPORT_Y=R_BOT+18;
+    if(routerPorts.length){
+      const rw=(routerPorts.length-1)*PORT_GAP;
+      const rx=CX-rw/2;
+      routerPorts.forEach((name,i)=>{
+        const px=rx+i*PORT_GAP;
+        html+=`<rect x="${px-PORT_W/2}" y="${RPORT_Y-8}" width="${PORT_W}" height="${PORT_H}" rx="3" fill="#1a2540" stroke="#4da3ff" stroke-width="1.5"/>`;
+        html+=`<text x="${px}" y="${RPORT_Y+3}" text-anchor="middle" fill="#4da3ff" font-size="8" font-weight="600">${esc(name)}</text>`;
+        html+=`<line x1="${px}" y1="${RPORT_Y-8}" x2="${px}" y2="${R_BOT}" stroke="#4da3ff" stroke-width="1.5" opacity="0.5"/>`;
+      });
+    }
+    // Draw AP port rows (below each AP)
+    for(const [idx,ap] of Object.entries(apPortMap)){
+      if(!ap.names.length)continue;
+      const apIdx=parseInt(idx);
+      const AP_PORT_Y=AP_BOT+18;
+      const aw=(ap.names.length-1)*PORT_GAP;
+      const ax=ap.x-aw/2;
+      ap.names.forEach((name,i)=>{
+        const px=ax+i*PORT_GAP;
+        html+=`<rect x="${px-PORT_W/2}" y="${AP_PORT_Y-8}" width="${PORT_W}" height="${PORT_H}" rx="3" fill="#1a2540" stroke="#4da3ff" stroke-width="1.5"/>`;
+        html+=`<text x="${px}" y="${AP_PORT_Y+3}" text-anchor="middle" fill="#4da3ff" font-size="8" font-weight="600">${esc(name)}</text>`;
+        html+=`<line x1="${px}" y1="${AP_PORT_Y-8}" x2="${px}" y2="${AP_BOT}" stroke="#4da3ff" stroke-width="1.5" opacity="0.5"/>`;
+      });
+    }
+    // WiFi signals below port row
+    for(let i=0;i<otherResults.length;i++){
+      const dr=otherResults[i];
+      const dx=START_X+i*SPACING;
+      if(dr.status?.wifi&&dr.status.wifi.length>0){
+        const wy=PORT_ROW_Y+35;
+        html+=`<path d="M${dx-25} ${wy} Q${dx} ${wy-18} ${dx+25} ${wy}" fill="none" stroke="#4da3ff" stroke-width="1.5" opacity="0.5"/>`;
+        html+=`<path d="M${dx-15} ${wy+7} Q${dx} ${wy-10} ${dx+15} ${wy+7}" fill="none" stroke="#4da3ff" stroke-width="1.5" opacity="0.4"/>`;
+        html+=`<text x="${dx}" y="${wy+20}" text-anchor="middle" fill="#8b98b8" font-size="8">WiFi</text>`;
+        for(let c=0;c<Math.min(dr.status.clients||3,5);c++){
+          html+=`<circle cx="${dx-20+c*10}" cy="${wy+32}" r="3" fill="#4da3ff" opacity="0.6"/>`;
+        }
+      }
+    }
+    html+='</svg>';
+    el.querySelector('#map-container').innerHTML=html;
+  }catch(e){el.querySelector('#map-container').innerHTML=`<p style="color:var(--bad)">Error: ${esc(String(e))}</p>`}
+}
+function showMapDevInfo(id){
+  const el=document.getElementById('map-container');
+  if(!el)return;
+  el.innerHTML+='<div id="map-dev-info" class="card" style="margin-top:16px;position:fixed;top:100px;right:20px;width:350px;max-height:70vh;overflow:auto;z-index:50;box-shadow:0 0 20px rgba(0,0,0,.5)"><div class="row" style="justify-content:space-between"><strong>Loading…</strong><button class="act" onclick="this.closest(\'#map-dev-info\').remove()">×</button></div></div>';
+  api(`/devices/${id}/check`,{method:'POST'}).then(r=>{
+    const container=document.getElementById('map-dev-info');
+    if(!container)return;
+    const st=r.status;
+    const rows=[
+      ['Firmware',st.firmware||'—'],['Model',st.model||'—'],
+      ['Uptime',fmtUptime(st.uptime_s)],['Load',(st.load||[]).join(' ')||'—'],
+      ['Memory',st.mem_total_kb?`${fmtKB(st.mem_total_kb-st.mem_free_kb)} / ${fmtKB(st.mem_total_kb)}`:'—'],
+      ['WAN',st.wan_up===false?'DOWN':(st.wan_up===true?'UP':'—')+(st.wan_ip?' ('+st.wan_ip+')':'')],
+      ['Clients',st.clients==null?'—':st.clients],
+      ['Health',r.health_score!=null?`${r.health_score}/100`:'—'],
+      // WiFi clients per SSID
+      ...(st.stations&&Object.keys(st.stations).length?
+        Object.entries(st.stations).map(([essid,c])=>['  '+essid,`${c} clients`]):[]),
+      // Traffic counters
+      ...(st.traffic&&Object.keys(st.traffic).length?
+        Object.entries(st.traffic).map(([iface,t])=>['  '+iface,`RX ${fmtKB(t.rx)} / TX ${fmtKB(t.tx)}`]):[]),
+      ['FW in/fwd/out',st.fw_in&&`${st.fw_in}/${st.fw_fwd}/${st.fw_out}`||'—'],
+      ['Listeners',(st.listeners||[]).join(', ')||'—'],
+    ];
+    if(st.interfaces){
+      Object.values(st.interfaces).forEach(iface=>{
+        rows.push([`${iface.name} (${iface.ip})`, iface.cidr]);
+      });
+    }
+    if(st.wifi&&st.wifi.length){
+      rows.push(['WiFi','']);
+      st.wifi.forEach(ap=>{
+        rows.push([`  ${ap.essid}`, `${ap.band} ch${ap.channel} ${ap.encryption}`]);
+      });
+    }
+    container.innerHTML=`<div class="row" style="justify-content:space-between"><strong>${esc(r.status.name||'Device')} (${esc(r.status.host||'')})</strong><button class="act" onclick="this.closest('#map-dev-info').remove()">×</button></div>`+
+      rows.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`).join('');
+  }).catch(e=>{
+    const container=document.getElementById('map-dev-info');
+    if(container)container.innerHTML=`<div style="color:var(--bad)">Error: ${esc(e.message)}</div><button class="act" onclick="this.closest('#map-dev-info').remove()">Close</button>`;
+  });
+}
+function showDevInfo(id,st,fromMap=false){
   const el=document.getElementById('devinfo-'+id);if(!el)return;
+  if(!st)return;
   const rows=[
     ['Firmware',st.firmware||'—'],['Model',st.model||'—'],
     ['Uptime',fmtUptime(st.uptime_s)],['Load',(st.load||[]).join(' ')||'—'],
@@ -142,13 +387,91 @@ function showDevInfo(id,st){
     ['FW in/fwd/out',st.fw_in&&`${st.fw_in}/${st.fw_fwd}/${st.fw_out}`||'—'],
     ['Listeners',(st.listeners||[]).join(', ')||'—'],
   ];
-  el.innerHTML=rows.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`).join('');
+  // Interfaces
+  if(st.interfaces){
+    const ifaces=Object.values(st.interfaces);
+    ifaces.forEach(iface=>{
+      rows.push([`${iface.name} (${iface.ip})`, iface.cidr]);
+    });
+  }
+  // WiFi
+  if(st.wifi&&st.wifi.length){
+    rows.push(['WiFi','']);
+    st.wifi.forEach(ap=>{
+      rows.push([`  ${ap.essid}`, `${ap.band} ch${ap.channel} ${ap.encryption}`]);
+    });
+  }
+  // DHCP clients
+  if(st.dhcp&&st.dhcp.length){
+    rows.push(['DHCP Clients',`${st.dhcp.length} connected`]);
+    st.dhcp.slice(0,8).forEach(c=>{
+      rows.push([`  ${c.hostname||c.mac}`, c.ip]);
+    });
+  }
+  // Config changes
+  if(st.config_changed){
+    rows.push(['Config',`<span style="color:var(--warn)">${esc(st.config_changed)}</span>`]);
+  }
+  el.innerHTML=rows.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${v}</span></div>`).join('')+
+    '<canvas id="dev-chart-'+id+'" width="300" height="80" style="margin-top:8px;border:1px solid var(--line);border-radius:4px;display:block">';
+  fetchTrafficChart(id);
+}
+async function fetchTrafficChart(id){
+  const canvas=document.getElementById('dev-chart-'+id);
+  if(!canvas)return;
+  try{
+    const r=await api(`/devices/${id}/traffic`);
+    drawTrafficChart(canvas,r);
+  }catch(e){canvas.style.display='none'}
+}
+function drawTrafficChart(canvas,data){
+  const ctx=canvas.getContext('2d');
+  const W=canvas.width,H=canvas.height;
+  ctx.clearRect(0,0,W,H);
+  if(data.length<2)return;
+  // Sort by time
+  data.sort((a,b)=>new Date(a.ts)-new Date(b.ts));
+  // Find max for scaling
+  const max=Math.max(...data.flatMap(d=>[d.rx,d.tx]));
+  if(!max)return;
+  // Draw RX and TX lines
+  const drawLine=(key,color)=>{
+    ctx.strokeStyle=color;ctx.lineWidth=1.5;ctx.beginPath();
+    data.forEach((d,i)=>{
+      const x=W*i/(data.length-1);
+      const y=H-(d[key]/max)*H;
+      if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  };
+  drawLine('rx','#4da3ff');
+  drawLine('tx','#ff6b6b');
+  // Labels
+  ctx.fillStyle='var(--mut)';ctx.font='9px sans-serif';
+  ctx.fillText('RX',4,12);ctx.fillText('TX',20,12);
+}
+function selectAccess(onOk){
+  const d=document.createElement('div');
+  d.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100';
+  d.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;min-width:260px">
+    <label style="display:block;margin-bottom:6px">Access mode</label>
+    <select id="sa-sel" style="width:100%;margin-bottom:14px"><option value="ssh">SSH (root key or password)</option><option value="luci">LuCI web password</option></select>
+    <div class="row" style="justify-content:flex-end;gap:8px"><button class="act" id="sa-cancel">Cancel</button><button class="act pri" id="sa-ok">OK</button></div></div>`;
+  document.body.appendChild(d);
+  const sel=d.querySelector('#sa-sel');
+  const ok=()=>{const v=sel.value;d.remove();onOk(v)};
+  d.querySelector('#sa-ok').onclick=ok;
+  d.querySelector('#sa-cancel').onclick=()=>{d.remove();onOk(null)};
+  d.onclick=e=>{if(e.target===d)d.querySelector('#sa-cancel').click()};
+  sel.onchange=ok;
 }
 async function promptAdd(){
   const name=prompt('Name (e.g. main-router):');if(!name)return;
   const host=prompt('Host IPv4 (e.g. 192.168.1.1):');if(!host)return;
   const role=prompt('Role (router / AP / mesh / other):')||'router';
-  const access=prompt('Access: ssh (default) or luci:')||'ssh';
+  let access;
+  await new Promise(r=>selectAccess(v=>{access=v;r()}));
+  if(!access)return;
   let d={name,host,role,access};
   if(access==='ssh'){
     d.ssh_port=parseInt(prompt('SSH port:','22'))||22;
@@ -164,9 +487,12 @@ async function promptAdd(){
 }
 async function testDev(id){
   toast('Testing connection…');
-  try{const t=await api(`/devices/${id}/test`,{method:'POST'});
-    if(t.ok){toast('Connected: '+(t.detail||'ok'))}else{toast('Connect failed: '+t.detail,true)}}
-  catch(e){toast(String(e),true)}
+  try{
+    const t=await api(`/devices/${id}/test`,{method:'POST'});
+    const el=document.getElementById('devinfo-'+id);
+    if(el)el.innerHTML=`<div class="kv"><span>Test</span><span style="color:${t.ok?'var(--ok)':'var(--bad)'}">${esc(t.detail||'ok')}</span></div>`;
+    if(t.ok){toast('Connected: '+(t.detail||'ok'))}else{toast('Connect failed: '+t.detail,true)}
+  }catch(e){toast(String(e),true)}
 }
 async function pushKey(id){
   if(!confirm('Install owctl SSH key on this device? (uses current credentials once)'))return;
@@ -180,7 +506,8 @@ async function editDev(id){
   const name=prompt('Name:',d.name);if(name===null)return;
   const host=prompt('Host:',d.host);
   const access=prompt('Access (ssh/luci):',d.access);
-  const body={name:name||d.name,host:host||d.host,access:access||d.access,
+  const tags=prompt('Tags (comma-separated, e.g. home,router):',d.tags||'')||'';
+  const body={name:name||d.name,host:host||d.host,access:access||d.access,tags,
     ssh_port:d.ssh_port||22,ssh_user:d.ssh_user||'root',luci_user:d.luci_user||'root'};
   if(access==='ssh')body.ssh_password=prompt('SSH password (empty=keep):')||d.ssh_password||'';
   if(access==='luci'){body.luci_user=prompt('LuCI user:',d.luci_user||'root')||'root';
@@ -264,7 +591,9 @@ async function renderSweep(){
 }
 async function addFromSweep(host){
   const name=prompt('Name for '+host+':',host);if(!name)return;
-  const access=prompt('Access (ssh/luci):')||'ssh';
+  let access;
+  await new Promise(r=>selectAccess(v=>{access=v;r()}));
+  if(!access)return;
   let d={name,host,role:'router',access};
   if(access==='ssh'){d.ssh_user=prompt('SSH user:','root');d.ssh_password=prompt('SSH password (empty=key):')||''}
   else{d.luci_user=prompt('LuCI user:','root');d.luci_pass=prompt('LuCI password:')||'';d.luci_port=null}
@@ -324,6 +653,63 @@ async function renderAlerts(){
 }
 
 render('devices');
+
+// Bulk actions
+function toggleAll(checked){
+  document.querySelectorAll('.bulk-cb').forEach(cb=>cb.checked=checked);
+  updateBulkBtn();
+}
+function updateBulkBtn(){
+  const sel=document.querySelectorAll('.bulk-cb:checked').length;
+  const btns=document.querySelectorAll('.bulk-action-btn');
+  btns.forEach(b=>b.disabled=sel===0);
+}
+async function bulkAction(action){
+  const ids=[...document.querySelectorAll('.bulk-cb:checked')].map(cb=>parseInt(cb.dataset.id));
+  if(!ids.length) return;
+  const r=await api('/bulk',{method:'POST',body:JSON.stringify({ids,action})});
+  toast(`${r.results.filter(x=>x.ok).length}/${r.results.length} ${action}s done`);
+  renderDevices();
+}
+async function showConfigHistory(did){
+  const hist=await api(`/devices/${did}/config-history`);
+  if(!hist.length){toast('No config history');return;}
+  let html=`<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center">
+    <div style="background:var(--bg);padding:20px;border-radius:8px;max-width:600px;width:90%;max-height:80vh;overflow:auto">
+      <h3>Config History</h3>
+      <table style="width:100%;font-size:12px">
+        <tr><th>Time</th><th>Changes</th></tr>`;
+  hist.forEach(h=>{
+    const changes=h.files.filter(f=>f.includes('='));
+    html+=`<tr><td class="small">${esc(h.ts)}</td><td>${changes.map(c=>`<div>${esc(c)}</div>`).join('')}</td></tr>`;
+  });
+  html+=`</table><button class="act" style="margin-top:12px" onclick="this.closest('div[style*=fixed]').remove()">Close</button></div></div>`;
+  document.body.insertAdjacentHTML('beforeend',html);
+}
+async function renderLogs(){
+  const el=document.getElementById('tab-logs');
+  const devs=await api('/devices');
+  let html=`<h2>Device Logs</h2>
+    <div class="card"><select id="log-dev" style="width:200px">
+      ${devs.map(d=>`<option value="${d.id}">${esc(d.name)} (${esc(d.host)})</option>`).join('')}
+    </select>
+    <button class="act" onclick="loadLogs()">Load Logs</button>
+    </div>
+    <div id="log-out" style="margin-top:16px"><p class="muted">Select a device and click Load Logs.</p></div>`;
+  el.innerHTML=html;
+}
+async function loadLogs(){
+  const did=parseInt(document.getElementById('log-dev').value);
+  const out=document.getElementById('log-out');
+  out.innerHTML='<p class="muted">Loading…</p>';
+  try{
+    const logs=await api(`/devices/${did}/logs`);
+    if(!logs.length){out.innerHTML='<p class="muted">No logs yet. Check a device first.</p>';return;}
+    out.innerHTML=`<table><tr><th>Time</th><th>Message</th></tr>`+
+      logs.map(l=>`<tr><td class="small">${esc(l.ts)}</td><td style="font-family:monospace;font-size:11px">${esc(l.message)}</td></tr>`).join('')+
+      '</table>';
+  }catch(e){out.innerHTML=`<p style="color:var(--bad)">Error: ${esc(e.message)}</p>`}
+}
 </script>
 </body>
 </html>

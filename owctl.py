@@ -74,11 +74,18 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT UNIQUE, role TEXT,
         access TEXT, ssh_port INTEGER, ssh_user TEXT, ssh_password TEXT, key_path TEXT,
         luci_user TEXT, luci_pass TEXT, status TEXT DEFAULT 'unknown',
-        last_checked TEXT, added_at TEXT)""")
+        last_checked TEXT, added_at TEXT, tags TEXT)""")
     try:
         execute("ALTER TABLE devices ADD COLUMN luci_port INTEGER")
     except sqlite3.OperationalError:
         pass
+    try:
+        execute("ALTER TABLE devices ADD COLUMN health_score INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    execute("""CREATE TABLE IF NOT EXISTS config_hashes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, ts TEXT,
+        hash TEXT, UNIQUE(device_id, ts))""")
     execute("""CREATE TABLE IF NOT EXISTS findings(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, device_id INTEGER, device_name TEXT,
         rule_id TEXT, severity TEXT, message TEXT, detail TEXT, rec TEXT)""")
@@ -88,9 +95,17 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS alert_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, device TEXT, severity TEXT, rule_id TEXT,
         message TEXT, channels TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS log_entries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, device_id INTEGER, device_name TEXT,
+        facility TEXT, severity TEXT, message TEXT)""")
     execute("""CREATE TABLE IF NOT EXISTS backups(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, device_id INTEGER, device_name TEXT,
         kind TEXT, path TEXT, size INTEGER)""")
+    execute("""CREATE TABLE IF NOT EXISTS config_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, ts TEXT, hash TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS traffic_samples(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, ts TEXT,
+        iface TEXT, rx_bytes INTEGER, tx_bytes INTEGER)""")
     execute("""CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)""")
 
 
@@ -106,21 +121,29 @@ def set_setting(k, v):
 
 # ------------------------------------------------------- OpenWrt: SSH backend
 GATHER_SCRIPT = r"""
-echo '##release##'; cat /etc/openwrt_release 2>/dev/null | tr '\n' ' '
+echo '##release##'; cat /etc/openwrt_release 2>/dev/null | tr '\n' ' '; echo
 echo '##model##'; sed -n 's/.*"hostname"[^"]*"\([^"]*\)".*/\1/p' /etc/board.json 2>/dev/null
 echo '##date##'; date '+%Y-%m-%d %H:%M:%S'
 echo '##uptime##'; awk '{print int($1)}' /proc/uptime
 echo '##load##'; cut -d' ' -f1-3 /proc/loadavg
-echo '##mem##'; grep -E 'MemTotal|MemFree' /proc/meminfo | awk '{printf "%s=%s ", $1, $2}'
+echo '##mem##'; grep -E 'MemTotal|MemFree' /proc/meminfo | awk '{sub(/:/,"",\$1); printf "%s=%s ", \$1, \$2}; echo'
 echo '##disk##'; df -h /overlay 2>/dev/null | awk 'NR==2 {print $2" used="$5" free="$4}'
 echo '##clients##'; iwinfo 2>/dev/null | grep 'Associated STAs' | awk '{s+=$3} END{print s+0}'
 echo '##wan##'; ubus call network.status wan 2>/dev/null | head -c 300
 echo '##fw##'; printf 'in=%s fwd=%s out=%s\n' "$(uci -q get firewall.@defaults[0].input)" "$(uci -q get firewall.@defaults[0].forward)" "$(uci -q get firewall.@defaults[0].output)"
 echo '##dropbear##'; printf 'pwauth=%s port=%s\n' "$(uci -q get dropbear.@dropbear[0].PasswordAuth)" "$(uci -q get dropbear.@dropbear[0].Port)"
-echo '##listeners##'; netstat -tln 2>/dev/null | awk 'NR>1 {n=split($4,a,":"); if (a[n]~/^[0-9]+$/) print a[n]}' | sort -un | tr '\n' ' '
+echo '##listeners##'; netstat -tln 2>/dev/null | awk 'NR>1 {n=split($4,a,":"); if (a[n]~/^[0-9]+$/) print a[n]}' | sort -un | tr '\n' ' '; echo
 echo '##ntp##'; uci -q get system.ntp.enabled
 echo '##redirects##'; i=0; while uci -q get "firewall.@redirect[$i].name" >/dev/null 2>&1; do printf '%s %s %s\n' "$i" "$(uci -q get "firewall.@redirect[$i].name")" "$(uci -q get "firewall.@redirect[$i].dest_port")"; i=$((i+1)); done
 echo '##upgradable##'; opkg list-upgradable 2>/dev/null
+echo '##interfaces##'; ifconfig 2>/dev/null | awk '/^[a-z]/&&!/Loopback/{name=$1} /inet addr:/{split($2,a,":"); printf "%s %s\n", name, a[2]}'
+echo '##wireless##'; iwinfo 2>/dev/null | awk '/ESSID:/{essid=$0; gsub(/.*ESSID: *"/, "", essid); gsub(/".*/, "", essid)} /Mode:.*Channel:/{chan=$0; gsub(/.*Channel: */, "", chan); gsub(/ .*/, "", chan)} /Encryption:/{enc=$0; gsub(/.*Encryption: */, "", enc); printf "%s\t%s\t%s\n", essid, chan, enc}'; echo
+echo '##stations##'; iwinfo 2>/dev/null | awk '/ESSID:/{essid=$0; gsub(/.*ESSID: *"/, "", essid); gsub(/".*/, "", essid)} /Associated STAs:/{stas=$0; gsub(/.*Associated STAs: */, "", stas); gsub(/ .*/, "", stas); if (essid) print essid"\t"stas}'; echo
+echo '##neighbors##'; ip neigh show 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/{print $1"\t"$3"\t"$5}'
+echo '##dhcp##'; cat /tmp/dhcp.leases 2>/dev/null
+echo '##config##'; sha256sum /etc/config/* 2>/dev/null | awk '{print $2"="$1}'
+echo '##traffic##'; awk 'NR>2{gsub(/:/,"",$1); printf "%s %s %s\n", $1, $2, $10}' /proc/net/dev
+echo '##syslog##'; logread 2>/dev/null | tail -50
 echo '##end##'
 """
 
@@ -217,7 +240,7 @@ def _build_status(dev, backend, s):
     st["disk"] = s.get("disk", "")
     st["clients"] = int(s.get("clients") or 0)
     wan = s.get("wan", "")
-    st["wan_up"] = '"up":true' in wan or '"up": true' in wan
+    st["wan_up"] = None if not wan.strip() else ('"up":true' in wan or '"up": true' in wan)
     m = re.search(r'"ipaddr":\s*\[\s*"([^"]+)"', wan)
     st["wan_ip"] = m.group(1) if m else ""
     st.update({("fw_" + k): v for k, v in dict(re.findall(r'(in|fwd|out)=(\S+)', s.get("fw", ""))).items()})
@@ -238,6 +261,70 @@ def _build_status(dev, backend, s):
         if len(p) >= 3:
             upg.append({"pkg": p[0], "installed": p[1], "available": p[2]})
     st["upgradable"] = upg
+    # Parse interfaces: lines like "lo 127.0.0.1/8" or "wan1 100.111.198.228/10"
+    iface_map = {}
+    iface_ip = []
+    for line in s.get("interfaces", "").splitlines():
+        p = line.split()
+        if len(p) >= 2:
+            name, cidr = p[0], p[1]
+            ip = cidr.split("/")[0]
+            iface_map[name] = {"name": name, "ip": ip, "cidr": cidr}
+            iface_ip.append(ip)
+    st["interfaces"] = iface_map
+    st["ips"] = iface_ip
+    # Parse wireless: ESSID Channel Encryption (tab-separated triplets)
+    ap_list = []
+    for line in s.get("wireless", "").splitlines():
+        parts = [x.strip() for x in line.split("\t")]
+        if len(parts) < 3:
+            continue
+        essid = parts[0].replace("ESSID:", "").strip('"')
+        chan = parts[1].replace("Channel:", "").strip()
+        enc = parts[2].replace("Encryption:", "").strip()
+        # Determine band from channel
+        band = "2.4GHz" if chan and int(chan.split()[0]) <= 14 else "5GHz"
+        ap_list.append({"essid": essid, "channel": chan, "band": band, "encryption": enc if enc else "open"})
+    st["wifi"] = ap_list
+    # Parse stations: ESSID\tclient_count
+    st["stations"] = {}
+    for line in s.get("stations", "").splitlines():
+        p = line.split("\t")
+        if len(p) >= 2:
+            st["stations"][p[0]] = int(p[1])
+    # Parse neighbors: IP\tIFACE\tMAC
+    nb = []
+    for line in s.get("neighbors", "").splitlines():
+        p = line.split("\t")
+        if len(p) >= 3:
+            nb.append({"ip": p[0], "iface": p[1], "mac": p[2]})
+    st["neighbors"] = nb
+    # Parse DHCP leases: timestamp MAC IP hostname expiry
+    dhcp = []
+    for line in s.get("dhcp", "").splitlines():
+        p = line.split()
+        if len(p) >= 4:
+            dhcp.append({"mac": p[1], "ip": p[2], "hostname": p[3] if len(p) > 3 else ""})
+    st["dhcp"] = dhcp
+    # Parse config hashes: /etc/config/file hash
+    st["config_hashes"] = {}
+    for line in s.get("config", "").splitlines():
+        if "=" in line:
+            path, h = line.split("=", 1)
+            st["config_hashes"][path] = h[:12]  # store short hash
+    # Parse traffic counters: iface rx_bytes tx_bytes
+    st["traffic"] = {}
+    for line in s.get("traffic", "").splitlines():
+        p = line.split()
+        if len(p) >= 3:
+            st["traffic"][p[0]] = {"rx": int(p[1]), "tx": int(p[2])}
+    # Parse syslog: timestamp facility message
+    syslog = []
+    for line in s.get("syslog", "").splitlines():
+        p = line.split(None, 4)
+        if len(p) >= 4:
+            syslog.append({"ts": " ".join(p[:3]), "message": p[4] if len(p) > 4 else ""})
+    st["syslog"] = syslog
     return st
 
 
@@ -250,7 +337,12 @@ def ssh_gather(dev):
     if "##end##" not in raw:
         tail = (err.strip() or raw.strip())[-400:]
         raise RuntimeError(f"gather script did not complete on device (exit={status}); tail: {tail}")
-    return _build_status(dev, "ssh", _parse_sections(raw))
+    st = _build_status(dev, "ssh", _parse_sections(raw))
+    # Detect config changes and attach to status
+    changed = check_config_changes(dev, st)
+    if changed:
+        st["config_changed"] = ", ".join(changed[:5])
+    return st
 
 
 # ------------------------------------------------------ OpenWrt: LuCI backend
@@ -399,7 +491,7 @@ def audit_status(st):
         add("fw_forward_accept", "HIGH", "Firewall default FORWARD policy is ACCEPT",
             "All inter-zone forwarding allowed by default",
             "Set forward=DROP and allow only intended traffic")
-    if st.get("ntp") in ("false", "0", "disabled"):
+    if str(st.get("ntp") or "").lower() in ("false", "0", "disabled"):
         add("ntp_disabled", "LOW", "NTP time sync is disabled",
             "", "Enable system.ntp so logs and certs stay correct")
     if st.get("upgradable"):
@@ -426,6 +518,36 @@ def audit_status(st):
         except Exception:
             pass
     return f
+
+
+def check_config_changes(dev, st):
+    """Detect config file changes since last check."""
+    changed = []
+    current_hashes = st.get("config_hashes", {})
+    if not current_hashes:
+        return changed
+    prev = q("SELECT hash FROM config_hashes WHERE device_id=? ORDER BY ts DESC LIMIT 1", (dev["id"],))
+    if not prev:
+        return changed  # first check, no baseline
+    prev_map = {}
+    for h in prev[0]["hash"].splitlines():
+        if "=" in h:
+            path, hash_val = h.split("=", 1)
+            prev_map[path] = hash_val
+    for path, curr_h in current_hashes.items():
+        prev_h = prev_map.get(path)
+        if prev_h and prev_h != curr_h:
+            changed.append(path)
+    return changed
+
+
+def calc_health_score(findings):
+    """Calculate 0-100 health score based on findings severity."""
+    weights = {"CRITICAL": 25, "HIGH": 15, "MEDIUM": 8, "LOW": 3, "INFO": 1}
+    score = 100
+    for f in findings:
+        score -= weights.get(f["severity"], 0)
+    return max(0, score)
 
 
 def apply_findings(dev, st):
@@ -783,7 +905,40 @@ def check_device(dev):
     st = gather(dev)
     execute("UPDATE devices SET status='online', last_checked=? WHERE id=?", (now(), dev["id"]))
     findings = apply_findings(dev, st)
-    return {"status": st, "findings": findings}
+    # Check for config changes
+    changed = check_config_changes(dev, st)
+    if changed:
+        findings.append({"rule_id": "config_changed", "severity": "INFO",
+                         "message": f"{len(changed)} config file(s) changed",
+                         "detail": ", ".join(changed[:5]), "rec": "Review config if unexpected"})
+    # Store config hashes
+    if st.get("config_hashes"):
+        execute("DELETE FROM config_hashes WHERE device_id=? AND ts<?",
+                (dev["id"], now()))  # keep only latest
+        for path, h in st["config_hashes"].items():
+            execute("INSERT OR IGNORE INTO config_hashes(device_id, ts, hash) VALUES(?,?,?)",
+                    (dev["id"], now(), f"{path}={h}"))
+    # Store config history for diff view
+    execute("INSERT INTO config_history(device_id, ts, hash) VALUES(?,?,?)",
+            (dev["id"], now(), ";".join(f"{p}={h}" for p,h in st.get("config_hashes",{}).items())))
+    # Calculate and store health score
+    score = calc_health_score(findings)
+    execute("UPDATE devices SET health_score=? WHERE id=?", (score, dev["id"]))
+    # Store traffic samples (keep last 288 per interface = 24h at 5min intervals)
+    if st.get("traffic"):
+        for iface, counters in st["traffic"].items():
+            execute("DELETE FROM traffic_samples WHERE device_id=? AND iface=?",
+                    (dev["id"], iface))
+            execute("INSERT INTO traffic_samples(device_id, ts, iface, rx_bytes, tx_bytes) VALUES(?,?,?,?,?)",
+                    (dev["id"], now(), iface, counters["rx"], counters["tx"]))
+    # Store recent syslog entries (keep last 100 per device)
+    if st.get("syslog"):
+        execute("DELETE FROM log_entries WHERE device_id=? AND ts<?",
+                (dev["id"], now()))  # keep only latest
+        for msg in st["syslog"][-100:]:
+            execute("INSERT OR IGNORE INTO log_entries(device_id, ts, message) VALUES(?,?,?)",
+                    (dev["id"], msg["ts"], msg["message"]))
+    return {"status": st, "findings": findings, "health_score": score}
 
 
 # --------------------------------------------------------------- scheduler
@@ -860,12 +1015,13 @@ async def update_device(request: Request, did: int):
     def g(k, dflt=None):
         return d.get(k) if d.get(k) is not None else dflt
     execute("UPDATE devices SET name=?, role=?, access=?, ssh_port=?, ssh_user=?, ssh_password=?, "
-            "key_path=?, luci_user=?, luci_pass=?, luci_port=? WHERE id=?",
+            "key_path=?, luci_user=?, luci_pass=?, luci_port=?, tags=? WHERE id=?",
             (g("name", dev["name"]), g("role", dev["role"]), g("access", dev["access"]),
              int(g("ssh_port", dev["ssh_port"] or 22)), g("ssh_user", dev["ssh_user"]),
              g("ssh_password", dev["ssh_password"]), g("key_path", dev["key_path"]),
              g("luci_user", dev["luci_user"]), g("luci_pass", dev["luci_pass"]),
-             (int(g("luci_port", dev.get("luci_port") or 0)) or None), did))
+             (int(g("luci_port", dev.get("luci_port") or 0)) or None),
+             d.get("tags", dev["tags"]), did))
     return {"ok": True}
 
 
@@ -942,6 +1098,52 @@ async def device_upgrade(request: Request, did: int):
         raise
     except Exception as e:
         raise HTTPException(502, f"upgrade failed: {e}")
+
+
+@app.get("/api/devices/{did}/config-history")
+def get_config_history(did: int):
+    """Return config history for diff view."""
+    rows = q("SELECT ts, hash FROM config_history WHERE device_id=? ORDER BY ts DESC LIMIT 20", (did,))
+    return [{"ts": r["ts"], "files": r["hash"].split(";")} for r in rows]
+
+
+@app.get("/api/devices/{did}/traffic")
+def get_traffic_history(did: int):
+    """Return recent traffic samples for charting."""
+    rows = q("SELECT ts, iface, rx_bytes, tx_bytes FROM traffic_samples WHERE device_id=? ORDER BY ts DESC LIMIT 24", (did,))
+    return [{"ts": r["ts"], "iface": r["iface"], "rx": r["rx_bytes"], "tx": r["tx_bytes"]} for r in rows]
+
+
+@app.post("/api/bulk")
+async def bulk_actions(request: Request):
+    """Execute same action on multiple devices."""
+    d = await request.json()
+    ids = d.get("ids") or []
+    action = d.get("action")  # check, backup, reboot
+    results = []
+    for did in ids:
+        cur = q("SELECT * FROM devices WHERE id=?", (did,))
+        if not cur:
+            continue
+        dev = cur[0]
+        try:
+            if action == "check":
+                check_device(dev)
+            elif action == "backup":
+                do_backup(dev)
+            elif action == "reboot":
+                do_reboot(dev)
+            results.append({"id": did, "name": dev["name"], "ok": True})
+        except Exception as e:
+            results.append({"id": did, "name": dev["name"], "ok": False, "error": str(e)})
+    return {"results": results}
+
+
+@app.get("/api/devices/{did}/logs")
+def get_device_logs(did: int):
+    """Return recent syslog entries for a device."""
+    rows = q("SELECT ts, message FROM log_entries WHERE device_id=? ORDER BY ts DESC LIMIT 50", (did,))
+    return [{"ts": r["ts"], "message": r["message"]} for r in rows]
 
 
 @app.post("/api/devices/{did}/reboot")

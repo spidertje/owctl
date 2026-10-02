@@ -49,7 +49,7 @@ OpenWrt 23.05.4 (goldman) r24046-85e4097894
 ##load##
 0.05 0.01 0.00
 ##mem##
-MemTotal=511788 MemFree=200000
+MemTotal:=511788 MemFree:=200000
 ##disk##
 287M used=45% free=120M
 ##clients##
@@ -69,6 +69,12 @@ true
 ##upgradable##
 base-files 23.05.4-1 23.05.5-1
 luci 23.053.2-1 23.053.3-1
+##interfaces##
+br-lan 192.168.1.1
+lo 127.0.0.1
+##wireless##
+spidertje\t8\tWPA-PSK (CCMP)
+spidertje2-fast\t120\tnone
 ##end##
 """
 
@@ -342,6 +348,8 @@ def main():
     # point owctl at the scratch dir (server key + backups)
     owctl.DATA_DIR = scratch
     owctl.BACKUP_DIR = scratch
+    owctl.DB_PATH = os.path.join(scratch, "test.db")
+    owctl.init_db()
 
     ssh_port, luci_port = 22222, 8091
     start_ssh_server(ssh_port)
