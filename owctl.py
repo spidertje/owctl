@@ -979,7 +979,8 @@ def do_guest_wifi(dev, ssid, password, vlan_id=None):
         if "wifi-iface" not in out and "wifi-device" not in out:
             raise HTTPException(400, f"{dev['name']} has no wireless interface")
         # Generate UCI config for guest WiFi
-        iface_name = f"guest_{ssid.replace(' ', '_')}"
+        # Sanitize: UCI section names can only contain [a-zA-Z0-9_]
+        iface_name = f"guest_{ssid.replace(' ', '_').replace('-', '_')}"
         cmd = f"""uci set wireless.{iface_name}=wifi-iface
 uci set wireless.{iface_name}.device='radio0'
 uci set wireless.{iface_name}.network='lan'"""
