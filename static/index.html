@@ -115,7 +115,13 @@ async function renderDevices(){
       <button class="act bulk-action-btn" onclick="bulkAction('check')" disabled>Check Selected</button>
       <button class="act bulk-action-btn" onclick="bulkAction('backup')" disabled>Backup Selected</button>
       <button class="act" onclick="renderDevices()">Refresh</button>
-      <button class="act pri" onclick="promptAdd()">+ Add device</button>
+      <div class="dropdown" style="position:relative;display:inline-block">
+        <button class="act pri">+ Add device ▾</button>
+        <div class="dropdown-menu" style="display:none;position:absolute;right:0;top:100%;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:6px;min-width:180px;z-index:50;margin-top:4px">
+          <button class="act" onclick="promptAdd();this.closest('.dropdown').style.display='none'" style="width:100%;text-align:left">Add manually</button>
+          <button class="act" onclick="goSweep();this.closest('.dropdown').style.display='none'" style="width:100%;text-align:left">Scan network (Sweep)</button>
+        </div>
+      </div>
     </div></div>`;
   if(!devs.length)html+=`<p class="muted">No devices yet. Add one manually, or run a <button class="act" onclick="goSweep()">LAN sweep</button>.</p>`;
   html+=`<div id="dev-grid" class="grid">`;
@@ -549,6 +555,16 @@ async function delDev(id){if(!confirm('Delete this device?'))return;await api(`/
 async function backup(id){
   try{const r=await api(`/devices/${id}/backup`,{method:'POST'});toast('Backup saved: '+r.backup)}catch(e){toast(String(e),true)}
 }
+// Dropdown toggle for add device button
+function toggleDropdown(e) {
+  const dd = e.target.closest('.dropdown');
+  if (!dd) return;
+  const menu = dd.querySelector('.dropdown-menu');
+  menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+  e.stopPropagation();
+}
+document.addEventListener('click', toggleDropdown);
+document.querySelector('.dropdown button').addEventListener('click', e => e.stopPropagation());
 async function restore(id){
   try{
     const bks=await api('/backups');
