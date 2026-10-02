@@ -138,6 +138,7 @@ async function renderDevices(){
         <button class="act" onclick="backup(${d.id})">Backup</button>
         <button class="act" onclick="openUpgrades(${d.id})">Updates</button>
         <button class="act" onclick="reboot(${d.id})">Reboot</button>
+        <button class="act" onclick="restore(${d.id})">Restore</button>
         <button class="act" onclick="showConfigHistory(${d.id})">Config History</button>
         <button class="act" onclick="editDev(${d.id})">Edit</button>
         <button class="act" onclick="delDev(${d.id})">Delete</button>
@@ -547,6 +548,40 @@ async function editDev(id){
 async function delDev(id){if(!confirm('Delete this device?'))return;await api(`/devices/${id}`,{method:'DELETE'});renderDevices()}
 async function backup(id){
   try{const r=await api(`/devices/${id}/backup`,{method:'POST'});toast('Backup saved: '+r.backup)}catch(e){toast(String(e),true)}
+}
+async function restore(id){
+  try{
+    const bks=await api('/backups');
+    const devBks=bks.filter(b=>b.device_id===id);
+    if(!devBks.length){toast('No backups for this device');return}
+    const pick=await pickBackup(devBks);
+    if(!pick)return;
+    if(!confirm(`Restore config from ${pick.ts}? This will overwrite current settings.`))return;
+    toast('Restoring…');
+    const r=await api(`/devices/${id}/restore`,{method:'POST',body:JSON.stringify({path:pick.path})});
+    toast('Restored: '+pick.ts);
+  }catch(e){toast(String(e),true)}
+}
+async function pickBackup(list){
+  return new Promise(r=>{
+    const d=document.createElement('div');
+    d.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100';
+    d.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;min-width:300px;max-width:500px">
+      <h3 style="margin:0 0 12px">Pick backup</h3>
+      <select id="bk-sel" style="width:100%;margin-bottom:14px;max-height:200px">
+        ${list.map(b=>`<option value="${esc(b.path)}">${esc(b.ts)} (${b.size} bytes)</option>`).join('')}
+      </select>
+      <div class="row" style="justify-content:flex-end;gap:8px">
+        <button class="act" id="bk-cancel">Cancel</button>
+        <button class="act pri" id="bk-ok">Restore</button>
+      </div></div>`;
+    document.body.appendChild(d);
+    const sel=d.querySelector('#bk-sel');
+    const ok=()=>{const v=sel.value;d.remove();r(v)};
+    d.querySelector('#bk-ok').onclick=ok;
+    d.querySelector('#bk-cancel').onclick=()=>{d.remove();r(null)};
+    d.onclick=e=>{if(e.target===d)d.querySelector('#bk-cancel').click()};
+  });
 }
 async function reboot(id){if(!confirm('Reboot this device now?'))return;try{await api(`/devices/${id}/reboot`,{method:'POST'});toast('Reboot sent')}catch(e){toast(String(e),true)}}
 async function openUpgrades(id){

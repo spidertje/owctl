@@ -867,6 +867,40 @@ def do_backup(dev):
     return local
 
 
+def do_restore(dev, backup_path):
+    """Restore device config from a backup file. Only for SSH-accessible devices."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "restore requires SSH access on this device")
+    if not os.path.exists(backup_path):
+        raise HTTPException(404, "backup file not found")
+    with open(backup_path, "r") as fh:
+        content = fh.read()
+    if not content.strip():
+        raise HTTPException(400, "backup file is empty")
+    c = _ssh_connect(dev)
+    try:
+        remote = f"/tmp/owctl-restore-{os.path.basename(backup_path)}"
+        # ponytail: write file via stdin pipe (avoid large command strings)
+        stdin, stdout, stderr = c.exec_command(f"cat > {remote}", timeout=120)
+        with open(backup_path, "rb") as fh:
+            data = fh.read()
+        stdin.write(data)
+        stdin.close()
+        stdout.read()
+        # Import and commit
+        stdin, stdout, stderr = c.exec_command(f"uci import < {remote} && uci commit", timeout=60)
+        out = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace")
+        status = stdout.channel.recv_exit_status()
+        c.exec_command(f"rm -f {remote}")
+        if status != 0:
+            raise RuntimeError(f"uci import failed (exit={status}): {(err or out)[:200]}")
+        return {"restored": True, "file": backup_path, "output": out[:500]}
+    except Exception as e:
+        c.close()
+        raise RuntimeError(f"restore failed: {e}") from e
+
+
 def do_upgrade(dev, packages):
     if dev["access"] != "ssh":
         raise HTTPException(400, "package upgrades require SSH access on this device")
@@ -1084,6 +1118,23 @@ def device_backup(did: int):
         raise
     except Exception as e:
         raise HTTPException(502, f"backup failed: {e}")
+
+
+@app.post("/api/devices/{did}/restore")
+async def device_restore(request: Request, did: int):
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    d = await request.json()
+    path = d.get("path", "")
+    if not path:
+        raise HTTPException(400, "backup path required")
+    try:
+        return do_restore(cur[0], path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"restore failed: {e}")
 
 
 @app.post("/api/devices/{did}/upgrade")
