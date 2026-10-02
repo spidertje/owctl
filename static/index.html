@@ -6,6 +6,7 @@
 <title>owctl — OpenWrt control</title>
 <style>
 :root{--bg:#0f1420;--panel:#161d2e;--panel2:#1c2540;--tx:#dbe4f5;--mut:#8b98b8;--acc:#4da3ff;--ok:#39c07f;--warn:#f5b544;--bad:#f4636e;--crit:#ff5470;--line:#26314f}
+.light{--bg:#f0f2f5;--panel:#fff;--panel2:#e8eaf0;--tx:#1a1a2e;--mut:#6b7280;--line:#d1d5db}
 *{box-sizing:border-box}
 body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
 header{display:flex;align-items:center;gap:14px;padding:14px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
@@ -56,6 +57,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
     <button data-tab="map">Network Map</button>
     <button data-tab="logs">Device Logs</button>
   </nav>
+  <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
 </header>
 <main>
   <section id="tab-devices"></section>
@@ -107,6 +109,7 @@ async function renderDevices(){
   let html=`<div class="row" style="justify-content:space-between;margin-bottom:12px">
     <strong>Devices (${devs.length})</strong>
     <div class="row">
+      <input type="text" id="dev-search" placeholder="Search…" style="width:160px" oninput="filterDevices(this.value)">
       <input type="checkbox" id="bulk-all" onchange="toggleAll(this.checked)">
       <label for="bulk-all" class="small muted">Select all</label>
       <button class="act bulk-action-btn" onclick="bulkAction('check')" disabled>Check Selected</button>
@@ -115,12 +118,12 @@ async function renderDevices(){
       <button class="act pri" onclick="promptAdd()">+ Add device</button>
     </div></div>`;
   if(!devs.length)html+=`<p class="muted">No devices yet. Add one manually, or run a <button class="act" onclick="goSweep()">LAN sweep</button>.</p>`;
-  html+=`<div class="grid">`;
+  html+=`<div id="dev-grid" class="grid">`;
   for(const d of devs){
     const badge=`<span class="badge b-${d.status}">${d.status}</span>`;
     const hs=d.health_score!=null?`<span class="badge ${d.health_score>=80?'b-online':d.health_score>=50?'b-MEDIUM':'b-CRITICAL'}" style="margin-left:6px">${d.health_score}</span>`:'';
     const tags=d.tags?`<span style="color:var(--mut);font-size:11px;margin-left:8px">#${esc(d.tags)}</span>`:'';
-    html+=`<div class="card" id="dev-${d.id}">
+    html+=`<div class="card dev-card" data-id="${d.id}" data-name="${esc(d.name)}" data-host="${esc(d.host)}">
       <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px">
         <input type="checkbox" class="bulk-cb" data-id="${d.id}" onchange="updateBulkBtn()">
         <span class="small muted">${esc(d.host)}</span>
@@ -144,6 +147,20 @@ async function renderDevices(){
   html+=`</div>`;
   host.innerHTML=html;
 }
+function filterDevices(q){
+  q=q.toLowerCase();
+  document.querySelectorAll('.dev-card').forEach(c=>{
+    const txt=(c.dataset.name+' '+c.dataset.host).toLowerCase();
+    c.style.display=txt.includes(q)?'':'none';
+  });
+}
+let _pollTm=null;
+function startPolling(ms=60000){
+  stopPolling();
+  renderDevices();
+  _pollTm=setInterval(renderDevices,ms);
+}
+function stopPolling(){if(_pollTm){clearInterval(_pollTm);_pollTm=null;}}
 function goSweep(){document.querySelector('nav button[data-tab=sweep]').click()}
 async function chk(id){
   toast('Checking…');
@@ -412,6 +429,15 @@ function showDevInfo(id,st,fromMap=false){
   if(st.config_changed){
     rows.push(['Config',`<span style="color:var(--warn)">${esc(st.config_changed)}</span>`]);
   }
+  try{
+    const bw=await api(`/devices/${id}/bandwidth`);
+    if(bw.ifaces&&Object.keys(bw.ifaces).length){
+      rows.push(['Bandwidth','']);
+      Object.entries(bw.ifaces).forEach(([iface,b])=>{
+        rows.push([`  ${iface}`,`RX ${b.rx_mbps} / TX ${b.tx_mbps} Mbps`]);
+      });
+    }
+  }catch(e){}
   el.innerHTML=rows.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${v}</span></div>`).join('')+
     '<canvas id="dev-chart-'+id+'" width="300" height="80" style="margin-top:8px;border:1px solid var(--line);border-radius:4px;display:block">';
   fetchTrafficChart(id);
@@ -653,6 +679,9 @@ async function renderAlerts(){
 }
 
 render('devices');
+function toggleTheme(){document.body.classList.toggle('light')}
+// ponytail: auto-refresh every 60s on devices tab
+startPolling(60000);
 
 // Bulk actions
 function toggleAll(checked){

@@ -1110,8 +1110,34 @@ def get_config_history(did: int):
 @app.get("/api/devices/{did}/traffic")
 def get_traffic_history(did: int):
     """Return recent traffic samples for charting."""
-    rows = q("SELECT ts, iface, rx_bytes, tx_bytes FROM traffic_samples WHERE device_id=? ORDER BY ts DESC LIMIT 24", (did,))
+    rows = q("SELECT ts, iface, rx_bytes, tx_bytes FROM traffic_samples WHERE device_id=? ORDER BY ts DESC LIMIT 48", (did,))
     return [{"ts": r["ts"], "iface": r["iface"], "rx": r["rx_bytes"], "tx": r["tx_bytes"]} for r in rows]
+
+
+@app.get("/api/devices/{did}/bandwidth")
+def get_bandwidth(did: int):
+    """Calculate current Mbps from latest traffic samples."""
+    rows = q("SELECT ts, iface, rx_bytes, tx_bytes FROM traffic_samples WHERE device_id=? ORDER BY ts DESC", (did,))
+    if len(rows) < 2:
+        return {"ifaces": {}}
+    by_iface = {}
+    for r in rows:
+        key = r["iface"]
+        if key not in by_iface:
+            by_iface[key] = []
+        by_iface[key].append(r)
+    result = {}
+    for iface, samples in by_iface.items():
+        if len(samples) < 2:
+            continue
+        a, b = samples[0], samples[1]
+        dt = (datetime.fromisoformat(b["ts"]) - datetime.fromisoformat(a["ts"])).total_seconds()
+        if dt <= 0:
+            continue
+        rx_mbps = ((b["rx_bytes"] - a["rx_bytes"]) * 8) / (dt * 1_000_000)
+        tx_mbps = ((b["tx_bytes"] - a["tx_bytes"]) * 8) / (dt * 1_000_000)
+        result[iface] = {"rx_mbps": round(rx_mbps, 2), "tx_mbps": round(tx_mbps, 2)}
+    return {"ifaces": result}
 
 
 @app.post("/api/bulk")
