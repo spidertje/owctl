@@ -144,6 +144,7 @@ echo '##dhcp##'; cat /tmp/dhcp.leases 2>/dev/null
 echo '##config##'; sha256sum /etc/config/* 2>/dev/null | awk '{print $2"="$1}'
 echo '##traffic##'; awk 'NR>2{gsub(/:/,"",$1); printf "%s %s %s\n", $1, $2, $10}' /proc/net/dev
 echo '##syslog##'; logread 2>/dev/null | tail -50
+echo '##vlans##'; uci show network 2>/dev/null | grep -E 'switch|vlan' | awk '{print $0}'
 echo '##end##'
 """
 
@@ -325,6 +326,18 @@ def _build_status(dev, backend, s):
         if len(p) >= 4:
             syslog.append({"ts": " ".join(p[:3]), "message": p[4] if len(p) > 4 else ""})
     st["syslog"] = syslog
+    # Parse VLAN config
+    st["vlans"] = []
+    for line in s.get("vlans", "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("config vlan"):
+            parts = line.split()
+            vlan_id = parts[2].strip("'\"")
+            st["vlans"].append({"type": "vlan", "id": vlan_id, "raw": line})
+        elif line.startswith("config switch"):
+            st["vlans"].append({"type": "switch", "raw": line})
     return st
 
 
@@ -901,7 +914,57 @@ def do_restore(dev, backup_path):
         raise RuntimeError(f"restore failed: {e}") from e
 
 
-def do_upgrade(dev, packages):
+def do_vlan(dev, vlan_id, name, subnet, dhcp, devices, router_id):
+    """Apply VLAN config to a device. router_id is the device that will act as router."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "VLAN config requires SSH access")
+    c = _ssh_connect(dev)
+    try:
+        is_router = dev["id"] == router_id
+        if is_router:
+            # Router: create routed interface + firewall zone
+            ip = subnet.split("/")[0].rsplit(".", 1)[0] + ".1"
+            mask = subnet.split("/")[1] if "/" in subnet else "24"
+            mask_full = {"8": "0.0.0.0", "16": "0.0.255.255", "24": "0.0.0.255", "30": "0.0.0.3"}.get(mask, "0.0.0.255")
+            cmd = f"""uci set network.vlan_{vlan_id}=interface
+uci set network.vlan_{vlan_id}.proto='static'
+uci set network.vlan_{vlan_id}.ipaddr='{ip}'
+uci set network.vlan_{vlan_id}.netmask='255.255.255.{mask_full}'
+uci set network.vlan_{vlan_id}.ifname='br-lan.{vlan_id}'
+"""
+            if dhcp:
+                cmd += f"""uci set dhcp.vlan_{vlan_id}=dhcp
+uci set dhcp.vlan_{vlan_id}.interface='vlan_{vlan_id}'
+uci set dhcp.vlan_{vlan_id}.start='100'
+uci set dhcp.vlan_{vlan_id}.limit='150'
+uci set dhcp.vlan_{vlan_id}.lease_time='12h'
+"""
+            cmd += f"""uci set zone.vlan_{vlan_id}=zone
+uci set zone.vlan_{vlan_id}.name='vlan_{vlan_id}'
+uci set zone.vlan_{vlan_id}.network='vlan_{vlan_id}'
+uci set zone.vlan_{vlan_id}.input='ACCEPT'
+uci set zone.vlan_{vlan_id}.output='ACCEPT'
+uci set zone.vlan_{vlan_id}.forward='REJECT'
+uci commit network
+uci commit dhcp
+uci commit firewall
+"""
+        else:
+            # Switch: tag ports with VLAN
+            cmd = f"""uci set network.vlan_{vlan_id}=switch
+uci set network.vlan_{vlan_id}.vlan='{vlan_id}'
+uci set network.vlan_{vlan_id}.device='switch0'
+uci commit network
+"""
+        stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
+        out = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace")
+        status = stdout.channel.recv_exit_status()
+        if status != 0:
+            raise RuntimeError(f"VLAN config failed on {dev['name']}: {(err or out)[:200]}")
+        return {"device": dev["name"], "role": "router" if is_router else "switch", "ok": True}
+    finally:
+        c.close()
     if dev["access"] != "ssh":
         raise HTTPException(400, "package upgrades require SSH access on this device")
     c = _ssh_connect(dev)
@@ -1135,6 +1198,31 @@ async def device_restore(request: Request, did: int):
         raise
     except Exception as e:
         raise HTTPException(502, f"restore failed: {e}")
+
+
+@app.post("/api/vlans/apply")
+async def apply_vlan(request: Request):
+    """Apply VLAN config across multiple devices."""
+    d = await request.json()
+    vlan_id = d.get("vlan_id")
+    name = d.get("name", f"vlan_{vlan_id}")
+    subnet = d.get("subnet", "192.168.10.0/24")
+    dhcp = d.get("dhcp", True)
+    devices = d.get("devices", [])
+    router_id = d.get("router_id")
+    if not vlan_id or not devices:
+        raise HTTPException(400, "vlan_id and devices required")
+    results = []
+    for did in devices:
+        cur = q("SELECT * FROM devices WHERE id=?", (did,))
+        if not cur:
+            continue
+        try:
+            r = do_vlan(cur[0], vlan_id, name, subnet, dhcp, devices, router_id)
+            results.append(r)
+        except Exception as e:
+            results.append({"device": cur[0]["name"], "ok": False, "error": str(e)})
+    return {"results": results}
 
 
 @app.post("/api/devices/{did}/upgrade")

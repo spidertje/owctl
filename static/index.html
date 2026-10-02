@@ -55,6 +55,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
     <button data-tab="sweep">Sweep</button>
     <button data-tab="alerts">Alerting</button>
     <button data-tab="map">Network Map</button>
+    <button data-tab="vlans">VLANs</button>
     <button data-tab="logs">Device Logs</button>
   </nav>
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
@@ -65,6 +66,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <section id="tab-sweep" style="display:none"></section>
   <section id="tab-alerts" style="display:none"></section>
   <section id="tab-map" style="display:none"></section>
+  <section id="tab-vlans" style="display:none"></section>
   <section id="tab-logs" style="display:none"></section>
 </main>
 <div id="toast"></div>
@@ -99,6 +101,7 @@ function render(tab){
   if(tab==='alerts')return renderAlerts();
   if(tab==='map')return renderMap();
   if(tab==='logs')return renderLogs();
+  if(tab==='vlans')return renderVlans();
 }
 function fmtUptime(s){if(!s&&s!==0)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
 function fmtKB(k){return k>1048576?(k/1048576).toFixed(1)+' GB':(k/1024).toFixed(0)+' MB'}
@@ -792,6 +795,57 @@ async function loadLogs(){
       logs.map(l=>`<tr><td class="small">${esc(l.ts)}</td><td style="font-family:monospace;font-size:11px">${esc(l.message)}</td></tr>`).join('')+
       '</table>';
   }catch(e){out.innerHTML=`<p style="color:var(--bad)">Error: ${esc(e.message)}</p>`}
+
+async function renderVlans(){
+  const el=document.getElementById('tab-vlans');
+  const devs=await api('/devices');
+  const router=devs.find(d=>d.role==='router')||devs[0];
+  let html=`<h2>VLAN Configuration</h2>
+    <p class="muted">Create and manage VLANs across your network. Each VLAN isolates devices into separate broadcast domains.</p>
+    <div class="card">
+      <h3>Create New VLAN</h3>
+      <div class="row" style="margin-bottom:12px">
+        <div><label>VLAN ID</label><input id="vlan-id" type="number" min="1" max="4094" value="10" style="width:80px"></div>
+        <div style="flex:1"><label>Name / Description</label><input id="vlan-name" placeholder="e.g. Office Devices" style="width:100%"></div>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <div><label>Subnet</label><input id="vlan-subnet" placeholder="192.168.10.0/24" style="width:180px"></div>
+        <div style="display:flex;align-items:flex-end">
+          <label style="margin:0 8px 0 0"><input type="checkbox" id="vlan-dhcp" checked> Enable DHCP</label>
+        </div>
+        <div style="flex:1"><label>Router Device</label><select id="vlan-router" style="width:100%">${devs.map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
+      </div>
+      <div style="margin-bottom:12px">
+        <label>Member Devices</label>
+        <div id="vlan-devices" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+          ${devs.map(d=>`<label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="vlan-dev-cb" value="${d.id}"> ${esc(d.name)} (${esc(d.host)})</label>`).join('')}
+        </div>
+      </div>
+      <button class="act pri" onclick="applyVlan()">Apply VLAN</button>
+    </div>
+    <div id="vlan-results" style="margin-top:16px"></div>`;
+  el.innerHTML=html;
+}
+async function applyVlan(){
+  const dids=[...document.querySelectorAll('.vlan-dev-cb:checked')].map(cb=>parseInt(cb.value));
+  if(!dids.length){toast('Select at least one device',true);return}
+  const vlan_id=parseInt(document.getElementById('vlan-id').value);
+  const name=document.getElementById('vlan-name').value||'vlan_'+vlan_id;
+  const subnet=document.getElementById('vlan-subnet').value||'192.168.'+vlan_id+'.0/24';
+  const dhcp=document.getElementById('vlan-dhcp').checked;
+  const router_id=parseInt(document.getElementById('vlan-router').value);
+  try{
+    toast('Applying VLAN '+vlan_id+'...');
+    const r=await api('/vlans/apply',{method:'POST',body:JSON.stringify({vlan_id,name,subnet,dhcp,devices:dids,router_id})});
+    const ok=r.results.filter(x=>x.ok).length;
+    const fail=r.results.filter(x=>!x.ok).length;
+    document.getElementById('vlan-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>VLAN applied</strong><br>${ok} devices configured successfully${fail?', '+fail+' failed':''}</div>`;
+    toast('VLAN '+vlan_id+' applied');
+  }catch(e){
+    document.getElementById('vlan-results').innerHTML=`<div class="card" style="border-color:var(--bad)"><strong>Failed</strong><br>${esc(String(e))}</div>`;
+    toast(String(e),true);
+  }
+}
 }
 </script>
 </body>
