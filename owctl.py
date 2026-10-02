@@ -965,6 +965,55 @@ uci commit network
         return {"device": dev["name"], "role": "router" if is_router else "switch", "ok": True}
     finally:
         c.close()
+
+
+def do_guest_wifi(dev, ssid, password, vlan_id=None):
+    """Create a guest WiFi interface on a device. Requires wireless-capable device."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "guest WiFi requires SSH access")
+    # Check if device has wireless (simple heuristic: check for wifi-iface config)
+    c = _ssh_connect(dev)
+    try:
+        stdin, stdout, stderr = c.exec_command("uci show wireless 2>/dev/null | head -5", timeout=10)
+        out = stdout.read().decode()
+        c.close()
+        if "wifi-iface" not in out and "wifi-device" not in out:
+            raise HTTPException(400, f"{dev['name']} has no wireless interface")
+        # Generate UCI config for guest WiFi
+        iface_name = f"guest_{ssid.replace(' ', '_')}"
+        cmd = f"""uci set wireless.{iface_name}=wifi-iface
+uci set wireless.{iface_name}.device='radio0'
+uci set wireless.{iface_name}.network='lan'"""
+        if vlan_id:
+            cmd += f"\nuci set wireless.{iface_name}.network='vlan_{vlan_id}'"
+        cmd += f"""
+uci set wireless.{iface_name}.mode='ap'
+uci set wireless.{iface_name}.ssid='{ssid}'
+uci set wireless.{iface_name}.encryption='psk2'
+uci set wireless.{iface_name}.key='{password}'
+uci set zone.guest_wifi=zone
+uci set zone.guest_wifi.name='guest_wifi'
+uci set zone.guest_wifi.network='wireless_guest'
+uci set zone.guest_wifi.input='ACCEPT'
+uci set zone.guest_wifi.output='ACCEPT'
+uci set zone.guest_wifi.forward='REJECT'
+uci commit wireless
+uci commit firewall"""
+        c = _ssh_connect(dev)
+        stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        status = stdout.channel.recv_exit_status()
+        if status != 0:
+            raise RuntimeError(f"guest WiFi config failed: {(err or out)[:200]}")
+        c.exec_command("wifi 2>/dev/null || true")
+        return {"ssid": ssid, "ok": True, "output": out[:300]}
+    finally:
+        if 'c' in dir():
+            c.close()
+
+
+def do_upgrade(dev, packages):
     if dev["access"] != "ssh":
         raise HTTPException(400, "package upgrades require SSH access on this device")
     c = _ssh_connect(dev)
@@ -1223,6 +1272,26 @@ async def apply_vlan(request: Request):
         except Exception as e:
             results.append({"device": cur[0]["name"], "ok": False, "error": str(e)})
     return {"results": results}
+
+
+@app.post("/api/devices/{did}/guest-wifi")
+async def device_guest_wifi(request: Request, did: int):
+    """Create guest WiFi on a device."""
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    d = await request.json()
+    ssid = d.get("ssid", "")
+    password = d.get("password", "")
+    vlan_id = d.get("vlan_id")
+    if not ssid or not password:
+        raise HTTPException(400, "ssid and password required")
+    try:
+        return do_guest_wifi(cur[0], ssid, password, vlan_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"guest WiFi failed: {e}")
 
 
 @app.post("/api/devices/{did}/upgrade")

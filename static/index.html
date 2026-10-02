@@ -147,6 +147,7 @@ async function renderDevices(){
         <button class="act" onclick="backup(${d.id})">Backup</button>
         <button class="act" onclick="openUpgrades(${d.id})">Updates</button>
         <button class="act" onclick="reboot(${d.id})">Reboot</button>
+        <button class="act" onclick="showGuestWifi(${d.id})">Guest WiFi</button>
         <button class="act" onclick="restore(${d.id})">Restore</button>
         <button class="act" onclick="showConfigHistory(${d.id})">Config History</button>
         <button class="act" onclick="editDev(${d.id})">Edit</button>
@@ -846,6 +847,38 @@ async function applyVlan(){
     document.getElementById('vlan-results').innerHTML=`<div class="card" style="border-color:var(--bad)"><strong>Failed</strong><br>${esc(String(e))}</div>`;
     toast(String(e),true);
   }
+}
+async function showGuestWifi(did){
+  const devs=await api('/devices');
+  const d=devs.find(x=>x.id===did);
+  if(!d)return;
+  const modal=document.createElement('div');
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;min-width:350px;max-width:450px">
+    <h3 style="margin:0 0 16px">Create Guest WiFi</h3>
+    <div style="margin-bottom:12px"><label>SSID (network name)</label><input id="gw-ssid" placeholder="e.g. Guest-Network" style="width:100%"></div>
+    <div style="margin-bottom:12px"><label>Password</label><input id="gw-pwd" type="password" placeholder="WPA2 password" style="width:100%"></div>
+    <div style="margin-bottom:12px"><label>VLAN (optional)</label><select id="gw-vlan" style="width:100%"><option value="">— none —</option></select></div>
+    <div class="row" style="justify-content:flex-end;gap:8px">
+      <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
+      <button class="act pri" id="gw-apply">Create</button>
+    </div></div>`;
+  document.body.appendChild(modal);
+  try{const vlans=await api('/vlans');modal.querySelector('#gw-vlan').innerHTML=vlans.map(v=>`<option value="${v.id}">VLAN ${v.id}</option>`).join('');}catch(e){}
+  modal.querySelector('#gw-apply').onclick=async()=>{
+    const ssid=modal.querySelector('#gw-ssid').value.trim();
+    const pwd=modal.querySelector('#gw-pwd').value.trim();
+    const vlan_id=modal.querySelector('#gw-vlan').value||null;
+    if(!ssid||!pwd){toast('SSID and password required',true);return}
+    try{
+      toast('Creating guest WiFi...');
+      const r=await api(`/devices/${did}/guest-wifi`,{method:'POST',body:JSON.stringify({ssid,password:pwd,vlan_id})});
+      toast('Guest WiFi created: '+ssid);
+      modal.remove();
+    }catch(e){toast(String(e),true)}
+  };
+  modal.querySelector('button').addEventListener('click',()=>modal.remove());
+  modal.onclick=e=>{if(e.target===modal)modal.remove()};
 }
 </script>
 </body>
