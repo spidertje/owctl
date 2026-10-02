@@ -75,6 +75,10 @@ def init_db():
         access TEXT, ssh_port INTEGER, ssh_user TEXT, ssh_password TEXT, key_path TEXT,
         luci_user TEXT, luci_pass TEXT, status TEXT DEFAULT 'unknown',
         last_checked TEXT, added_at TEXT)""")
+    try:
+        execute("ALTER TABLE devices ADD COLUMN luci_port INTEGER")
+    except sqlite3.OperationalError:
+        pass
     execute("""CREATE TABLE IF NOT EXISTS findings(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, device_id INTEGER, device_name TEXT,
         rule_id TEXT, severity TEXT, message TEXT, detail TEXT, rec TEXT)""")
@@ -130,26 +134,74 @@ def _parse_sections(raw):
             sections[cur] = []
         elif cur is not None:
             sections[cur].append(line)
-    return {k: " ".join(v).strip() for k, v in sections.items()}
+    # Join multi-line sections with a NEWLINE (not a space): sections that hold
+    # one record per line (upgradable packages, port redirects) must keep their
+    # line structure so _build_status can splitlines() them back into records.
+    return {k: "\n".join(v).strip() for k, v in sections.items()}
 
 
 def _ssh_connect(dev):
     import paramiko
+    import socket as _socket
+    from paramiko.ssh_exception import AuthenticationException as SSHAuthError
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     kw = dict(hostname=dev["host"], port=int(dev.get("ssh_port") or 22),
               username=dev.get("ssh_user") or "root", timeout=15,
+              banner_timeout=20, auth_timeout=20,
               allow_agent=False, look_for_keys=False)
     if dev.get("key_path"):
         kw["key_filename"] = dev["key_path"]
     elif dev.get("ssh_password"):
         kw["password"] = dev["ssh_password"]
     else:
-        kp = ensure_server_key()
-        if os.path.exists(kp):
-            kw["key_filename"] = kp
-    c.connect(**kw)
+        kw["key_filename"] = ensure_server_key()
+    try:
+        c.connect(**kw)
+    except SSHAuthError as e:
+        if dev.get("ssh_password"):
+            raise RuntimeError(f"SSH authentication failed for {dev.get('ssh_user')}@{dev['host']} "
+                               f"— check the password") from e
+        raise RuntimeError(f"SSH key rejected by {dev['host']} — set a password on the device "
+                           f"or install our key first (Push SSH key)") from e
+    except _socket.timeout as e:
+        raise RuntimeError(f"SSH connect to {dev['host']}:{kw['port']} timed out — is the device up?") from e
+    except _socket.gaierror as e:
+        raise RuntimeError(f"SSH: cannot resolve host {dev['host']}") from e
+    except _socket.error as e:
+        raise RuntimeError(f"SSH connect to {dev['host']}:{kw['port']} failed — check the address/port: {e}") from e
     return c
+
+
+def _exec_capture(client, cmd, timeout=300):
+    """Run cmd on an open client, draining stdout+stderr in parallel (no pipe deadlock).
+    Returns (stdout, stderr, exit_status)."""
+    chan = client.get_transport().open_session()
+    chan.exec_command(cmd)
+    out_q, err_q = [], []
+
+    def drain(f, q):
+        try:
+            while True:
+                b = f.read(65536)
+                if not b:
+                    break
+                q.append(b)
+        except Exception:
+            pass
+
+    t1 = threading.Thread(target=drain, args=(chan.makefile("rb"), out_q), daemon=True)
+    t2 = threading.Thread(target=drain, args=(chan.makefile_stderr("rb"), err_q), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout)
+    t2.join(timeout)
+    try:
+        status = chan.recv_exit_status()
+    except Exception:
+        status = -1
+    chan.close()
+    return b"".join(out_q).decode(errors="replace"), b"".join(err_q).decode(errors="replace"), status
 
 
 def _build_status(dev, backend, s):
@@ -192,35 +244,60 @@ def _build_status(dev, backend, s):
 def ssh_gather(dev):
     c = _ssh_connect(dev)
     try:
-        _, out, _err = c.exec_command(GATHER_SCRIPT, timeout=180)
-        raw = out.read().decode(errors="replace")
+        raw, err, status = _exec_capture(c, GATHER_SCRIPT, timeout=180)
     finally:
         c.close()
     if "##end##" not in raw:
-        raise RuntimeError("gather script did not complete on device")
+        tail = (err.strip() or raw.strip())[-400:]
+        raise RuntimeError(f"gather script did not complete on device (exit={status}); tail: {tail}")
     return _build_status(dev, "ssh", _parse_sections(raw))
 
 
 # ------------------------------------------------------ OpenWrt: LuCI backend
+_LUCI_SCHEMES = {}
+
+
+def _luci_schemes(host):
+    """Which LuCI scheme(s) to try for a host: probe 443 then 80, cache the result."""
+    if host in _LUCI_SCHEMES:
+        return _LUCI_SCHEMES[host]
+    open_schemes = []
+    for scheme, port in (("https", 443), ("http", 80)):
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                open_schemes.append(scheme)
+        except Exception:
+            pass
+    _LUCI_SCHEMES[host] = open_schemes or ["https", "http"]
+    return _LUCI_SCHEMES[host]
+
+
 def _luci_rpc(dev, method, obj=None, args=None):
+    """Call a LuCI RPC method. NOTE: the endpoint is /rpc (NOT /cgi-bin/luci/rpc)."""
     user = dev.get("luci_user") or "root"
     pw = dev.get("luci_pass") or ""
+    port = dev.get("luci_port")
+    base = f"{dev['host']}:{port}" if port else dev["host"]
     body = json.dumps({"method": "call", "params": ["luci.rpc", method, obj or "", args or []],
                        "id": 1}).encode()
     auth = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
     last = None
-    for scheme in ("https", "http"):
+    for scheme in _luci_schemes(base):
         req = urllib.request.Request(
-            f"{scheme}://{dev['host']}/cgi-bin/luci/rpc", data=body, method="POST",
+            f"{scheme}://{base}/rpc", data=body, method="POST",
             headers={"Content-Type": "application/json", "Authorization": auth})
         try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+            if scheme == "https":
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                r = urllib.request.urlopen(req, timeout=15, context=ctx)
+            else:
+                r = urllib.request.urlopen(req, timeout=15)
+            with r:
                 data = json.loads(r.read().decode())
             if data.get("error"):
-                raise RuntimeError(str(data["error"]))
+                raise RuntimeError(f"LuCI rpc {method}: {data['error']}")
             return data.get("payload")
         except Exception as e:
             last = e
@@ -310,9 +387,10 @@ def audit_status(st):
     if st.get("telnet_on"):
         add("telnet", "HIGH", "Telnet (port 23) is listening",
             "Cleartext service exposed", "Disable telnet; use SSH with key auth")
-    if st.get("dropbear_pwauth") in ("yes", "true"):
+    if str(st.get("dropbear_pwauth", "")).lower() in ("yes", "true", "on", "1"):
         add("ssh_password_auth", "MEDIUM", "SSH allows password authentication",
-            "dropbear PasswordAuth=yes", "Set PasswordAuth='no' and use SSH keys")
+            "dropbear PasswordAuth=" + str(st.get("dropbear_pwauth", "")),
+            "Set PasswordAuth='no' and use SSH keys")
     if st.get("fw_in") == "ACCEPT":
         add("fw_input_accept", "HIGH", "Firewall default INPUT policy is ACCEPT",
             "All inbound traffic to the router is allowed by default",
@@ -579,11 +657,14 @@ def _key_pub_line():
 
 def ssh_test(dev):
     """Verify we can reach + authenticate to the device and read a banner."""
-    c = _ssh_connect(dev)
     try:
-        _, out, _ = c.exec_command("cat /etc/openwrt_release 2>/dev/null | head -1; uptime", timeout=30)
-        detail = (out.read().decode(errors="replace") or "").strip()
-        return {"ok": True, "detail": detail[:200]}
+        c = _ssh_connect(dev)
+    except Exception as e:
+        return {"ok": False, "detail": str(e)}
+    try:
+        out, err, status = _exec_capture(
+            c, "cat /etc/openwrt_release 2>/dev/null | head -1; uptime", timeout=30)
+        return {"ok": True, "detail": (out.strip() or err.strip() or "connected")[:200]}
     except Exception as e:
         return {"ok": False, "detail": str(e)}
     finally:
@@ -602,32 +683,34 @@ def luci_test(dev):
 def push_ssh_key(dev):
     """Install the owctl public key on the device, then verify key-only auth."""
     pub = _key_pub_line()
+    key_path = ensure_server_key()
     c = _ssh_connect(dev)
     try:
-        c.exec_command("mkdir -p /home/root/.ssh && chmod 700 /home/root/.ssh && "
-                       "touch /home/root/.ssh/authorized_keys && chmod 600 /home/root/.ssh/authorized_keys")
-        time.sleep(1)
         sftp = c.open_sftp()
         try:
-            existing = ""
-            try:
-                with sftp.open("/home/root/.ssh/authorized_keys", "r") as fh:
-                    existing = fh.read().decode(errors="replace")
-            except IOError:
-                pass
-            if pub not in existing.splitlines():
-                with sftp.open("/home/root/.ssh/authorized_keys", "a") as fh:
-                    fh.write(pub + "\n")
-            sftp.chmod("/home/root/.ssh/authorized_keys", 0o600)
-        finally:
-            sftp.close()
+            sftp.mkdir("/home/root/.ssh")
+        except IOError:
+            pass
+        sftp.chmod("/home/root/.ssh", 0o700)
+        existing = ""
+        try:
+            with sftp.open("/home/root/.ssh/authorized_keys", "r") as fh:
+                existing = fh.read().decode(errors="replace")
+        except IOError:
+            pass
+        if pub not in existing.splitlines():
+            with sftp.open("/home/root/.ssh/authorized_keys", "a") as fh:
+                fh.write(pub + "\n")
+        sftp.chmod("/home/root/.ssh/authorized_keys", 0o600)
+        sftp.close()
     finally:
         c.close()
+    execute("UPDATE devices SET key_path=? WHERE id=?", (key_path, dev["id"]))
     probe = dict(dev)
-    probe["key_path"] = os.path.join(DATA_DIR, "ssh_key")
+    probe["key_path"] = key_path
     probe["ssh_password"] = ""
     vt = ssh_test(probe)
-    return {"ok": vt["ok"], "public_key": pub, "detail": vt["detail"]}
+    return {"ok": vt["ok"], "public_key": pub, "detail": vt["detail"], "key_saved": True}
 
 
 def do_backup(dev):
@@ -637,10 +720,15 @@ def do_backup(dev):
         c = _ssh_connect(dev)
         try:
             remote = f"/tmp/owctl-backup-{ts}.conf"
-            c.exec_command(f"uci export > {remote}")
-            time.sleep(2)
+            out, err, status = _exec_capture(c, f"uci export > {remote} && echo BACKUP_OK", timeout=120)
+            if status != 0 or "BACKUP_OK" not in out:
+                raise RuntimeError(f"uci export failed on device (exit={status}): {(err or out).strip()[:300]}")
             local = os.path.join(BACKUP_DIR, f"{slug}-{ts}.conf")
-            c.open_sftp().get(remote, local)
+            sftp = c.open_sftp()
+            try:
+                sftp.get(remote, local)
+            finally:
+                sftp.close()
             c.exec_command(f"rm -f {remote}")
             kind = "uci-export"
         finally:
@@ -671,9 +759,10 @@ def do_upgrade(dev, packages):
             if len(safe) != len(packages):
                 raise HTTPException(400, "invalid package name in list")
             cmd = "opkg update && opkg upgrade -y " + " ".join(safe)
-        _, out, err = c.exec_command(cmd, timeout=3600)
-        result = (out.read().decode(errors="replace")
-                  + "\n--- stderr ---\n" + err.read().decode(errors="replace")).strip()
+        out, err, status = _exec_capture(c, cmd, timeout=3600)
+        result = (out.strip() + "\n--- stderr ---\n" + err.strip()).strip()
+        if status != 0:
+            raise RuntimeError(f"upgrade exited with status {status}")
     finally:
         c.close()
     return result[:30000]
@@ -750,11 +839,12 @@ async def add_device(request: Request):
     try:
         did = execute(
             "INSERT INTO devices(name,host,role,access,ssh_port,ssh_user,ssh_password,key_path,"
-            "luci_user,luci_pass,added_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "luci_user,luci_pass,luci_port,added_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, host, d.get("role") or "router", d.get("access") or "ssh",
              int(d.get("ssh_port") or 22), d.get("ssh_user") or "root",
              d.get("ssh_password") or "", d.get("key_path") or "",
-             d.get("luci_user") or "root", d.get("luci_pass") or "", now()))
+             d.get("luci_user") or "root", d.get("luci_pass") or "",
+             (int(d["luci_port"]) if d.get("luci_port") else None), now()))
     except sqlite3.IntegrityError:
         raise HTTPException(400, f"host {host} already registered")
     return {"id": did}
@@ -770,11 +860,12 @@ async def update_device(request: Request, did: int):
     def g(k, dflt=None):
         return d.get(k) if d.get(k) is not None else dflt
     execute("UPDATE devices SET name=?, role=?, access=?, ssh_port=?, ssh_user=?, ssh_password=?, "
-            "key_path=?, luci_user=?, luci_pass=? WHERE id=?",
+            "key_path=?, luci_user=?, luci_pass=?, luci_port=? WHERE id=?",
             (g("name", dev["name"]), g("role", dev["role"]), g("access", dev["access"]),
              int(g("ssh_port", dev["ssh_port"] or 22)), g("ssh_user", dev["ssh_user"]),
              g("ssh_password", dev["ssh_password"]), g("key_path", dev["key_path"]),
-             g("luci_user", dev["luci_user"]), g("luci_pass", dev["luci_pass"]), did))
+             g("luci_user", dev["luci_user"]), g("luci_pass", dev["luci_pass"]),
+             (int(g("luci_port", dev.get("luci_port") or 0)) or None), did))
     return {"ok": True}
 
 

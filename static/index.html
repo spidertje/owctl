@@ -154,7 +154,9 @@ async function promptAdd(){
     d.ssh_port=parseInt(prompt('SSH port:','22'))||22;
     d.ssh_user=prompt('SSH user:','root')||'root';
     d.ssh_password=prompt('SSH password (leave empty for key):')||'';
-  }else{d.luci_user=prompt('LuCI user:','root')||'root';d.luci_pass=prompt('LuCI password:')||'';}
+  }else{d.luci_user=prompt('LuCI user:','root')||'root';d.luci_pass=prompt('LuCI password:')||'';
+    const lp=prompt('LuCI port (blank=auto-detect 80/443):')||'';if(lp)d.luci_port=parseInt(lp);
+    d.luci_port=d.luci_port||null;}
   try{const r=await api('/devices',{method:'POST',body:JSON.stringify(d)});const id=r.id;toast('Added — testing connection…');
     const t=await api(`/devices/${id}/test`,{method:'POST'});
     if(t.ok){toast('Connected: '+(t.detail||'ok'))}else{toast('Added, but connect test failed: '+t.detail,true)}
@@ -181,7 +183,9 @@ async function editDev(id){
   const body={name:name||d.name,host:host||d.host,access:access||d.access,
     ssh_port:d.ssh_port||22,ssh_user:d.ssh_user||'root',luci_user:d.luci_user||'root'};
   if(access==='ssh')body.ssh_password=prompt('SSH password (empty=keep):')||d.ssh_password||'';
-  if(access==='luci')body.luci_pass=prompt('LuCI password (empty=keep):')||d.luci_pass||'';
+  if(access==='luci'){body.luci_user=prompt('LuCI user:',d.luci_user||'root')||'root';
+    body.luci_pass=prompt('LuCI password (empty=keep):')||d.luci_pass||'';
+    body.luci_port=d.luci_port||null;}
   try{await api(`/devices/${id}`,{method:'PUT',body:JSON.stringify(body)});toast('Saved');renderDevices()}catch(e){toast(String(e),true)}
 }
 async function delDev(id){if(!confirm('Delete this device?'))return;await api(`/devices/${id}`,{method:'DELETE'});renderDevices()}
@@ -263,7 +267,7 @@ async function addFromSweep(host){
   const access=prompt('Access (ssh/luci):')||'ssh';
   let d={name,host,role:'router',access};
   if(access==='ssh'){d.ssh_user=prompt('SSH user:','root');d.ssh_password=prompt('SSH password (empty=key):')||''}
-  else{d.luci_user=prompt('LuCI user:','root');d.luci_pass=prompt('LuCI password:')||''}
+  else{d.luci_user=prompt('LuCI user:','root');d.luci_pass=prompt('LuCI password:')||'';d.luci_port=null}
   try{await api('/devices',{method:'POST',body:JSON.stringify(d)});toast('Added '+host)}catch(e){toast(String(e),true)}
 }
 

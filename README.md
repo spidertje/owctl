@@ -41,10 +41,30 @@ re-alert if they disappear and return. Scheduler re-audits every 30 min
 Dashboard (always on), plus optional: Email (SMTP), Telegram (bot token +
 chat_id), and a JSON Webhook. Minimum-severity threshold configurable.
 
+## Testing
+
+A self-contained end-to-end harness (`test_e2e.py`) stands up an in-process
+paramiko SSH server (password + SFTP) and an HTTP server emulating LuCI, then
+drives the real code paths (gather over both backends, threat audit, push-key,
+backup, large-output exec, error messaging). No real router or network needed:
+
+```bash
+.venv/bin/python test_e2e.py     # 33 checks; exits non-zero on any failure
+```
+
+## Notes on the LuCI backend
+
+- The LuCI RPC endpoint is **`/rpc`** (not `/cgi-bin/luci/rpc`, which 404s).
+- Scheme (http/https) is auto-detected by probing ports 443 then 80; override
+  with an explicit `luci_port` if LuCI runs elsewhere.
+- LuCI access is read-mostly: status, sysupgrade detection, `opkg` list,
+  config backup. Upgrades/reboot/SSH-key-push require the `ssh` backend.
+
 ## Files
 
 - `owctl.py` — backend (API + scheduler)
 - `static/index.html` — dashboard
+- `test_e2e.py` — in-process mock-device test harness
 - `data/` — sqlite DB, config backups, created at runtime
 
 ## Install via Hermes Agent
