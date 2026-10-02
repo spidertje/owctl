@@ -123,7 +123,7 @@ def set_setting(k, v):
 GATHER_SCRIPT = r"""
 echo '##release##'; cat /etc/openwrt_release 2>/dev/null | tr '\n' ' '; echo
 echo '##model##'; sed -n 's/.*"hostname"[^"]*"\([^"]*\)".*/\1/p' /etc/board.json 2>/dev/null
-echo '##date##'; date '+%Y-%m-%d %H:%M:%S'
+echo '##date##'; date -u '+%Y-%m-%d %H:%M:%S'
 echo '##uptime##'; awk '{print int($1)}' /proc/uptime
 echo '##load##'; cut -d' ' -f1-3 /proc/loadavg
 echo '##mem##'; grep -E 'MemTotal|MemFree' /proc/meminfo | awk '{sub(/:/,"",\$1); printf "%s=%s ", \$1, \$2}; echo'
