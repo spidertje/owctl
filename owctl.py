@@ -971,12 +971,11 @@ def do_guest_wifi(dev, ssid, password, vlan_id=None):
     """Create a guest WiFi interface on a device. Requires wireless-capable device."""
     if dev["access"] != "ssh":
         raise HTTPException(400, "guest WiFi requires SSH access")
-    # Check if device has wireless (simple heuristic: check for wifi-iface config)
     c = _ssh_connect(dev)
     try:
-        stdin, stdout, stderr = c.exec_command("uci show wireless 2>/dev/null | head -5", timeout=10)
+        # Check if device has wireless
+        stdin, stdout, stderr = c.exec_command("uci show wireless 2>/dev/null | head -10", timeout=10)
         out = stdout.read().decode()
-        c.close()
         if "wifi-iface" not in out and "wifi-device" not in out:
             raise HTTPException(400, f"{dev['name']} has no wireless interface")
         # Generate UCI config for guest WiFi
@@ -991,26 +990,19 @@ uci set wireless.{iface_name}.mode='ap'
 uci set wireless.{iface_name}.ssid='{ssid}'
 uci set wireless.{iface_name}.encryption='psk2'
 uci set wireless.{iface_name}.key='{password}'
-uci set zone.guest_wifi=zone
-uci set zone.guest_wifi.name='guest_wifi'
-uci set zone.guest_wifi.network='wireless_guest'
-uci set zone.guest_wifi.input='ACCEPT'
-uci set zone.guest_wifi.output='ACCEPT'
-uci set zone.guest_wifi.forward='REJECT'
 uci commit wireless
 uci commit firewall"""
-        c = _ssh_connect(dev)
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode()
         err = stderr.read().decode()
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"guest WiFi config failed: {(err or out)[:200]}")
-        c.exec_command("wifi 2>/dev/null || true")
+        # Try to bring up wireless (may fail if radio not available)
+        c.exec_command("wifi up 2>/dev/null || true")
         return {"ssid": ssid, "ok": True, "output": out[:300]}
     finally:
-        if 'c' in dir():
-            c.close()
+        c.close()
 
 
 def do_upgrade(dev, packages):
