@@ -38,7 +38,7 @@ SEV_RANK = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
 
 def now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 # ---------------------------------------------------------------- database
@@ -924,13 +924,16 @@ def check_device(dev):
     # Calculate and store health score
     score = calc_health_score(findings)
     execute("UPDATE devices SET health_score=? WHERE id=?", (score, dev["id"]))
-    # Store traffic samples (keep last 288 per interface = 24h at 5min intervals)
+    # Store traffic samples (keep last 48 per interface for trend chart)
     if st.get("traffic"):
         for iface, counters in st["traffic"].items():
-            execute("DELETE FROM traffic_samples WHERE device_id=? AND iface=?",
-                    (dev["id"], iface))
             execute("INSERT INTO traffic_samples(device_id, ts, iface, rx_bytes, tx_bytes) VALUES(?,?,?,?,?)",
                     (dev["id"], now(), iface, counters["rx"], counters["tx"]))
+        # prune old samples: keep only last 48 per device/iface
+        execute("""DELETE FROM traffic_samples WHERE id NOT IN (
+            SELECT id FROM traffic_samples
+            WHERE device_id=? ORDER BY ts DESC LIMIT 48
+        ) AND device_id=?""", (dev["id"], dev["id"]))
     # Store recent syslog entries (keep last 100 per device)
     if st.get("syslog"):
         execute("DELETE FROM log_entries WHERE device_id=? AND ts<?",
