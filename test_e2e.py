@@ -216,16 +216,12 @@ class MockSSHServer(paramiko.ServerInterface):
     def check_channel_exec_request(self, channel, command):
         cmd = command.decode(errors="replace") if isinstance(command, bytes) else str(command)
         self.commands.append(cmd)
-        if "BACKUP_OK" in cmd:
-            # emulate: uci export wrote the backup file; create it where SFTP can serve it
-            import re as _re
-            m = _re.search(r"> (\S+)", cmd)
-            if m:
-                target = os.path.join(ROOT, m.group(1).lstrip("/"))
-                os.makedirs(os.path.dirname(target) or ROOT, exist_ok=True)
-                with open(target, "w") as fh:
-                    fh.write(MOCK_BACKUP)
-            channel.sendall(b"BACKUP_OK\n")
+        if "BACKUP_OK" in cmd or "uci export" in cmd:
+            # emulate: uci export output or backup signal
+            channel.sendall(MOCK_BACKUP.encode())
+            channel.send_exit_status(0)
+            channel.shutdown_write()
+            return True
         elif "echo x" in cmd:
             channel.sendall(b"x" * 200000)
         elif "/etc/openwrt_release" in cmd:

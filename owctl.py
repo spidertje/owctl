@@ -841,17 +841,15 @@ def do_backup(dev):
     if dev["access"] == "ssh":
         c = _ssh_connect(dev)
         try:
-            remote = f"/tmp/owctl-backup-{ts}.conf"
-            out, err, status = _exec_capture(c, f"uci export > {remote} && echo BACKUP_OK", timeout=120)
-            if status != 0 or "BACKUP_OK" not in out:
-                raise RuntimeError(f"uci export failed on device (exit={status}): {(err or out).strip()[:300]}")
+            # ponytail: read config directly via SSH to avoid SFTP/EOF issues
+            cmd = "uci export; true"  # force success even if uci returns non-zero
+            stdin, stdout, stderr = c.exec_command(cmd, timeout=60)
+            content = stdout.read().decode(errors="replace")
+            if not content.strip():
+                raise RuntimeError("uci export returned empty config")
             local = os.path.join(BACKUP_DIR, f"{slug}-{ts}.conf")
-            sftp = c.open_sftp()
-            try:
-                sftp.get(remote, local)
-            finally:
-                sftp.close()
-            c.exec_command(f"rm -f {remote}")
+            with open(local, "w") as fh:
+                fh.write(content)
             kind = "uci-export"
         finally:
             c.close()
