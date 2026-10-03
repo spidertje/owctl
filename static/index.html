@@ -44,6 +44,32 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
 .muted{color:var(--mut)}
 .pill{font-size:11px;color:var(--mut)}
 #toast{position:fixed;right:16px;bottom:16px;background:var(--panel2);border:1px solid var(--line);padding:10px 16px;border-radius:10px;display:none;z-index:9}
+/* ---- Network Map (theme-safe) ---- */
+.map-wrap{position:relative;padding:0 20px 20px}
+.map-stage{position:relative;width:100%;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--bg)}
+#map-svg{display:block;width:100%;height:620px;cursor:grab;touch-action:none}
+#map-svg:active{cursor:grabbing}
+.map-node{cursor:pointer}
+.map-node:hover .node-body{filter:drop-shadow(0 0 7px var(--acc));stroke-width:2.4}
+.node-body{stroke-width:1.6;transition:filter .12s,stroke-width .12s}
+.node-router{fill:var(--panel2)}
+.node-ap,.node-wired{fill:var(--panel)}
+.node-on{stroke:var(--ok)}
+.node-off{stroke:var(--bad)}
+.dot-on{fill:var(--ok)}
+.dot-off{fill:var(--bad)}
+.node-name{fill:var(--tx);font-weight:600;font-family:system-ui,Segoe UI,Roboto,sans-serif}
+.node-sub{fill:var(--mut);font-family:system-ui,Segoe UI,Roboto,sans-serif}
+.map-link{stroke:var(--mut);stroke-width:2;fill:none;opacity:.8}
+.map-link.off{stroke:var(--bad);opacity:.55;stroke-dasharray:5,4}
+.link-label-bg{fill:var(--panel);stroke:var(--line)}
+.link-label{fill:var(--tx);font-weight:600;font-size:10px;font-family:system-ui,Segoe UI,Roboto,sans-serif}
+.legend-box{fill:var(--panel);stroke:var(--line)}
+.legend-text{fill:var(--mut);font-family:system-ui,Segoe UI,Roboto,sans-serif}
+.map-ctrl{position:absolute;top:12px;right:12px;display:flex;gap:6px;z-index:15}
+.map-ctrl button{background:var(--panel2);border:1px solid var(--line);color:var(--tx);width:34px;height:34px;border-radius:9px;cursor:pointer;font-size:16px;line-height:1}
+.map-ctrl button:hover{border-color:var(--acc)}
+.map-hint{position:absolute;left:12px;bottom:10px;color:var(--mut);font-size:11px;z-index:15}
 </style>
 </head>
 <body>
@@ -183,9 +209,64 @@ async function chk(id){
     toast(`Checked. ${r.findings.length} finding(s).`);
   }catch(e){toast(String(e),true)}
 }
+// ============ Network Map (rewritten: real graph, theme-safe, interactive) ============
+function _mapTip(html,x,y){
+  let t=document.getElementById('map-tip');
+  if(!t){t=document.createElement('div');t.id='map-tip';t.style.cssText='position:fixed;pointer-events:none;z-index:60;background:var(--panel);border:1px solid var(--line);color:var(--tx);padding:6px 10px;border-radius:8px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.45);display:none';document.body.appendChild(t);}
+  t.innerHTML=html;t.style.display='block';t.style.left=(x+14)+'px';t.style.top=(y+16)+'px';
+}
+function _hideMapTip(){const t=document.getElementById('map-tip');if(t)t.style.display='none';}
+
+function showMapDevInfo(id){
+  const host=document.getElementById('map-host');
+  if(!host)return;
+  let box=document.getElementById('map-dev-info');
+  if(box)box.remove();
+  box=document.createElement('div');
+  box.id='map-dev-info';
+  box.className='card';
+  box.style.cssText='position:absolute;top:12px;right:12px;width:340px;max-height:calc(100% - 24px);overflow:auto;z-index:30;pointer-events:auto';
+  box.innerHTML='<div class="row" style="justify-content:space-between"><strong>Checking…</strong><button class="act" onclick="document.getElementById(\'map-dev-info\').remove()">×</button></div>';
+  host.appendChild(box);
+  api(`/devices/${id}/check`).then(r=>{
+    const st=r.status;
+    if(!box.isConnected)return;
+    const rows=[
+      ['Firmware',st.firmware||'—'],['Model',st.model||'—'],
+      ['Uptime',fmtUptime(st.uptime_s)],['Load',(st.load||[]).join(' ')||'—'],
+      ['Memory',st.mem_total_kb?`${fmtKB(st.mem_total_kb-st.mem_free_kb)} / ${fmtKB(st.mem_total_kb)}`:'—'],
+      ['WAN',st.wan_up===false?'DOWN':(st.wan_up===true?'UP':'—')+(st.wan_ip?' ('+st.wan_ip+')':'')],
+      ['Wireless clients',st.clients==null?'—':st.clients],
+      ['Health',r.health_score!=null?`${r.health_score}/100`:'—'],
+      ...(st.stations&&Object.keys(st.stations).length?Object.entries(st.stations).map(([e,c])=>['  '+e,`${c} client(s)`]):[]),
+      ...(st.traffic&&Object.keys(st.traffic).length?Object.entries(st.traffic).map(([i,t])=>['  '+i,`RX ${fmtKB(t.rx)} / TX ${fmtKB(t.tx)}`]):[]),
+      ['FW in/fwd/out',(st.fw_in!=null)?`${st.fw_in}/${st.fw_fwd}/${st.fw_out}`:'—'],
+      ['Listening ports',(st.listeners||[]).join(', ')||'—'],
+    ];
+    if(st.interfaces){Object.values(st.interfaces).forEach(f=>rows.push([`  ${f.name}`,`${f.ip} ${f.cidr}`]));}
+    if(st.wifi&&st.wifi.length){rows.push(['WiFi','']);st.wifi.forEach(ap=>rows.push([`  ${ap.essid}`,`${ap.band} ch${ap.channel} · ${ap.encryption}`]));}
+    box.innerHTML=`<div class="row" style="justify-content:space-between;margin-bottom:4px"><strong>${esc(r.status.name||'Device')} · ${esc(r.status.host||'')}</strong><button class="act" onclick="document.getElementById('map-dev-info').remove()">×</button></div>`+
+      rows.map(([k,v])=>`<div class="kv"><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join('');
+  }).catch(e=>{
+    if(!box.isConnected)return;
+    box.innerHTML=`<div style="color:var(--bad)">Error: ${esc(e.message)}</div><button class="act" onclick="document.getElementById('map-dev-info').remove()">Close</button>`;
+  });
+}
+
 async function renderMap(){
   const el=document.getElementById('tab-map');
-  el.innerHTML='<h2 style="margin:16px 20px 8px">Network Map</h2><div id="map-container" style="padding:0 20px 20px"><svg id="map-svg" style="width:100%;height:700px;display:block;margin:0 auto"></svg></div>';
+  el.innerHTML='<h2 style="margin:16px 20px 8px">Network Map</h2>'+
+    '<div class="map-wrap"><div class="map-stage" id="map-stage">'+
+    '<div class="map-ctrl">'+
+    '<button id="map-zin" title="Zoom in">+</button>'+
+    '<button id="map-zout" title="Zoom out">−</button>'+
+    '<button id="map-fit" title="Fit">⤢</button>'+
+    '</div>'+
+    '<svg id="map-svg"></svg>'+
+    '<div class="map-hint">Click a device for details · drag to pan · scroll to zoom</div>'+
+    '</div></div>';
+  const svg=el.querySelector('#map-svg');
+  const stage=el.querySelector('#map-stage');
   try{
     const devs=await api('/devices');
     const results=[];
@@ -193,218 +274,164 @@ async function renderMap(){
       try{const r=await api(`/devices/${d.id}/check`,{method:'POST'});results.push({device:d,status:r.status,error:null})}
       catch(e){results.push({device:d,status:null,error:e.message})}
     }
-    const routerResult=results.find(r=>r.device.role==='router')||results[0];
-    const otherResults=results.filter(r=>r!==routerResult);
+    if(!results.length){svg.outerHTML='<p style="padding:30px;color:var(--mut)">No devices added yet.</p>';return;}
+    const router=results.find(r=>r.device.role==='router')||results[0];
+    const others=results.filter(r=>r!==router);
     const ipMap={};
-    for(const r of results){if(r.status?.ips)r.status.ips.forEach(ip=>ipMap[ip]=r)}
-    const connections=[];
+    for(const r of results){if(r.status&&r.status.ips)r.status.ips.forEach(ip=>ipMap[ip]=r);}
+    // Build unique, directional links from neighbor data
+    const seen={},links=[];
     for(const r of results){
-      if(!r.status?.neighbors)continue;
+      if(!r.status||!r.status.neighbors)continue;
       for(const nb of r.status.neighbors){
-        if(nb.ip==='loopback'||nb.ip.startsWith('127.'))continue;
-        const other=ipMap[nb.ip];
-        if(other&&other.device.host!==r.device.host){
-          const key=[r.device.id,other.device.id].sort().join('-');
-          if(!connections.find(c=>c.key===key))connections.push({from:r,to:other,key,iface:nb.iface});
-        }
+        if(nb.ip==='loopback'||String(nb.ip).startsWith('127.'))continue;
+        const o=ipMap[nb.ip];
+        if(!o||o.device.id===r.device.id)continue;
+        const key=[r.device.id,o.device.id].sort().join('-');
+        if(seen[key])continue;
+        seen[key]=1;
+        links.push({a:r,b:o,iface:nb.iface});
       }
     }
-    const W=960,H=700;
-    let html=`<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="${H}" viewBox="0 0 ${W} ${H}">`;
-    html+=`<defs>
-      <filter id="glow"><feGaussianBlur stdDeviation="4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-      <linearGradient id="wan-grad" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" style="stop-color:#f5b544"/><stop offset="100%" style="stop-color:#4da3ff"/></linearGradient>
-      <linearGradient id="dev-body" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" style="stop-color:#2a3a5c"/><stop offset="100%" style="stop-color:#1a2540"/></linearGradient>
-    </defs>`;
-    const CX=W/2;
-    // LAYOUT
-    const I_Y=35; // Internet center Y
-    const R_TOP=110; // Router top Y
-    const R_H=70; // Router height
-    const R_BOT=R_TOP+R_H; // Router bottom Y
-    const LAN_Y=R_BOT+25; // LAN backbone Y
-    const AP_TOP=LAN_Y+55; // AP top Y
-    const AP_H=55; // AP height
-    const AP_BOT=AP_TOP+AP_H; // AP bottom Y
-    const PORT_ROW_Y=AP_BOT+20; // Port labels row Y
-    const SPACING=180; // AP horizontal spacing
-    const START_X=CX-(otherResults.length-1)*SPACING/2;
-    const devicePositions={};
-    // Draw all connections first (behind devices)
-    // WAN: Internet -> router left side (wan port)
-    html+=`<line x1="${CX}" y1="${I_Y+30}" x2="${CX-75}" y2="${R_TOP+15}" stroke="url(#wan-grad)" stroke-width="3" stroke-dasharray="8,4"/>`;
-    // Device-to-device connections
-    for(const conn of connections){
-      const fp=devicePositions[conn.from.device.id]||{x:CX,y:R_BOT};
-      const tp=devicePositions[conn.to.device.id]||{x:START_X,y:AP_BOT};
-      const fx=conn.from===routerResult?CX:fp.x;
-      const fy=conn.from===routerResult?R_BOT:fp.y+AP_H;
-      const tx=conn.to===routerResult?CX:tp.x;
-      const ty=conn.to===routerResult?R_TOP:tp.y;
-      const mx=(fx+tx)/2,my=(fy+ty)/2;
-      html+=`<line x1="${fx}" y1="${fy}" x2="${tx}" y2="${ty}" stroke="#39c07f" stroke-width="2" stroke-dasharray="5,3" opacity="0.7"/>`;
-      html+=`<rect x="${mx-26}" y="${my-10}" width="52" height="16" rx="3" fill="#161d2e" stroke="#26314f"/>`;
-      html+=`<text x="${mx}" y="${my+3}" text-anchor="middle" fill="#4da3ff" font-size="8" font-weight="600">${esc(conn.iface)}</text>`;
+    // ---- Layout: router top-center, connected children fanned below, others in a second row ----
+    const nodeW=172,nodeH=58,gap=26;
+    const connected=new Set(links.flatMap(l=>[l.a.device.id,l.b.device.id]));
+    const children=others.filter(r=>connected.has(r.device.id));
+    const orphans=others.filter(r=>!connected.has(r.device.id));
+    const childrenX=children.map((_,i)=>(i-(children.length-1)/2)*(nodeW+gap));
+    const orphansX=orphans.map((_,i)=>(i-(orphans.length-1)/2)*(nodeW+gap));
+    const routerX=0,routerY=0;
+    const row1Y=150,row2Y=300;
+    const pos={};
+    pos[router.device.id]={x:routerX,y:routerY,type:'router'};
+    children.forEach((r,i)=>pos[r.device.id]={x:childrenX[i],y:row1Y,type:r.device.role==='ap'?'ap':'wired'});
+    orphans.forEach((r,i)=>pos[r.device.id]={x:orphansX[i],y:row2Y,type:r.device.role==='ap'?'ap':'wired'});
+    const xvals=Object.values(pos).map(p=>p.x);
+    const minx=Math.min(0,...xvals),maxx=Math.max(0,...xvals);
+    const topPad=90,botPad=70;
+    const maxy=Math.max(row1Y,orphans.length?row2Y:row1Y);
+    const padL=60,padR=60;
+    const ox=minx-padL, oy=topPad;
+    const vbW=(maxx-minx)+nodeW+padL+padR;
+    const vbH=(maxy-topPad+nodeH)+botPad;
+    svg.setAttribute('viewBox',`${ox} ${oy} ${vbW} ${vbH}`);
+
+    let s='';
+    s+='<defs>'+
+      '<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">'+
+        '<path d="M0,0 L10,5 L0,10 z" class="map-link" style="opacity:1;fill:var(--mut)"/></marker>'+
+      '</defs>';
+    // ---- Links (curved, each labeled with its interface) ----
+    for(const l of links){
+      const a=pos[l.a.device.id],b=pos[l.b.device.id];
+      const ax=a.x+nodeW/2, ay=a.y+nodeH;
+      const bx=b.x+nodeW/2, by=b.y;
+      const off=(b.x>ax?1:-1)*26;
+      const path=`M ${ax} ${ay} C ${ax} ${ay+42}, ${bx} ${by-42}, ${bx} ${by-7}`;
+      const offlink=!(l.b.status&&l.b.status.online);
+      s+=`<path d="${path}" class="map-link${offlink?' off':''}" marker-end="url(#arrow)"/>`;
+      // label at the cubic-bezier midpoint (t=0.5)
+      const t=0.5,mt=1-t;
+      const mx=mt*mt*mt*ax+3*mt*mt*t*ax+3*mt*t*t*bx+t*t*t*bx;
+      const my=mt*mt*mt*ay+3*mt*mt*t*(ay+42)+3*mt*t*t*(by-42)+t*t*t*(by-7);
+      const txt=l.iface||'';
+      const w=txt.length*5.6+14;
+      s+=`<g><rect x="${mx-w/2}" y="${my-10}" width="${w}" height="20" rx="6" class="link-label-bg"/>`+
+         `<text x="${mx}" y="${my+4}" text-anchor="middle" class="link-label">${esc(txt)}</text></g>`;
     }
-    // LAN backbone
-    html+=`<line x1="${CX-230}" y1="${LAN_Y}" x2="${CX+230}" y2="${LAN_Y}" stroke="#26314f" stroke-width="6" stroke-linecap="round"/>`;
-    html+=`<text x="${CX}" y="${LAN_Y+16}" text-anchor="middle" fill="#4da3ff" font-size="10" font-weight="500">LAN Backbone</text>`;
-    // Router to LAN
-    html+=`<line x1="${CX}" y1="${R_BOT}" x2="${CX}" y2="${LAN_Y}" stroke="#4da3ff" stroke-width="2"/>`;
-    // Internet cloud
-    html+=`<ellipse cx="${CX}" cy="${I_Y}" rx="60" ry="28" fill="#0d1525" stroke="#4da3ff" stroke-width="2" filter="url(#glow)"/>`;
-    html+=`<text x="${CX}" y="${I_Y-4}" text-anchor="middle" fill="#dbe4f5" font-size="13" font-weight="600">Internet</text>`;
-    html+=`<text x="${CX}" y="${I_Y+14}" text-anchor="middle" fill="#4da3ff" font-size="14">☁</text>`;
-    // Render router
-    const r=routerResult,online=r.status&&r.status.online;
-    html+=`<g transform="translate(${CX},${R_TOP})">`;
-    // Antennas
-    html+=`<line x1="-20" y1="-6" x2="-40" y2="-38" stroke="#4da3ff" stroke-width="2" opacity="0.7"/>`;
-    html+=`<line x1="20" y1="-6" x2="40" y2="-38" stroke="#4da3ff" stroke-width="2" opacity="0.7"/>`;
-    html+=`<circle cx="-40" cy="-38" r="4" fill="#4da3ff" opacity="0.9"/>`;
-    html+=`<circle cx="40" cy="-38" r="4" fill="#4da3ff" opacity="0.9"/>`;
-    // Main body
-    html+=`<rect x="-80" y="0" width="160" height="${R_H}" rx="7" fill="url(#dev-body)" stroke="${online?'#39c07f':'#f4636e'}" stroke-width="2.5" filter="url(#glow)"/>`;
-    // Top panel
-    html+=`<rect x="-75" y="3" width="150" height="16" rx="3" fill="#0d1525"/>`;
-    // LEDs
-    html+=`<circle cx="-60" cy="11" r="3.5" fill="${online?'#39c07f':'#f4636e'}" filter="url(#glow)"/>`;
-    html+=`<circle cx="-48" cy="11" r="3.5" fill="#4da3ff"/>`;
-    html+=`<circle cx="-36" cy="11" r="3.5" fill="#f5b544"/>`;
-    // Name
-    html+=`<text x="0" y="36" text-anchor="middle" fill="#dbe4f5" font-size="12" font-weight="600">${esc(r.device.name)}</text>`;
-    // IP + role
-    html+=`<text x="0" y="52" text-anchor="middle" fill="#8b98b8" font-size="9">${esc(r.status?.ips?.[0]||r.device.host)} · ${esc(r.device.role||'router')}</text>`;
-    // WAN IP label (right side)
-    if(r.status?.ips&&r.status.ips.length>1){
-      html+=`<text x="${80+8}" y="16" fill="#f5b544" font-size="9" font-weight="500">${esc(r.status.ips[r.status.ips.length-1])}</text>`;
-    }
-    html+=`</g>`;
-    // Render APs
-    for(let i=0;i<otherResults.length;i++){
-      const dr=otherResults[i];
-      const dx=START_X+i*SPACING;
-      devicePositions[dr.device.id]={x:dx,y:AP_TOP};
-      const dor=dr.status&&dr.status.online;
-      // Vertical line from LAN to AP
-      html+=`<line x1="${dx}" y1="${LAN_Y}" x2="${dx}" y2="${AP_TOP}" stroke="#4da3ff" stroke-width="2" opacity="0.7"/>`;
-      // AP box
-      html+=`<g transform="translate(${dx},${AP_TOP})">`;
-      html+=`<rect x="-60" y="0" width="120" height="${AP_H}" rx="7" fill="url(#dev-body)" stroke="${dor?'#39c07f':'#f4636e'}" stroke-width="2" filter="url(#glow)"/>`;
-      html+=`<circle cx="-48" cy="16" r="5" fill="${dor?'#39c07f':'#f4636e'}" filter="url(#glow)"/>`;
-      html+=`<text x="0" y="20" text-anchor="middle" fill="#dbe4f5" font-size="11" font-weight="600">${esc(dr.device.name)}</text>`;
-      html+=`<text x="0" y="37" text-anchor="middle" fill="#8b98b8" font-size="9">${esc(dr.status?.ips?.[0]||dr.device.host)}</text>`;
-      html+=`<text x="0" y="49" text-anchor="middle" fill="#6b7898" font-size="8">${esc(dr.device.role||'device')}</text>`;
-      html+=`</g>`;
-    }
-    // Port labels row - ALL ports in one horizontal line below devices
-    // PORT ROWS - one per device, aligned under each device
-    const PORT_W=42, PORT_H=16, PORT_GAP=55;
-    // Collect ports per device
-    const routerPorts=[];
-    if(routerResult.status?.interfaces){
-      Object.values(routerResult.status.interfaces).forEach(iface=>{
-        if(iface.name!=='lo'&&iface.name!=='br-lan')routerPorts.push(iface.name);
+    // ---- Nodes ----
+    const node=(r,p)=>{
+      const on=!!(r.status&&r.status.online);
+      const x=p.x,y=p.y;
+      const id=r.device.id;
+      const role=p.type==='router'?'Router':(p.type==='ap'?'Access point':'Wired device');
+      const ip=(r.status&&r.status.ips&&r.status.ips[0])||r.device.host;
+      const sub=p.type==='router'?(r.device.role||'router'):role;
+      // AP client count chip
+      const clients=r.status&&r.status.clients?r.status.clients:0;
+      let g=`<g class="map-node" data-id="${id}" data-role="${esc(sub)}" data-on="${on?'1':'0'}" data-ip="${esc(ip)}" data-name="${esc(r.device.name)}" data-clients="${clients}" transform="translate(${x},${y})">`;
+      g+=`<rect x="0" y="0" width="${nodeW}" height="${nodeH}" rx="12" class="node-body node-${p.type} ${on?'node-on':'node-off'}"/>`;
+      g+=`<circle cx="18" cy="${nodeH/2}" r="5.5" class="${on?'dot-on':'dot-off'}"/>`;
+      g+=`<text x="34" y="${nodeH/2-3}" class="node-name" font-size="13">${esc(r.device.name)}</text>`;
+      g+=`<text x="34" y="${nodeH/2+13}" class="node-sub" font-size="11">${esc(ip)}</text>`;
+      g+=`</g>`;
+      return g;
+    };
+    results.forEach(r=>s+=node(r,pos[r.device.id]));
+    // ---- Legend ----
+    const lx=ox+14,ly=oy+vbH-24;
+    s+=`<rect x="${lx-6}" y="${ly-16}" width="330" height="26" rx="7" class="legend-box"/>`;
+    s+=`<circle cx="${lx+8}" cy="${ly-3}" r="5" class="dot-on"/>`;
+    s+=`<text x="${lx+18}" y="${ly+1}" class="legend-text" font-size="11">Online</text>`;
+    s+=`<circle cx="${lx+78}" cy="${ly-3}" r="5" class="dot-off"/>`;
+    s+=`<text x="${lx+88}" y="${ly+1}" class="legend-text" font-size="11">Offline</text>`;
+    s+=`<text x="${lx+150}" y="${ly+1}" class="legend-text" font-size="11">→ link label = interface</text>`;
+    svg.innerHTML=s;
+
+    // ---- Interactivity: click node -> detail panel (idempotent), hover tooltip ----
+    const host=document.createElement('div');
+    host.id='map-host';
+    host.style.cssText='position:absolute;inset:0;pointer-events:none';
+    stage.appendChild(host);
+    svg.querySelectorAll('.map-node').forEach(n=>{
+      n.style.pointerEvents='all';
+      n.addEventListener('click',e=>{e.stopPropagation();showMapDevInfo(+n.getAttribute('data-id'));});
+      n.addEventListener('mouseenter',e=>{
+        const on=n.getAttribute('data-on')==='1';
+        _mapTip(`<strong>${esc(n.getAttribute('data-name'))}</strong><br>${esc(n.getAttribute('data-role'))} · ${esc(n.getAttribute('data-ip'))}<br>${on?'Online':'Offline'}`,e.clientX,e.clientY);
       });
-    }
-    const apPortMap={};
-    for(let i=0;i<otherResults.length;i++){
-      const dx=START_X+i*SPACING;
-      const dr=otherResults[i];
-      const names=[];
-      if(dr.status?.interfaces){
-        Object.values(dr.status.interfaces).forEach(iface=>{
-          if(iface.name!=='lo'&&iface.name!=='br-lan')names.push(iface.name);
-        });
-      }
-      apPortMap[i]={x:dx,names};
-    }
-    // Draw router ports (between router and LAN)
-    const RPORT_Y=R_BOT+18;
-    if(routerPorts.length){
-      const rw=(routerPorts.length-1)*PORT_GAP;
-      const rx=CX-rw/2;
-      routerPorts.forEach((name,i)=>{
-        const px=rx+i*PORT_GAP;
-        html+=`<rect x="${px-PORT_W/2}" y="${RPORT_Y-8}" width="${PORT_W}" height="${PORT_H}" rx="3" fill="#1a2540" stroke="#4da3ff" stroke-width="1.5"/>`;
-        html+=`<text x="${px}" y="${RPORT_Y+3}" text-anchor="middle" fill="#4da3ff" font-size="8" font-weight="600">${esc(name)}</text>`;
-        html+=`<line x1="${px}" y1="${RPORT_Y-8}" x2="${px}" y2="${R_BOT}" stroke="#4da3ff" stroke-width="1.5" opacity="0.5"/>`;
-      });
-    }
-    // Draw AP port rows (below each AP)
-    for(const [idx,ap] of Object.entries(apPortMap)){
-      if(!ap.names.length)continue;
-      const apIdx=parseInt(idx);
-      const AP_PORT_Y=AP_BOT+18;
-      const aw=(ap.names.length-1)*PORT_GAP;
-      const ax=ap.x-aw/2;
-      ap.names.forEach((name,i)=>{
-        const px=ax+i*PORT_GAP;
-        html+=`<rect x="${px-PORT_W/2}" y="${AP_PORT_Y-8}" width="${PORT_W}" height="${PORT_H}" rx="3" fill="#1a2540" stroke="#4da3ff" stroke-width="1.5"/>`;
-        html+=`<text x="${px}" y="${AP_PORT_Y+3}" text-anchor="middle" fill="#4da3ff" font-size="8" font-weight="600">${esc(name)}</text>`;
-        html+=`<line x1="${px}" y1="${AP_PORT_Y-8}" x2="${px}" y2="${AP_BOT}" stroke="#4da3ff" stroke-width="1.5" opacity="0.5"/>`;
-      });
-    }
-    // WiFi signals below port row
-    for(let i=0;i<otherResults.length;i++){
-      const dr=otherResults[i];
-      const dx=START_X+i*SPACING;
-      if(dr.status?.wifi&&dr.status.wifi.length>0){
-        const wy=PORT_ROW_Y+35;
-        html+=`<path d="M${dx-25} ${wy} Q${dx} ${wy-18} ${dx+25} ${wy}" fill="none" stroke="#4da3ff" stroke-width="1.5" opacity="0.5"/>`;
-        html+=`<path d="M${dx-15} ${wy+7} Q${dx} ${wy-10} ${dx+15} ${wy+7}" fill="none" stroke="#4da3ff" stroke-width="1.5" opacity="0.4"/>`;
-        html+=`<text x="${dx}" y="${wy+20}" text-anchor="middle" fill="#8b98b8" font-size="8">WiFi</text>`;
-        for(let c=0;c<Math.min(dr.status.clients||3,5);c++){
-          html+=`<circle cx="${dx-20+c*10}" cy="${wy+32}" r="3" fill="#4da3ff" opacity="0.6"/>`;
-        }
-      }
-    }
-    html+='</svg>';
-    el.querySelector('#map-container').innerHTML=html;
-  }catch(e){el.querySelector('#map-container').innerHTML=`<p style="color:var(--bad)">Error: ${esc(String(e))}</p>`}
+      n.addEventListener('mousemove',e=>_mapTip(`<strong>${esc(n.getAttribute('data-name'))}</strong><br>${esc(n.getAttribute('data-role'))} · ${esc(n.getAttribute('data-ip'))}`,e.clientX,e.clientY));
+      n.addEventListener('mouseleave',_hideMapTip);
+    });
+    // Click empty svg closes panel
+    svg.addEventListener('click',()=>{const b=document.getElementById('map-dev-info');if(b)b.remove();});
+    // ---- Zoom / pan (preserve original viewBox; center-anchored scaling) ----
+    const svgRect=()=>svg.getBoundingClientRect();
+    const parseVB=()=>svg.getAttribute('viewBox').split(' ').map(Number);
+    const ORIG=parseVB();               // original, never mutated
+    let vb=ORIG.slice();
+    const setVB=()=>svg.setAttribute('viewBox',vb.join(' '));
+    const fit=()=>{vb=ORIG.slice();setVB();};
+    const clampMin=w=>Math.max(w,40);   // never let width go pathological
+    const zoom=(f,clientX,clientY)=>{
+      const rect=svgRect();
+      if(!rect.width||!rect.height)return;
+      // anchor = screen point (default center)
+      const ax=clientX==null?rect.left+rect.width/2:clientX;
+      const ay=clientY==null?rect.top+rect.height/2:clientY;
+      // anchor in current svg coords
+      const px=vb[0]+(ax-rect.left)/rect.width*vb[2];
+      const py=vb[1]+(ay-rect.top)/rect.height*vb[3];
+      const nwx=clampMin(vb[2]/f), nwy=clampMin(vb[3]/f);
+      // keep the anchor point fixed
+      const nx=px-(ax-rect.left)/rect.width*nwx;
+      const ny=py-(ay-rect.top)/rect.height*nwy;
+      vb=[nx,ny,nwx,nwy];setVB();
+    };
+    const elZin=stage.querySelector('#map-zin'),elZout=stage.querySelector('#map-zout'),elFit=stage.querySelector('#map-fit');
+    elZin.onclick=()=>zoom(1.25);
+    elZout.onclick=()=>zoom(0.8);
+    elFit.onclick=fit;
+    // wheel zoom
+    svg.addEventListener('wheel',e=>{e.preventDefault();zoom(e.deltaY<0?1.12:0.89,e.clientX,e.clientY);},{passive:false});
+    // drag pan
+    let drag=null;
+    svg.addEventListener('pointerdown',e=>{if(e.target.closest&&e.target.closest('.map-node'))return;drag={x:e.clientX,y:e.clientY,vb:vb.slice()};if(svg.setPointerCapture)svg.setPointerCapture(e.pointerId);});
+    svg.addEventListener('pointermove',e=>{
+      if(!drag)return;
+      const rect=svgRect();
+      const sx=drag.vb[2]/rect.width, sy=drag.vb[3]/rect.height;
+      vb=[drag.vb[0]-(e.clientX-drag.x)*sx,drag.vb[1]-(e.clientY-drag.y)*sy,drag.vb[2],drag.vb[3]];setVB();
+    });
+    const endDrag=()=>{drag=null;};
+    svg.addEventListener('pointerup',endDrag);
+    svg.addEventListener('pointerleave',endDrag);
+    fit();
+  }catch(e){
+    stage.innerHTML=`<p style="padding:30px;color:var(--bad)">Error: ${esc(String(e))}</p>`;
+  }
 }
-function showMapDevInfo(id){
-  const el=document.getElementById('map-container');
-  if(!el)return;
-  el.innerHTML+='<div id="map-dev-info" class="card" style="margin-top:16px;position:fixed;top:100px;right:20px;width:350px;max-height:70vh;overflow:auto;z-index:50;box-shadow:0 0 20px rgba(0,0,0,.5)"><div class="row" style="justify-content:space-between"><strong>Loading…</strong><button class="act" onclick="this.closest(\'#map-dev-info\').remove()">×</button></div></div>';
-  api(`/devices/${id}/check`,{method:'POST'}).then(r=>{
-    const container=document.getElementById('map-dev-info');
-    if(!container)return;
-    const st=r.status;
-    const rows=[
-      ['Firmware',st.firmware||'—'],['Model',st.model||'—'],
-      ['Uptime',fmtUptime(st.uptime_s)],['Load',(st.load||[]).join(' ')||'—'],
-      ['Memory',st.mem_total_kb?`${fmtKB(st.mem_total_kb-st.mem_free_kb)} / ${fmtKB(st.mem_total_kb)}`:'—'],
-      ['WAN',st.wan_up===false?'DOWN':(st.wan_up===true?'UP':'—')+(st.wan_ip?' ('+st.wan_ip+')':'')],
-      ['Clients',st.clients==null?'—':st.clients],
-      ['Health',r.health_score!=null?`${r.health_score}/100`:'—'],
-      // WiFi clients per SSID
-      ...(st.stations&&Object.keys(st.stations).length?
-        Object.entries(st.stations).map(([essid,c])=>['  '+essid,`${c} clients`]):[]),
-      // Traffic counters
-      ...(st.traffic&&Object.keys(st.traffic).length?
-        Object.entries(st.traffic).map(([iface,t])=>['  '+iface,`RX ${fmtKB(t.rx)} / TX ${fmtKB(t.tx)}`]):[]),
-      ['FW in/fwd/out',st.fw_in&&`${st.fw_in}/${st.fw_fwd}/${st.fw_out}`||'—'],
-      ['Listeners',(st.listeners||[]).join(', ')||'—'],
-    ];
-    if(st.interfaces){
-      Object.values(st.interfaces).forEach(iface=>{
-        rows.push([`${iface.name} (${iface.ip})`, iface.cidr]);
-      });
-    }
-    if(st.wifi&&st.wifi.length){
-      rows.push(['WiFi','']);
-      st.wifi.forEach(ap=>{
-        rows.push([`  ${ap.essid}`, `${ap.band} ch${ap.channel} ${ap.encryption}`]);
-      });
-    }
-    container.innerHTML=`<div class="row" style="justify-content:space-between"><strong>${esc(r.status.name||'Device')} (${esc(r.status.host||'')})</strong><button class="act" onclick="this.closest('#map-dev-info').remove()">×</button></div>`+
-      rows.map(([k,v])=>`<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`).join('');
-  }).catch(e=>{
-    const container=document.getElementById('map-dev-info');
-    if(container)container.innerHTML=`<div style="color:var(--bad)">Error: ${esc(e.message)}</div><button class="act" onclick="this.closest('#map-dev-info').remove()">Close</button>`;
-  });
-}
+
 function showDevInfo(id,st,fromMap=false){
   const el=document.getElementById('devinfo-'+id);if(!el)return;
   if(!st)return;
