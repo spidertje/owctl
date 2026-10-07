@@ -228,7 +228,7 @@ function showMapDevInfo(id){
   box.style.cssText='position:absolute;top:12px;right:12px;width:340px;max-height:calc(100% - 24px);overflow:auto;z-index:30;pointer-events:auto';
   box.innerHTML='<div class="row" style="justify-content:space-between"><strong>Checking…</strong><button class="act" onclick="document.getElementById(\'map-dev-info\').remove()">×</button></div>';
   host.appendChild(box);
-  api(`/devices/${id}/check`).then(r=>{
+  api(`/devices/${id}/check`,{method:'POST'}).then(r=>{
     const st=r.status;
     if(!box.isConnected)return;
     const rows=[
