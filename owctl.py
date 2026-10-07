@@ -107,6 +107,26 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, ts TEXT,
         iface TEXT, rx_bytes INTEGER, tx_bytes INTEGER)""")
     execute("""CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS owctl_actions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, device_id INTEGER, device_name TEXT,
+        action TEXT, detail TEXT, result TEXT, error TEXT)""")
+
+
+def log_action(device, action, detail='', ok=None, error=''):
+    """Insert an audit-log row for a mutating operation. Never raises — logging
+    must not break the operation it is recording."""
+    try:
+        dev_id = None
+        dev_name = None
+        if isinstance(device, dict):
+            dev_id = device.get('id')
+            dev_name = device.get('name')
+        execute(
+            "INSERT INTO owctl_actions(ts, device_id, device_name, action, detail, result, error) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (now(), dev_id, dev_name, action, detail, 'ok' if ok else 'failed', error or ''))
+    except Exception:
+        pass
 
 
 def get_setting(k, d=None):
@@ -846,6 +866,7 @@ def push_ssh_key(dev):
     probe["key_path"] = key_path
     probe["ssh_password"] = ""
     vt = ssh_test(probe)
+    log_action(dev, 'push_ssh_key', 'key pushed', ok=vt["ok"], error=vt["detail"] if not vt["ok"] else '')
     return {"ok": vt["ok"], "public_key": pub, "detail": vt["detail"], "key_saved": True}
 
 
@@ -878,6 +899,7 @@ def do_backup(dev):
     size = os.path.getsize(local)
     execute("INSERT INTO backups(ts, device_id, device_name, kind, path, size) VALUES(?,?,?,?,?,?)",
             (now(), dev["id"], dev["name"], kind, local, size))
+    log_action(dev, 'backup', f'kind={kind} path={os.path.basename(local)}', ok=True)
     return local
 
 
@@ -909,6 +931,7 @@ def do_restore(dev, backup_path):
         c.exec_command(f"rm -f {remote}")
         if status != 0:
             raise RuntimeError(f"uci import failed (exit={status}): {(err or out)[:200]}")
+        log_action(dev, 'restore', f'file={os.path.basename(backup_path)}', ok=True)
         return {"restored": True, "file": backup_path, "output": out[:500]}
     except Exception as e:
         c.close()
@@ -963,6 +986,7 @@ uci commit network
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"VLAN config failed on {dev['name']}: {(err or out)[:200]}")
+        log_action(dev, 'vlan', f'vlan_id={vlan_id} role={"router" if is_router else "switch"}', ok=True)
         return {"device": dev["name"], "role": "router" if is_router else "switch", "ok": True}
     finally:
         c.close()
@@ -1002,6 +1026,7 @@ uci commit firewall"""
             raise RuntimeError(f"guest WiFi config failed: {(err or out)[:200]}")
         # Try to bring up wireless (may fail if radio not available)
         c.exec_command("wifi up 2>/dev/null || true")
+        log_action(dev, 'guest_wifi', f'ssid={ssid}', ok=True)
         return {"ssid": ssid, "ok": True, "output": out[:300]}
     finally:
         c.close()
@@ -1025,6 +1050,7 @@ def do_upgrade(dev, packages):
             raise RuntimeError(f"upgrade exited with status {status}")
     finally:
         c.close()
+    log_action(dev, 'upgrade', f'packages={", ".join(packages) if packages else "all"}', ok=True)
     return result[:30000]
 
 
@@ -1036,6 +1062,7 @@ def do_reboot(dev):
         c.exec_command("reboot")
     finally:
         c.close()
+    log_action(dev, 'reboot', 'reboot sent', ok=True)
     return "reboot sent"
 
 
@@ -1210,6 +1237,7 @@ def device_push_key(did: int):
     except HTTPException:
         raise
     except Exception as e:
+        log_action(cur[0], 'push_key', '', ok=False, error=str(e))
         raise HTTPException(502, f"key push failed: {e}")
 
 
@@ -1223,6 +1251,7 @@ def device_backup(did: int):
     except HTTPException:
         raise
     except Exception as e:
+        log_action(cur[0], 'backup', '', ok=False, error=str(e))
         raise HTTPException(502, f"backup failed: {e}")
 
 
@@ -1240,6 +1269,7 @@ async def device_restore(request: Request, did: int):
     except HTTPException:
         raise
     except Exception as e:
+        log_action(cur[0], 'restore', '', ok=False, error=str(e))
         raise HTTPException(502, f"restore failed: {e}")
 
 
@@ -1304,6 +1334,7 @@ async def device_guest_wifi(request: Request, did: int):
     except HTTPException:
         raise
     except Exception as e:
+        log_action(cur[0], 'guest_wifi', '', ok=False, error=str(e))
         raise HTTPException(502, f"guest WiFi failed: {e}")
 
 
@@ -1355,6 +1386,7 @@ async def device_upgrade(request: Request, did: int):
     except HTTPException:
         raise
     except Exception as e:
+        log_action(cur[0], 'upgrade', '', ok=False, error=str(e))
         raise HTTPException(502, f"upgrade failed: {e}")
 
 
@@ -1421,8 +1453,10 @@ async def bulk_actions(request: Request):
             elif action == "reboot":
                 do_reboot(dev)
             results.append({"id": did, "name": dev["name"], "ok": True})
+            log_action(dev, action or 'unknown', '', ok=True)
         except Exception as e:
             results.append({"id": did, "name": dev["name"], "ok": False, "error": str(e)})
+            log_action(dev, action or 'unknown', '', ok=False, error=str(e))
     return {"results": results}
 
 
@@ -1443,6 +1477,7 @@ def device_reboot(did: int):
     except HTTPException:
         raise
     except Exception as e:
+        log_action(cur[0], 'reboot', '', ok=False, error=str(e))
         raise HTTPException(502, f"reboot failed: {e}")
 
 
@@ -1488,6 +1523,12 @@ def alerts_log():
 @app.get("/api/backups")
 def backups():
     return q("SELECT * FROM backups ORDER BY id DESC LIMIT 100")
+
+
+@app.get("/api/actions")
+def actions(limit: int = 100):
+    """Read-only audit log of all mutating operations, newest first."""
+    return q("SELECT * FROM owctl_actions ORDER BY ts DESC, id DESC LIMIT ?", (max(1, int(limit)),))
 
 
 @app.get("/api/settings")
