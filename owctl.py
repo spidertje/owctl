@@ -1559,23 +1559,91 @@ def parse_vlan_ids(output):
     return sorted(ids)
 
 
-def discover_vlans(dev):
-    """Read configured VLAN ids from a single device over SSH (uci show network).
+def netmask_to_prefix(mask):
+    """'255.255.255.0' -> 24. Returns None on garbage input."""
+    try:
+        parts = [int(x) for x in (mask or "").split(".")]
+        if len(parts) != 4 or any(p < 0 or p > 255 for p in parts):
+            return None
+        bits = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+        return bin(bits).count("1")
+    except Exception:
+        return None
 
-    Returns {'name','host','vlans':[int], 'error':None} or {'error': str}.
+
+def parse_vlan_details(network_out, dhcp_out=""):
+    """Pure parser: map VLAN id -> {'subnet': 'a.b.c.0/N'|None, 'dhcp': bool}.
+
+    A VLAN-bound interface is a `network.<x>=interface` section carrying
+    `.vlan='<id>'`. Its subnet is derived from `.ipaddr` + `.netmask` when
+    present (ip network address + netmask prefix). dhcp=True when a
+    `dhcp.<y>.interface='<x>'` section references it.
+    """
+    sections = {}
+    for line in (network_out or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^network\.([A-Za-z0-9_]+)=(\w+)$", line)
+        if m:
+            if m.group(2) == "interface":
+                sections.setdefault(m.group(1), {})
+            continue
+        m = re.match(r"^network\.([A-Za-z0-9_]+)\.(\w+)='?([^']*)'?$", line)
+        if m and m.group(1) in sections:
+            sections[m.group(1)][m.group(2)] = m.group(3)
+    dhcp_ifaces = set()
+    for line in (dhcp_out or "").splitlines():
+        m = re.match(r"^dhcp\.[A-Za-z0-9_]+\.interface='?([^' ]*)'?$", line.strip())
+        if m:
+            dhcp_ifaces.add(m.group(1))
+    details = {}
+    for name, a in sections.items():
+        vid = (a.get("vlan") or "").strip()
+        if not vid.isdigit():
+            continue
+        vid = int(vid)
+        if vid <= 0:
+            continue
+        subnet = None
+        ip = (a.get("ipaddr") or "").strip().strip("'")
+        mask = (a.get("netmask") or "").strip().strip("'")
+        if ip and mask:
+            pref = netmask_to_prefix(mask)
+            if pref:
+                import ipaddress
+                try:
+                    subnet = str(ipaddress.ip_network(f"{ip}/{pref}", strict=False))
+                except Exception:
+                    subnet = None
+        details[vid] = {"subnet": subnet, "dhcp": name in dhcp_ifaces}
+    return details
+
+
+def discover_vlans(dev):
+    """Read configured VLANs + their subnet/dhcp from a device over SSH.
+
+    Runs `uci show network` and `uci show dhcp`, then maps each VLAN id to
+    {'subnet','dhcp'}. Returns {'name','host','vlans':[int],
+    'details':{int:{'subnet','dhcp'}}, 'error':None} or {'error': str}.
     """
     if dev["access"] != "ssh":
-        return {"name": dev.get("name"), "host": dev["host"], "vlans": [], "error": "luci-only device skipped"}
+        return {"name": dev.get("name"), "host": dev["host"], "vlans": [],
+                "details": {}, "error": "luci-only device skipped"}
     try:
         c = _ssh_connect(dev)
         try:
-            out, _err, _status = _exec_capture(c, "uci show network 2>/dev/null", timeout=30)
+            net, _e1, _s1 = _exec_capture(c, "uci show network 2>/dev/null", timeout=30)
+            dhc, _e2, _s2 = _exec_capture(c, "uci show dhcp 2>/dev/null", timeout=30)
         finally:
             c.close()
+        details = parse_vlan_details(net, dhc)
+        all_ids = sorted(set(parse_vlan_ids(net)) | set(details.keys()))
         return {"name": dev.get("name"), "host": dev["host"],
-                "vlans": parse_vlan_ids(out), "error": None}
+                "vlans": all_ids, "details": details, "error": None}
     except Exception as e:
-        return {"name": dev.get("name"), "host": dev["host"], "vlans": [], "error": str(e)}
+        return {"name": dev.get("name"), "host": dev["host"], "vlans": [],
+                "details": {}, "error": str(e)}
 
 
 def _upsert_discovered_vlan(vlan_id, name, subnet, dhcp):
@@ -1590,19 +1658,29 @@ def _upsert_discovered_vlan(vlan_id, name, subnet, dhcp):
 
 @app.post("/api/vlans/discover")
 async def discover_vlans_endpoint(request: Request):
-    """Scan all SSH-accessible devices for configured VLANs and record them."""
+    """Scan all SSH-accessible devices for configured VLANs (with subnet/dhcp) and record them."""
     devs = q("SELECT * FROM devices WHERE access='ssh' ORDER BY id")
     results = []
     for dev in devs:
         results.append(discover_vlans(dev))
-    found = {}
+    # Union of VLAN ids across devices (switch-only VLANs included via parse_vlan_ids),
+    # with details (subnet/dhcp) attached where an interface section provided them.
+    merged = {}
     for r in results:
-        for v in r.get("vlans", []):
-            found.setdefault(str(v), {"name": f"vlan_{v}", "subnet": None, "dhcp": None})
-    for vid, info in found.items():
-        _upsert_discovered_vlan(vid, info["name"], info["subnet"], info["dhcp"])
-    all_ids = sorted((int(v) for v in found), reverse=True)
-    log_action(None, "vlan_discover", f"devices_scanned={len(devs)} vlans_found={len(found)}", ok=True)
+        det = r.get("details") or {}
+        ids = set(r.get("vlans") or []) | set(det.keys())
+        for vid in ids:
+            d = det.get(vid, {})
+            m = merged.setdefault(vid, {"subnet": None, "dhcp": False})
+            if d.get("subnet"):
+                m["subnet"] = d["subnet"]
+            if d.get("dhcp"):
+                m["dhcp"] = True
+    for vid, info in merged.items():
+        _upsert_discovered_vlan(str(vid), f"vlan_{vid}", info["subnet"],
+                                1 if info["dhcp"] else None)
+    all_ids = sorted((int(v) for v in merged), reverse=True)
+    log_action(None, "vlan_discover", f"devices_scanned={len(devs)} vlans_found={len(merged)}", ok=True)
     return {"devices_scanned": len(devs), "results": results,
             "vlans_found": all_ids, "vlans": list_vlans()}
 
