@@ -107,6 +107,11 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, ts TEXT,
         iface TEXT, rx_bytes INTEGER, tx_bytes INTEGER)""")
     execute("""CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS device_heartbeats(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, ts TEXT, online INTEGER)""")
+    execute("""CREATE TABLE IF NOT EXISTS offline_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, device_name TEXT,
+        went_offline TEXT, went_online TEXT, offline_seconds INTEGER DEFAULT NULL)""")
 
 
 def get_setting(k, d=None):
@@ -117,6 +122,57 @@ def get_setting(k, d=None):
 def set_setting(k, v):
     execute("INSERT INTO settings(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
+
+
+# --------------------------------------------- device heartbeats / offline events
+_HEARTBEAT_STATE = {}  # device_id -> last known online bool
+
+
+def record_heartbeat(device_row, online_bool):
+    """Insert a heartbeat row and maintain offline-event transitions.
+
+    online->offline: open an offline_event (went_offline=now()).
+    offline->online: close the most recent open event for that device
+    (went_online=now(), offline_seconds = elapsed seconds).
+    First observation for a device: heartbeat only, no event.
+    Never raises.
+    """
+    try:
+        did = device_row["id"]
+        ts = now()
+        execute("INSERT INTO device_heartbeats(device_id, ts, online) VALUES(?,?,?)",
+                (did, ts, 1 if online_bool else 0))
+        prev = _HEARTBEAT_STATE.get(did)
+        if prev is None:
+            _HEARTBEAT_STATE[did] = online_bool
+            return
+        if prev and not online_bool:
+            # online -> offline transition
+            execute(
+                "INSERT INTO offline_events(device_id, device_name, went_offline) VALUES(?,?,?)",
+                (did, device_row.get("name"), ts))
+        elif not prev and online_bool:
+            # offline -> online transition: close the most recent open event
+            rows = q("SELECT id, went_offline FROM offline_events "
+                     "WHERE device_id=? AND went_online IS NULL "
+                     "ORDER BY id DESC LIMIT 1", (did,))
+            if rows:
+                ev = rows[0]
+                try:
+                    t_off = datetime.fromisoformat(ev["went_offline"])
+                    secs = max(0, int((datetime.fromisoformat(ts.replace(" ", "T"))
+                                       - t_off).total_seconds()))
+                except Exception:
+                    secs = None
+                execute("UPDATE offline_events SET went_online=?, offline_seconds=? WHERE id=?",
+                        (ts, secs, ev["id"]))
+        _HEARTBEAT_STATE[did] = online_bool
+    except Exception as e:
+        try:
+            import logging
+            logging.getLogger("owctl").warning("record_heartbeat failed: %s", e)
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------- OpenWrt: SSH backend
@@ -1041,6 +1097,7 @@ def do_reboot(dev):
 
 def check_device(dev):
     st = gather(dev)
+    record_heartbeat(dev, True)
     execute("UPDATE devices SET status='online', last_checked=? WHERE id=?", (now(), dev["id"]))
     findings = apply_findings(dev, st)
     # Check for config changes
@@ -1094,9 +1151,11 @@ def _scheduler():
         for dev in q("SELECT * FROM devices WHERE access IN ('ssh','luci')"):
             try:
                 st = gather(dev)
+                record_heartbeat(dev, True)
                 execute("UPDATE devices SET status='online', last_checked=? WHERE id=?", (now(), dev["id"]))
                 apply_findings(dev, st)
             except Exception:
+                record_heartbeat(dev, False)
                 execute("UPDATE devices SET status='offline' WHERE id=?", (dev["id"],))
 
 
@@ -1181,6 +1240,7 @@ def device_check(did: int):
     try:
         return check_device(cur[0])
     except Exception as e:
+        record_heartbeat(cur[0], False)
         execute("UPDATE devices SET status='offline' WHERE id=?", (did,))
         raise HTTPException(502, f"device check failed: {e}")
 
@@ -1504,6 +1564,53 @@ async def settings_put(request: Request):
     if "ui_token" in d:
         set_setting("ui_token", d["ui_token"] or "")
     return {"ok": True}
+
+
+@app.get("/api/devices/{did}/heartbeat")
+def get_device_heartbeat(did: int, limit: int = 200):
+    """Return recent heartbeat rows for a device (newest first)."""
+    rows = q("SELECT ts, online FROM device_heartbeats WHERE device_id=? "
+             "ORDER BY ts DESC, id DESC LIMIT ?", (did, max(1, min(1000, limit))))
+    return [{"ts": r["ts"], "online": bool(r["online"])} for r in rows]
+
+
+@app.get("/api/uptime")
+def get_uptime():
+    """Per-device uptime summary: total checks, online count, uptime %, last seen."""
+    rows = q("""SELECT d.id, d.name, d.host, d.status AS device_status,
+                      COUNT(h.id) AS total_checks,
+                      SUM(CASE WHEN h.online=1 THEN 1 ELSE 0 END) AS online_count,
+                      MAX(h.ts) AS last_seen,
+                      MAX(CASE WHEN h.online=1 THEN h.ts END) AS last_online
+               FROM devices d
+               LEFT JOIN device_heartbeats h ON h.device_id = d.id
+               GROUP BY d.id
+               ORDER BY d.id""")
+    out = []
+    for r in rows:
+        total = r["total_checks"] or 0
+        online = r["online_count"] or 0
+        pct = round(100.0 * online / total, 1) if total else None
+        out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "host": r["host"],
+            "status": r["device_status"],
+            "total_checks": total,
+            "online_count": online,
+            "uptime_pct": pct,
+            "last_seen": r["last_seen"],
+            "last_online": r["last_online"],
+        })
+    return out
+
+
+@app.get("/api/offline-events")
+def get_offline_events(limit: int = 100):
+    """Return offline events (newest first)."""
+    rows = q("SELECT * FROM offline_events ORDER BY went_offline DESC, id DESC LIMIT ?",
+             (max(1, min(500, limit)),))
+    return [dict(r) for r in rows]
 
 
 app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="static")
