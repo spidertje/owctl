@@ -1541,6 +1541,72 @@ def list_vlans():
              "dhcp": bool(r["dhcp"])} for r in rows]
 
 
+def parse_vlan_ids(output):
+    """Extract VLAN ids from `uci show network` output. Pure + testable.
+
+    Matches both switch VLAN sections (`... .vlan='2'`) and bridge-tag
+    interfaces (`... .vlan='10'` on a network section). Returns a sorted,
+    de-duplicated list of positive ints.
+    """
+    ids = set()
+    for m in re.finditer(r"\.vlan='?(\d+)'?", output or ""):
+        try:
+            v = int(m.group(1))
+            if v > 0:
+                ids.add(v)
+        except ValueError:
+            pass
+    return sorted(ids)
+
+
+def discover_vlans(dev):
+    """Read configured VLAN ids from a single device over SSH (uci show network).
+
+    Returns {'name','host','vlans':[int], 'error':None} or {'error': str}.
+    """
+    if dev["access"] != "ssh":
+        return {"name": dev.get("name"), "host": dev["host"], "vlans": [], "error": "luci-only device skipped"}
+    try:
+        c = _ssh_connect(dev)
+        try:
+            out, _err, _status = _exec_capture(c, "uci show network 2>/dev/null", timeout=30)
+        finally:
+            c.close()
+        return {"name": dev.get("name"), "host": dev["host"],
+                "vlans": parse_vlan_ids(out), "error": None}
+    except Exception as e:
+        return {"name": dev.get("name"), "host": dev["host"], "vlans": [], "error": str(e)}
+
+
+def _upsert_discovered_vlan(vlan_id, name, subnet, dhcp):
+    """Insert a discovered VLAN without clobbering fields already set by an apply."""
+    execute("INSERT INTO vlans(vlan_id, name, subnet, dhcp, created_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(vlan_id) DO UPDATE SET "
+            "name=COALESCE(excluded.name, vlans.name), "
+            "subnet=COALESCE(excluded.subnet, vlans.subnet), "
+            "dhcp=COALESCE(excluded.dhcp, vlans.dhcp) ",
+            (str(vlan_id), name, subnet, dhcp, now()))
+
+
+@app.post("/api/vlans/discover")
+async def discover_vlans_endpoint(request: Request):
+    """Scan all SSH-accessible devices for configured VLANs and record them."""
+    devs = q("SELECT * FROM devices WHERE access='ssh' ORDER BY id")
+    results = []
+    for dev in devs:
+        results.append(discover_vlans(dev))
+    found = {}
+    for r in results:
+        for v in r.get("vlans", []):
+            found.setdefault(str(v), {"name": f"vlan_{v}", "subnet": None, "dhcp": None})
+    for vid, info in found.items():
+        _upsert_discovered_vlan(vid, info["name"], info["subnet"], info["dhcp"])
+    all_ids = sorted((int(v) for v in found), reverse=True)
+    log_action(None, "vlan_discover", f"devices_scanned={len(devs)} vlans_found={len(found)}", ok=True)
+    return {"devices_scanned": len(devs), "results": results,
+            "vlans_found": all_ids, "vlans": list_vlans()}
+
+
 @app.post("/api/devices/{did}/guest-wifi")
 async def device_guest_wifi(request: Request, did: int):
     """Create or update guest WiFi on a device."""
