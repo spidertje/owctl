@@ -17,6 +17,7 @@ import sqlite3
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -600,6 +601,9 @@ DEFAULT_ALERTS = {
                   "user": "", "password": "", "from": "", "to": ""},
         "telegram": {"enabled": False, "token": "", "chat_id": ""},
         "webhook": {"enabled": False, "url": ""},
+        "ntfy": {"enabled": False, "server": "https://ntfy.sh", "topic": ""},
+        "pushover": {"enabled": False, "token": "", "user_key": ""},
+        "discord": {"enabled": False, "webhook_url": ""},
     },
 }
 
@@ -682,6 +686,46 @@ def fire_alert(dev, finding):
             used.append("webhook")
         except Exception as e:
             used.append(f"webhook:FAIL({e})")
+    nf = ch.get("ntfy") or {}
+    if nf.get("enabled") and nf.get("topic"):
+        try:
+            server = (nf.get("server") or "https://ntfy.sh").rstrip("/")
+            payload = text.encode()
+            req = urllib.request.Request(
+                f"{server}/{nf['topic']}", data=payload,
+                headers={"Content-Type": "text/plain",
+                         "Title": f"owctl [{finding['severity']}] {dev['name']}"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                r.read()
+            used.append("ntfy")
+        except Exception as e:
+            used.append(f"ntfy:FAIL({e})")
+    po = ch.get("pushover") or {}
+    if po.get("enabled") and po.get("token") and po.get("user_key"):
+        try:
+            payload = urllib.parse.urlencode({
+                "token": po["token"], "user": po["user_key"],
+                "message": text, "title": f"owctl {finding['severity']}"}).encode()
+            req = urllib.request.Request(
+                "https://api.pushover.net/1/messages.json", data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                r.read()
+            used.append("pushover")
+        except Exception as e:
+            used.append(f"pushover:FAIL({e})")
+    dc = ch.get("discord") or {}
+    if dc.get("enabled") and dc.get("webhook_url") and dc["webhook_url"].startswith("https://"):
+        try:
+            payload = json.dumps({"content": text}).encode()
+            req = urllib.request.Request(
+                dc["webhook_url"], data=payload,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                r.read()
+            used.append("discord")
+        except Exception as e:
+            used.append(f"discord:FAIL({e})")
     if used:
         execute("UPDATE alert_log SET channels=? WHERE id=?", (",".join(used), log_id))
     return used
