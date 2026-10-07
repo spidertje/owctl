@@ -687,7 +687,77 @@ def fire_alert(dev, finding):
     return used
 
 
-# ------------------------------------------------------------------ sweep
+def build_digest():
+    devices = q("SELECT * FROM devices ORDER BY name")
+    if not devices:
+        return ("OpenWrt Fleet Digest — no devices registered",
+                "No devices are currently registered in owctl.\n")
+
+    lines = []
+    for dev in devices:
+        lines.append(f"=== {dev['name']} ({dev['host']}) ===")
+        lines.append(f"Status: {dev.get('status', 'unknown')}")
+        lines.append(f"Health score: {dev.get('health_score', 'N/A')}")
+        afs = q("SELECT severity, message, detail FROM active_findings WHERE device_id=? ORDER BY severity",
+                (dev['id'],))
+        if afs:
+            cnt = {}
+            for a in afs:
+                cnt[a['severity']] = cnt.get(a['severity'], 0) + 1
+            lines.append(f"Active findings: {cnt}")
+            for a in afs:
+                lines.append(f"  [{a['severity']}] {a['message']}")
+                if a.get('detail'):
+                    lines.append(f"    {a['detail']}")
+        else:
+            lines.append("Active findings: none")
+        lines.append("")
+
+    new = q("SELECT ts, device_name, rule_id, severity, message FROM findings WHERE ts > datetime('now', '-7 days') ORDER BY ts DESC")
+    lines.append("=== New in last 7 days ===")
+    if new:
+        for f in new:
+            lines.append(f"  [{f['severity']}] {f['device_name']}: {f['message']} ({f['ts']})")
+    else:
+        lines.append("  No new findings in the last 7 days.")
+    lines.append("")
+
+    offline = [d for d in devices if d.get('status') != 'online']
+    total_active = sum(len(q("SELECT 1 FROM active_findings WHERE device_id=?", (d['id'],))) for d in devices)
+    lines.append(f"Summary: {len(devices)} device(s), {total_active} active findings, {len(offline)} offline")
+
+    subject = f"OpenWrt Fleet Digest — {len(devices)} device(s), {total_active} findings"
+    body = "\n".join(lines) + "\n"
+    return subject, body
+
+
+def send_digest():
+    cfg = get_alert_cfg()
+    ch = (cfg.get("channels") or {}).get("email") or {}
+    if not ch.get("enabled") or not ch.get("to") or not ch.get("smtp_host"):
+        return {"sent": False, "reason": "email channel not configured"}
+    try:
+        subject, body = build_digest()
+    except Exception as e:
+        return {"sent": False, "reason": f"build_digest: {e}"}
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = ch.get("from") or ch.get("user") or "owctl@lan"
+        msg["To"] = ch["to"]
+        msg.set_content(body)
+        with smtplib.SMTP(ch["smtp_host"], int(ch.get("smtp_port") or 587), timeout=20) as s:
+            if ch.get("use_tls", True):
+                s.starttls()
+            if ch.get("user"):
+                s.login(ch["user"], ch.get("password", ""))
+            s.send_message(msg)
+        return {"sent": True, "to": ch["to"]}
+    except Exception as e:
+        return {"sent": False, "reason": str(e)}
+
+
+# --------------------------------------------------------------- sweep
 def parse_spec(spec):
     import ipaddress
     ips = []
@@ -1086,6 +1156,18 @@ def check_device(dev):
 def _scheduler():
     while True:
         try:
+            last = int(get_setting("digest_last_sent", "0") or "0")
+            cfg = get_alert_cfg()
+            em = (cfg.get("channels") or {}).get("email") or {}
+            if time.time() - last > 7 * 24 * 3600 and em.get("enabled") and em.get("to") and em.get("smtp_host"):
+                try:
+                    send_digest()
+                except Exception:
+                    pass
+                set_setting("digest_last_sent", str(int(time.time())))
+        except Exception:
+            pass
+        try:
             interval_min = max(5, int(get_setting("audit_interval_min", "30") or 30))
         except Exception:
             interval_min = 30
@@ -1483,6 +1565,17 @@ async def alerts_put(request: Request):
 @app.get("/api/alerts/log")
 def alerts_log():
     return q("SELECT * FROM alert_log ORDER BY id DESC LIMIT 200")
+
+
+@app.post("/api/digest")
+async def api_digest(request: Request):
+    d = await request.json()
+    dry_run = bool(d.get("dry_run"))
+    subject, body = build_digest()
+    if dry_run:
+        return {"subject": subject, "body": body}
+    result = send_digest()
+    return {"subject": subject, "body": body, **result}
 
 
 @app.get("/api/backups")
