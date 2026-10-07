@@ -116,6 +116,8 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS owctl_actions(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, device_id INTEGER, device_name TEXT,
         action TEXT, detail TEXT, result TEXT, error TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS vlans(
+        vlan_id TEXT PRIMARY KEY, name TEXT, subnet TEXT, dhcp INTEGER, created_at TEXT)""")
 
 
 def log_action(device, action, detail='', ok=None, error=''):
@@ -1523,7 +1525,20 @@ async def apply_vlan(request: Request):
             results.append(r)
         except Exception as e:
             results.append({"device": cur[0]["name"], "ok": False, "error": str(e)})
+    if results and any(r.get("ok") for r in results):
+        execute("INSERT INTO vlans(vlan_id, name, subnet, dhcp, created_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(vlan_id) DO UPDATE SET name=excluded.name, subnet=excluded.subnet, "
+                "dhcp=excluded.dhcp, created_at=excluded.created_at",
+                (str(vlan_id), name, subnet, 1 if dhcp else 0, now()))
     return {"results": results}
+
+
+@app.get("/api/vlans")
+def list_vlans():
+    """Known VLANs (recorded when applied). Shape for the WiFi modal: [{id, name, subnet, dhcp}]."""
+    rows = q("SELECT * FROM vlans ORDER BY CAST(vlan_id AS INTEGER) DESC, vlan_id DESC")
+    return [{"id": r["vlan_id"], "name": r["name"], "subnet": r["subnet"],
+             "dhcp": bool(r["dhcp"])} for r in rows]
 
 
 @app.post("/api/devices/{did}/guest-wifi")
