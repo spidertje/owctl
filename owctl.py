@@ -199,6 +199,7 @@ echo '##neighbors##'; ip neigh show 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\
 echo '##dhcp##'; cat /tmp/dhcp.leases 2>/dev/null
 echo '##config##'; sha256sum /etc/config/* 2>/dev/null | awk '{print $2"="$1}'
 echo '##traffic##'; awk 'NR>2{gsub(/:/,"",$1); printf "%s %s %s\n", $1, $2, $10}' /proc/net/dev
+echo '##thermal##'; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null
 echo '##syslog##'; logread 2>/dev/null | tail -50
 echo '##vlans##'; uci show network 2>/dev/null | grep -E 'switch|vlan' | awk '{print $0}'
 echo '##end##'
@@ -295,6 +296,10 @@ def _build_status(dev, backend, s):
     st["mem_total_kb"] = int(mem.get("MemTotal", 0))
     st["mem_free_kb"] = int(mem.get("MemFree", 0))
     st["disk"] = s.get("disk", "")
+    m_disk = re.search(r'used=(\d+)%', st["disk"])
+    st["disk_used_pct"] = int(m_disk.group(1)) if m_disk else None
+    thermal = s.get("thermal", "").strip()
+    st["cpu_temp_c"] = float(thermal) / 1000 if thermal and thermal.isdigit() else None
     st["clients"] = int(s.get("clients") or 0)
     wan = s.get("wan", "")
     st["wan_up"] = None if not wan.strip() else ('"up":true' in wan or '"up": true' in wan)
@@ -578,6 +583,43 @@ def audit_status(st):
         rs = ", ".join(f"{r['name']}->{r['dest_port']}" for r in st["redirects"][:8])
         add("wan_forwards", "INFO", f"{len(st['redirects'])} WAN port forward(s)",
             rs, "Confirm each forward is intended")
+
+    # disk_usage
+    if st.get("disk_used_pct") is not None:
+        if st["disk_used_pct"] >= 90:
+            add("disk_full", "HIGH", f"Overlay disk {st['disk_used_pct']}% used",
+                detail=st.get("disk", ""), rec="Free space or move logs; a full overlay bricks config writes")
+        elif st["disk_used_pct"] >= 80:
+            add("disk_full", "MEDIUM", f"Overlay disk {st['disk_used_pct']}% used",
+                detail=st.get("disk", ""), rec="Free space or move logs; a full overlay bricks config writes")
+
+    # thermal
+    if st.get("cpu_temp_c") is not None:
+        if st["cpu_temp_c"] >= 85:
+            add("cpu_hot", "MEDIUM", f"CPU at {st['cpu_temp_c']}°C", detail=str(st['cpu_temp_c']))
+        elif st["cpu_temp_c"] >= 75:
+            add("cpu_hot", "LOW", f"CPU at {st['cpu_temp_c']}°C", detail=str(st['cpu_temp_c']))
+
+    # wifi security
+    wifi = st.get("wifi", [])
+    if wifi:
+        open_aps = [a for a in wifi if a.get("encryption") in ("open", "", "none")]
+        if open_aps:
+            sev = "CRITICAL"
+            if any(a.get("encryption") == "none" for a in open_aps) and not any(a.get("encryption") in ("open", "") for a in open_aps):
+                sev = "HIGH"
+            add("wifi_open", sev, f"{len(open_aps)} open WiFi network(s) detected",
+                detail=", ".join(a.get("essid", "?") for a in open_aps),
+                rec="Open networks are trivially sniffed; disable or use a VLAN. Disable the AP or require WPA2")
+
+        wpa2_psk_aps = [a for a in wifi if 'psk' in str(a.get("encryption", "")).lower()
+                        and 'psk2' not in str(a.get("encryption", "")).lower()
+                        and 'psk3' not in str(a.get("encryption", "")).lower()]
+        if wpa2_psk_aps:
+            add("wpa2_psk", "LOW", f"{len(wpa2_psk_aps)} AP(s) use WPA2-PSK (no 802.1X)",
+                detail=", ".join(a.get("essid", "?") for a in wpa2_psk_aps),
+                rec="Prefer WPA2/WPA3 (sae) or mixed sae+psk2")
+
     if st.get("device_date"):
         try:
             dev_t = datetime.strptime(st["device_date"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
