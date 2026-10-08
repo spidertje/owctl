@@ -922,6 +922,10 @@ async function renderWifi(){
     }
   }
 }
+function vlanOpt(v){
+  const label='VLAN '+v.id+(v.subnet?` (${v.subnet})`:'');
+  return `<option value="${v.id}">${esc(label)}</option>`;
+}
 async function editWifi(did){
   const devs=await api('/devices');
   const d=devs.find(x=>x.id===did);
@@ -935,7 +939,7 @@ async function editWifi(did){
     <div style="margin-bottom:12px"><label>Password (WPA2)</label><input id="wifi-pwd" type="password" placeholder="Minimum 8 characters" style="width:100%"></div>
     <div style="margin-bottom:12px"><label style="display:flex;justify-content:space-between;align-items:center">VLAN (optional)
       <button class="act" id="wifi-vlan-disc" title="Scan all devices for configured VLANs" style="margin-left:8px">⟳ discover</button></label>
-      <select id="wifi-vlan" style="width:100%"><option value="">— no VLAN (LAN) —</option>${vlans.map(v=>`<option value="${v.id}">VLAN ${v.id}</option>`).join('')}</select></div>
+      <select id="wifi-vlan" style="width:100%"><option value="">— no VLAN (LAN) —</option>${vlans.map(vlanOpt).join('')}</select></div>
     <div class="row" style="justify-content:flex-end;gap:8px">
       <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
       <button class="act pri" id="wifi-save">Save</button>
@@ -971,7 +975,7 @@ async function editWifi(did){
       const r=await api('/vlans/discover',{method:'POST',body:'{}'});
       const sel=modal.querySelector('#wifi-vlan');
       const keep=sel.value;
-      sel.innerHTML='<option value="">— no VLAN (LAN) —</option>'+((r.vlans||[]).map(v=>`<option value="${v.id}">VLAN ${v.id}</option>`)).join('');
+      sel.innerHTML='<option value="">— no VLAN (LAN) —</option>'+((r.vlans||[]).map(vlanOpt).join(''));
       if((r.vlans||[]).some(v=>String(v.id)===keep))sel.value=keep;
       toast(`Discovered ${r.vlans_found.length} VLAN(s) across ${r.devices_scanned} device(s)`);
     }catch(e){toast(String(e),true)}
