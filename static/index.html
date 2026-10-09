@@ -1005,10 +1005,15 @@ async function applyVlan(){
 async function renderWifi(){
   const el=document.getElementById('tab-wifi');
   const devs=await api('/devices');
-  // Filter: only show devices that have wireless capability (role 'ap' or 'router').
-  // Roles are normalized to lowercase in the backend; a gateway/router with a
-  // built-in radio is also a legitimate WiFi target, so include it.
-  const wifi_devs = devs.filter(d => (d.role || '').toLowerCase() === 'ap' || (d.role || '').toLowerCase() === 'router');
+  // Only show devices that can actually host WiFi:
+  //   - wifi_capable is the DETECTED radio capability (from `uci show wireless`
+  //     at last check) — true means a radio, false means none. A router with no
+  //     radio is correctly hidden even though its role is 'router'.
+  //   - If a device has never been checked (wifi_capable null), fall back to
+  //     role 'ap' so a freshly-added AP still shows before its first check.
+  const wifi_devs = devs.filter(d =>
+      d.wifi_capable === true ||
+      (d.wifi_capable === null && (d.role || '').toLowerCase() === 'ap'));
   const vlans=await api('/vlans').catch(()=>[]);
   let html=`<h2>WiFi Configuration</h2>
     <p class="muted">Configure guest WiFi networks on each wireless-capable device. Set SSID, password, and optionally bind to a VLAN.</p>`;

@@ -121,6 +121,11 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS device_status(
         id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER UNIQUE, ts TEXT,
         clients INTEGER, uptime_s INTEGER, firmware TEXT, rx_bytes INTEGER, tx_bytes INTEGER)""")
+    # Idempotent migration for databases created before wifi_capable existed.
+    try:
+        execute("ALTER TABLE device_status ADD COLUMN wifi_capable INTEGER")
+    except sqlite3.OperationalError:
+        pass
     # Role normalization: roles are the lowercase enum router/ap/switch/other.
     # Idempotent migration for any rows added before this code shipped.
     try:
@@ -219,10 +224,12 @@ def record_status_snapshot(dev_row, st):
         traffic = st.get("traffic") or {}
         rx_bytes = sum(int(v.get("rx", 0) or 0) for v in traffic.values() if isinstance(v, dict))
         tx_bytes = sum(int(v.get("tx", 0) or 0) for v in traffic.values() if isinstance(v, dict))
-        cols = ["device_id", "ts", "clients", "uptime_s", "firmware", "rx_bytes", "tx_bytes"]
+        wifi_capable = 1 if st.get("wifi_capable") else (0 if st.get("wifi_capable") is False else None)
+        cols = ["device_id", "ts", "clients", "uptime_s", "firmware", "rx_bytes", "tx_bytes", "wifi_capable"]
         vals = [dev_row["id"], now(),
                 st.get("clients"), st.get("uptime_s"), st.get("firmware"),
-                rx_bytes if traffic else None, tx_bytes if traffic else None]
+                rx_bytes if traffic else None, tx_bytes if traffic else None,
+                wifi_capable]
         # Null-safe: only write a column when its source is present.
         set_clause = ", ".join(
             f"{c}=excluded.{c}" for c, v in zip(cols, vals) if v is not None
@@ -1423,7 +1430,16 @@ def index():
 
 @app.get("/api/devices")
 def list_devices():
-    return q("SELECT * FROM devices ORDER BY id")
+    rows = q("""SELECT d.id, d.name, d.host, d.role, d.access, d.status,
+                       d.health_score, d.last_checked, d.added_at, d.tags,
+                       d.ssh_port, d.ssh_user, d.ssh_password, d.key_path,
+                       d.luci_user, d.luci_pass, d.luci_port,
+                       s.wifi_capable
+                FROM devices d LEFT JOIN device_status s ON s.device_id = d.id
+                ORDER BY d.id""")
+    for r in rows:
+        r["wifi_capable"] = bool(r["wifi_capable"]) if r["wifi_capable"] is not None else None
+    return rows
 
 
 @app.get("/api/network")
