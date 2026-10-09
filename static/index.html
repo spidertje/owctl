@@ -86,6 +86,8 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
     <button data-tab="map">Network Map</button>
     <button data-tab="wifi">WiFi</button>
     <button data-tab="vlans">VLANs</button>
+    <button data-tab="qos">QoS</button>
+    <button data-tab="firewall">Firewall</button>
     <button data-tab="logs">Device Logs</button>
   </nav>
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
@@ -99,6 +101,8 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <section id="tab-map" style="display:none"></section>
   <section id="tab-wifi" style="display:none"></section>
   <section id="tab-vlans" style="display:none"></section>
+  <section id="tab-qos" style="display:none"></section>
+  <section id="tab-firewall" style="display:none"></section>
   <section id="tab-logs" style="display:none"></section>
 </main>
 <div id="toast"></div>
@@ -135,6 +139,8 @@ function render(tab){
   if(tab==='map')return renderMap();
   if(tab==='logs')return renderLogs();
   if(tab==='vlans')return renderVlans();
+  if(tab==='qos')return renderQos();
+  if(tab==='firewall')return renderFirewall();
   if(tab==='wifi')return renderWifi();
 }
 function fmtUptime(s){if(!s&&s!==0)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
@@ -1002,6 +1008,207 @@ async function applyVlan(){
     toast(String(e),true);
   }
 }
+
+/* ─────────────────────────── QoS tab ─────────────────────────── */
+async function renderQos(){
+  const el=document.getElementById('tab-qos');
+  el.innerHTML='<p class="muted">Loading…</p>';
+  let devs;
+  try{ devs=await api('/devices'); }catch(e){ el.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; return; }
+  const sshDevs=devs.filter(d=>d.access==='ssh');
+  if(!sshDevs.length){ el.innerHTML='<div class="card">Add an SSH device to configure QoS.</div>'; return; }
+  const did=sshDevs[0].id;
+  let saved=null, live=null, err='';
+  try{ const r=await api(`/qos?did=${did}`); saved=r.saved; live=r.live; }
+  catch(e){ err=String(e); }
+  const src=saved||live||{};
+  el.innerHTML=`
+  <h2>QoS / SQM</h2>
+  <p class="muted">Traffic shaping via SQM (fq_codel or cake). Speeds in kbit/s. Requires SSH access.</p>
+  <div class="row" style="margin-bottom:16px">
+    <div style="flex:1"><label>Device</label>
+      <select id="qos-did" onchange="qosReload()" style="width:100%">
+        ${sshDevs.map(d=>`<option value="${d.id}" ${d.id===did?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}
+      </select>
+    </div>
+  </div>
+  ${err?`<div class="card" style="border-color:var(--bad)" id="qos-err">${esc(err)}</div>`:''}
+  <div class="row" style="gap:16px;flex-wrap:wrap;margin-bottom:16px">
+    <div class="card" style="flex:1;min-width:220px">
+      <h3>Live (on device)</h3>
+      ${live?`
+        <div class="row"><span>Backend</span><b>${esc(live.backend||'?')}</b></div>
+        <div class="row"><span>Enabled</span><b>${live.enabled?'yes':'no'}</b></div>
+        <div class="row"><span>Interface</span><b>${esc(live.interface||'—')}</b></div>
+        <div class="row"><span>Download</span><b>${live.download_kbps||0} kbps</b></div>
+        <div class="row"><span>Upload</span><b>${live.upload_kbps||0} kbps</b></div>
+        <div class="row"><span>Qdisc</span><b>${esc(live.qdisc||'—')}</b></div>
+        <div class="row"><span>ECN</span><b>${live.ecn==null?'—':(live.ecn?'on':'off')}</b></div>
+      `:'<p class="muted">No QoS configured on this device.</p>'}
+    </div>
+    <div class="card" style="flex:1;min-width:220px">
+      <h3>Apply</h3>
+      <div class="row" style="margin-bottom:10px">
+        <div><label>Enabled</label><select id="qos-enabled" style="width:110px"><option value="1" ${src.enabled!==false?'selected':''}>on</option><option value="0" ${src.enabled===false?'selected':''}>off</option></select></div>
+        <div><label>Interface</label><input id="qos-iface" value="${esc(src.interface||'wan')}" style="width:100px"></div>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <div><label>Download (kbps)</label><input id="qos-dl" type="number" min="0" value="${src.download_kbps||0}" style="width:120px"></div>
+        <div><label>Upload (kbps)</label><input id="qos-ul" type="number" min="0" value="${src.upload_kbps||0}" style="width:120px"></div>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <div><label>Qdisc</label><select id="qos-qdisc" style="width:130px">${['fq_codel','cake'].map(q=>`<option value="${q}" ${src.qdisc===q?'selected':''}>${q}</option>`).join('')}</select></div>
+        <div><label>ECN</label><select id="qos-ecn" style="width:90px"><option value="0" ${src.ecn!==true?'selected':''}>off</option><option value="1" ${src.ecn===true?'selected':''}>on</option></select></div>
+        <div style="align-self:flex-end"><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="qos-install"> install if missing</label></div>
+      </div>
+      <button class="act pri" onclick="applyQos()">Apply QoS</button>
+      <span class="muted" style="margin-left:8px">commits + restarts SQM</span>
+    </div>
+  </div>
+  <div id="qos-result" style="margin-top:8px"></div>`;
+}
+async function qosReload(){ renderQos(); }
+async function applyQos(){
+  const did=parseInt(document.getElementById('qos-did').value);
+  const body={ did, enabled:document.getElementById('qos-enabled').value==='1',
+    interface:document.getElementById('qos-iface').value||'wan',
+    download_kbps:parseInt(document.getElementById('qos-dl').value||0),
+    upload_kbps:parseInt(document.getElementById('qos-ul').value||0),
+    qdisc:document.getElementById('qos-qdisc').value,
+    ecn:document.getElementById('qos-ecn').value==='1',
+    install_if_missing:document.getElementById('qos-install').checked };
+  const box=document.getElementById('qos-result');
+  try{
+    box.innerHTML='<p class="muted">Applying…</p>';
+    await api('/qos/apply',{method:'POST',body:JSON.stringify(body)});
+    box.innerHTML='<div class="card" style="border-color:var(--ok)">QoS applied and restarted.</div>';
+    toast('QoS applied');
+    renderQos();
+  }catch(e){
+    box.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`;
+    toast(String(e),true);
+  }
+}
+
+/* ─────────────────────────── Firewall tab ─────────────────────────── */
+async function renderFirewall(){
+  const el=document.getElementById('tab-firewall');
+  el.innerHTML='<p class="muted">Loading…</p>';
+  let devs;
+  try{ devs=await api('/devices'); }catch(e){ el.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; return; }
+  const sshDevs=devs.filter(d=>d.access==='ssh');
+  if(!sshDevs.length){ el.innerHTML='<div class="card">Add an SSH device to manage the firewall.</div>'; return; }
+  const did=sshDevs[0].id;
+  let live=null, err='';
+  try{ live=await api(`/firewall?did=${did}`); live=live.live; }catch(e){ err=String(e); }
+  const zones=(live&&live.zones)||[];
+  const fwd=(live&&live.redirects)||[];
+  const rules=(live&&live.rules)||[];
+  el.innerHTML=`
+  <h2>Firewall</h2>
+  <p class="muted">Port forwards, inter-zone rules and zone policies. Changes commit + reload fw4.</p>
+  <div class="row" style="margin-bottom:16px">
+    <div style="flex:1"><label>Device</label>
+      <select id="fw-did" onchange="fwReload()" style="width:100%">
+        ${sshDevs.map(d=>`<option value="${d.id}" ${d.id===did?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}
+      </select>
+    </div>
+  </div>
+  ${err?`<div class="card" style="border-color:var(--bad)">${esc(err)}</div>`:''}
+
+  <div class="card" style="margin-bottom:16px">
+    <h3>Port Forwards</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <div><label>Name</label><input id="fwf-name" placeholder="cam" style="width:120px"></div>
+      <div><label>Proto</label><select id="fwf-proto"><option value="tcp">tcp</option><option value="udp">udp</option><option value="tcpudp">tcp+udp</option></select></div>
+      <div><label>Src port</label><input id="fwf-sport" type="number" min="1" max="65535" placeholder="8080" style="width:90px"></div>
+      <div><label>Dest IP</label><input id="fwf-dip" placeholder="192.168.1.50" style="width:140px"></div>
+      <div><label>Dest port</label><input id="fwf-dport" type="number" min="0" max="65535" placeholder="=src" style="width:90px"></div>
+      <div style="align-self:flex-end"><button class="act pri" onclick="fwApplyForward()">Apply forward</button></div>
+    </div>
+    <table><tr><th>Name</th><th>Proto</th><th>Src</th><th>Dest</th><th></th></tr>
+      ${fwd.length?fwd.map(f=>`<tr><td>${esc(f.name||'')}</td><td>${esc(f.proto||'')}</td><td>${esc(f.src_dport||'')}</td><td>${esc(f.dest_ip||'')}:${esc(f.dest_port||'')}</td>
+        <td><button class="act" style="background:var(--bad);color:#fff" onclick="fwDelForward('${esc(f.name||'')}')">delete</button></td></tr>`).join(''):'<tr><td colspan="5" class="muted">none</td></tr>'}
+    </table>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <h3>Inter-Zone Rules</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <div><label>Name</label><input id="fwr-name" placeholder="allow cam" style="width:140px"></div>
+      <div><label>From zone</label><select id="fwr-src">${zones.map(z=>`<option>${esc(z.name)}</option>`).join('')}</select></div>
+      <div><label>To zone</label><select id="fwr-dest">${zones.map(z=>`<option>${esc(z.name)}</option>`).join('')}</select></div>
+      <div><label>Target</label><select id="fwr-target"><option>ACCEPT</option><option>REJECT</option><option>DROP</option></select></div>
+      <div style="align-self:flex-end"><button class="act pri" onclick="fwApplyRule()">Apply rule</button></div>
+    </div>
+    <table><tr><th>Name</th><th>From</th><th>To</th><th>Target</th><th></th></tr>
+      ${rules.length?rules.map(r=>`<tr><td>${esc(r.name||'')}</td><td>${esc(r.src||'')}</td><td>${esc(r.dest||'')}</td><td>${esc(r.target||'')}</td>
+        <td><button class="act" style="background:var(--bad);color:#fff" onclick="fwDelRule('${esc(r.name||'')}')">delete</button></td></tr>`).join(''):'<tr><td colspan="5" class="muted">none</td></tr>'}
+    </table>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <h3>Zone Policies</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+      ${zones.map(z=>`
+        <div class="zone-card" style="border:1px solid var(--line);border-radius:8px;padding:8px 10px">
+          <b>${esc(z.name)}</b>
+          <div style="display:flex;gap:6px;margin-top:6px">
+            <select data-zone="${esc(z.name)}" data-pol="input">${['ACCEPT','REJECT','DROP'].map(v=>`<option ${z.input===v?'selected':''}>${v}</option>`).join('')}</select>
+            <select data-zone="${esc(z.name)}" data-pol="forward">${['ACCEPT','REJECT','DROP'].map(v=>`<option ${z.forward===v?'selected':''}>${v}</option>`).join('')}</select>
+            <button class="act" onclick="fwApplyZone(this)">apply</button>
+          </div>
+          <span class="muted" style="font-size:11px">input · forward</span>
+        </div>`).join('')||'<span class="muted">no zones</span>'}
+    </div>
+  </div>
+  <div id="fw-result" style="margin-top:8px"></div>`;
+}
+async function fwReload(){ renderFirewall(); }
+function fwResult(msg,bad){const b=document.getElementById('fw-result');b.innerHTML=`<div class="card" style="border-color:var(--${bad?'bad':'ok'})">${esc(msg)}</div>`;}
+async function fwApplyForward(){
+  const did=parseInt(document.getElementById('fw-did').value);
+  const rule={ name:document.getElementById('fwf-name').value,
+    proto:document.getElementById('fwf-proto').value,
+    src_dport:parseInt(document.getElementById('fwf-sport').value||0),
+    dest_ip:document.getElementById('fwf-dip').value,
+    dest_port:parseInt(document.getElementById('fwf-dport').value||0)||null };
+  if(!rule.name||!rule.dest_ip){ fwResult('name and dest IP required',true); return; }
+  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'forward',rule})}); fwResult('Port forward applied + fw4 reloaded.'); renderFirewall(); }
+  catch(e){ fwResult(String(e),true); toast(String(e),true); }
+}
+async function fwApplyRule(){
+  const did=parseInt(document.getElementById('fw-did').value);
+  const rule={ name:document.getElementById('fwr-name').value,
+    src:document.getElementById('fwr-src').value,
+    dest:document.getElementById('fwr-dest').value,
+    target:document.getElementById('fwr-target').value };
+  if(!rule.name){ fwResult('rule name required',true); return; }
+  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'rule',rule})}); fwResult('Rule applied + fw4 reloaded.'); renderFirewall(); }
+  catch(e){ fwResult(String(e),true); toast(String(e),true); }
+}
+async function fwApplyZone(btn){
+  const did=parseInt(document.getElementById('fw-did').value);
+  const wrap=btn.closest('.zone-card')||btn.parentElement;
+  const zone=wrap.querySelector('select[data-zone]').dataset.zone;
+  const policies={};
+  wrap.querySelectorAll('select[data-pol]').forEach(s=>policies[s.dataset.pol]=s.value);
+  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'zone',zone,policies})}); fwResult(`Zone ${zone} policies applied + fw4 reloaded.`); renderFirewall(); }
+  catch(e){ fwResult(String(e),true); toast(String(e),true); }
+}
+async function fwDelForward(name){
+  if(!confirm('Delete port forward "'+name+'"?'))return;
+  const did=parseInt(document.getElementById('fw-did').value);
+  try{ await api(`/firewall/${did}/forward/${encodeURIComponent(name)}`,{method:'DELETE'}); fwResult('Forward deleted + fw4 reloaded.'); renderFirewall(); }
+  catch(e){ fwResult(String(e),true); toast(String(e),true); }
+}
+async function fwDelRule(name){
+  if(!confirm('Delete rule "'+name+'"?'))return;
+  const did=parseInt(document.getElementById('fw-did').value);
+  try{ await api(`/firewall/${did}/rule/${encodeURIComponent(name)}`,{method:'DELETE'}); fwResult('Rule deleted + fw4 reloaded.'); renderFirewall(); }
+  catch(e){ fwResult(String(e),true); toast(String(e),true); }
+}
+
 async function renderWifi(){
   const el=document.getElementById('tab-wifi');
   const devs=await api('/devices');
