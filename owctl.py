@@ -890,6 +890,197 @@ def firewall_find_rule(fw: dict, name: str):
     return None
 
 
+# ─────────────────────── QoS / firewall apply (SSH) ─────────────────────────
+_UCI_SLUG_RE = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _uci_slug(name: str) -> str:
+    """Sanitize a friendly name into a valid uci section id (lowercase, alnum+underscore)."""
+    s = _UCI_SLUG_RE.sub("_", (name or "").strip()).strip("_").lower()
+    if not s:
+        raise HTTPException(400, "empty rule name")
+    return s
+
+
+def _uci_quote(v) -> str:
+    """Quote a uci value for a shell-safe `uci set` line."""
+    return "'" + str(v).replace("'", "'\\''") + "'"
+
+
+def _fw_commit(cmd: str) -> str:
+    """Finish a firewall mutation script: commit + reload so changes go live."""
+    return cmd + "uci commit firewall && fw4 restart\n"
+
+
+def _run_ssh(dev, cmd, action, detail, ok_msg):
+    """SSH-gated helper: run one command block on the device, log the action."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, f"{action} requires SSH access on this device")
+    c = _ssh_connect(dev)
+    try:
+        out, err, status = _exec_capture(c, cmd, timeout=300)
+        if status != 0:
+            raise RuntimeError(f"{ok_msg} failed on {dev['name']}: exit {status} {(err or out).strip()[:200]}")
+    finally:
+        c.close()
+    log_action(dev, action, detail, ok=True)
+    return {"device": dev["name"], "ok": True}
+
+
+def ensure_pkg(dev, pkg):
+    """Install an opkg package if missing (opkg update + install -y)."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "package install requires SSH access on this device")
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", pkg):
+        raise HTTPException(400, f"invalid package name {pkg!r}")
+    _run_ssh(dev, f"opkg update && opkg install -y {pkg}", "package",
+             f"pkg={pkg}", "package install")
+    return "installed"
+
+
+def do_qos(dev, cfg, install_if_missing=False):
+    """Apply SQM (luci-app-sqm) settings for the first enabled interface.
+
+    cfg: {enabled, interface, download_kbps, upload_kbps, qdisc, ecn}.
+    Idempotent: uses the named 'wan' section; re-apply only overwrites options."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "QoS config requires SSH access on this device")
+    iface = (cfg.get("interface") or "wan").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", iface):
+        raise HTTPException(400, f"invalid interface name {iface!r}")
+    dl, ul = int(cfg.get("download_kbps") or 0), int(cfg.get("upload_kbps") or 0)
+    if dl < 0 or ul < 0:
+        raise HTTPException(400, "QoS speeds must be >= 0")
+    qdisc = cfg.get("qdisc") or "fq_codel"
+    if qdisc not in ("fq_codel", "cake", "hfsc", "hfs", "layer_cake"):
+        raise HTTPException(400, f"unsupported qdisc {qdisc!r}")
+    ecn = "1" if cfg.get("ecn") else "0"
+    sec = "wan"
+    lines = [
+        f"uci set sqm.{sec}=queue",
+        f"uci set sqm.{sec}.enabled={'1' if cfg.get('enabled') else '0'}",
+        f"uci set sqm.{sec}.interface={_uci_quote(iface)}",
+        f"uci set sqm.{sec}.download='{dl}'",
+        f"uci set sqm.{sec}.upload='{ul}'",
+    ]
+    for name in ("fq_codel", "cake", "hfsc", "hfs", "layer_cake"):
+        lines.append(f"uci set sqm.{sec}.{name}={'1' if name == qdisc else '0'}")
+    lines.append(f"uci set sqm.{sec}.ecn={ecn}")
+    lines.append("uci commit sqm")
+    lines.append("sqm restart")
+    pre = f"opkg install -y luci-app-sqm || true\n" if install_if_missing else ""
+    _run_ssh(dev, pre + "\n".join(lines) + "\n", "qos",
+             f"iface={iface} dl={dl} ul={ul} qdisc={qdisc} enabled={bool(cfg.get('enabled'))}",
+             "QoS apply")
+    return {"device": dev["name"], "ok": True, "backend": "sqm"}
+
+
+def do_fw_forward(dev, rule):
+    """Create or update one port forward (named uci section => idempotent).
+
+    rule: {name, proto: tcp|udp|tcpudp, src_dport, dest_ip, dest_port?}.
+    dest_port defaults to src_dport when omitted."""
+    name = (rule.get("name") or "").strip()
+    slug = _uci_slug(name)
+    proto = rule.get("proto") or "tcp"
+    if proto == "tcpudp":
+        proto = "tcp udp"
+    elif proto not in ("tcp", "udp"):
+        raise HTTPException(400, f"invalid proto {proto!r} (use tcp, udp or tcpudp)")
+    sport = int(rule.get("src_dport") or 0)
+    if not (1 <= sport <= 65535):
+        raise HTTPException(400, f"invalid source port {sport} (1-65535)")
+    dport = int(rule.get("dest_port") or sport)
+    if not (1 <= dport <= 65535):
+        raise HTTPException(400, f"invalid destination port {dport} (1-65535)")
+    dip = (rule.get("dest_ip") or "").strip()
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", dip):
+        raise HTTPException(400, f"invalid destination IP {dip!r}")
+    lines = [
+        f"uci set firewall.{slug}=redirect",
+        f"uci set firewall.{slug}.name={_uci_quote(name)}",
+        f"uci set firewall.{slug}.src='wan'",
+        f"uci set firewall.{slug}.proto={_uci_quote(proto)}",
+        f"uci set firewall.{slug}.target='DNAT'",
+        f"uci set firewall.{slug}.src_dport='{sport}'",
+        f"uci set firewall.{slug}.dest_ip='{dip}'",
+        f"uci set firewall.{slug}.dest_port='{dport}'",
+    ]
+    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n"), "firewall",
+             f"forward={name} {proto} {sport}->{dip}:{dport}", "port forward apply")
+    return {"device": dev["name"], "ok": True, "section": slug}
+
+
+def do_fw_rule(dev, rule):
+    """Create or update one inter-zone rule (named uci section => idempotent).
+
+    rule: {name, src (zone name), dest (zone name), target: ACCEPT|REJECT|DROP, proto?}."""
+    name = (rule.get("name") or "").strip()
+    slug = _uci_slug(name)
+    src, dst = (rule.get("src") or "").strip(), (rule.get("dest") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", src) or not re.fullmatch(r"[A-Za-z0-9_\-]+", dst):
+        raise HTTPException(400, "rule needs a valid src and dest zone name")
+    target = (rule.get("target") or "ACCEPT").upper()
+    if target not in ("ACCEPT", "REJECT", "DROP"):
+        raise HTTPException(400, f"invalid rule target {target!r}")
+    proto = rule.get("proto")
+    lines = [
+        f"uci set firewall.{slug}=rule",
+        f"uci set firewall.{slug}.name={_uci_quote(name)}",
+        f"uci set firewall.{slug}.src={_uci_quote(src)}",
+        f"uci set firewall.{slug}.dest={_uci_quote(dst)}",
+        f"uci set firewall.{slug}.target='{target}'",
+    ]
+    if proto:
+        if proto == "tcpudp":
+            proto = "tcp udp"
+        elif proto not in ("tcp", "udp"):
+            raise HTTPException(400, f"invalid proto {proto!r}")
+        lines.append(f"uci set firewall.{slug}.proto={_uci_quote(proto)}")
+    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n"), "firewall",
+             f"rule={name} {src}->{dst} {target}", "firewall rule apply")
+    return {"device": dev["name"], "ok": True, "section": slug}
+
+
+def do_zone_policy(dev, zone, policies):
+    """Set default input/output/forward policies on a firewall zone.
+
+    zone: zone name (valid uci id, e.g. 'guest'). policies: dict of
+    {input?, output?, forward?} each ACCEPT|REJECT|DROP."""
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", zone or ""):
+        raise HTTPException(400, f"invalid zone name {zone!r}")
+    lines = []
+    for opt in ("input", "output", "forward"):
+        val = (policies or {}).get(opt)
+        if val is None:
+            continue
+        val = str(val).upper()
+        if val not in ("ACCEPT", "REJECT", "DROP"):
+            raise HTTPException(400, f"invalid {opt} policy {val!r}")
+        lines.append(f"uci set firewall.{zone}.{opt}='{val}'")
+    if not lines:
+        raise HTTPException(400, "no zone policies given (use input/output/forward)")
+    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n"), "firewall",
+             f"zone={zone} policies={policies}", "zone policy apply")
+    return {"device": dev["name"], "ok": True, "zone": zone}
+
+
+def delete_fw_rule(dev, name):
+    """Remove an inter-zone rule by name (section id = slug of the name)."""
+    slug = _uci_slug(name)
+    _run_ssh(dev, _fw_commit(f"uci delete firewall.{slug}\n"), "firewall",
+             f"delete_rule={name}", "rule delete")
+    return {"device": dev["name"], "ok": True, "section": slug}
+
+
+def delete_fw_forward(dev, name):
+    """Remove a port forward by name (section id = slug of the name)."""
+    slug = _uci_slug(name)
+    _run_ssh(dev, _fw_commit(f"uci delete firewall.{slug}\n"), "firewall",
+             f"delete_forward={name}", "forward delete")
+    return {"device": dev["name"], "ok": True, "section": slug}
+
+
 def apply_findings(dev, st):
     findings = audit_status(st)
     current = {r["rule_id"] for r in q("SELECT * FROM active_findings WHERE device_id=?", (dev["id"],))}
