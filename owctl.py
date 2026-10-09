@@ -118,6 +118,15 @@ def init_db():
         action TEXT, detail TEXT, result TEXT, error TEXT)""")
     execute("""CREATE TABLE IF NOT EXISTS vlans(
         vlan_id TEXT PRIMARY KEY, name TEXT, subnet TEXT, dhcp INTEGER, created_at TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS device_status(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER UNIQUE, ts TEXT,
+        clients INTEGER, uptime_s INTEGER, firmware TEXT, rx_bytes INTEGER, tx_bytes INTEGER)""")
+    # Role normalization: roles are the lowercase enum router/ap/switch/other.
+    # Idempotent migration for any rows added before this code shipped.
+    try:
+        execute("UPDATE devices SET role=lower(role) WHERE role IS NOT NULL AND role != lower(role)")
+    except sqlite3.OperationalError:
+        pass
 
 
 def log_action(device, action, detail='', ok=None, error=''):
@@ -196,6 +205,37 @@ def record_heartbeat(device_row, online_bool):
             logging.getLogger("owctl").warning("record_heartbeat failed: %s", e)
         except Exception:
             pass
+
+
+def record_status_snapshot(dev_row, st):
+    """Upsert one device_status row from the status dict `st` built by check_device.
+
+    Keys read: st.get('clients'), st.get('uptime_s'), st.get('firmware');
+    rx_bytes/tx_bytes = sum over (st.get('traffic') or {}).values() of the
+    per-interface rx/tx counters when present. Only writes a column when its
+    source is not None. Never raises — like record_heartbeat.
+    """
+    try:
+        traffic = st.get("traffic") or {}
+        rx_bytes = sum(int(v.get("rx", 0) or 0) for v in traffic.values() if isinstance(v, dict))
+        tx_bytes = sum(int(v.get("tx", 0) or 0) for v in traffic.values() if isinstance(v, dict))
+        cols = ["device_id", "ts", "clients", "uptime_s", "firmware", "rx_bytes", "tx_bytes"]
+        vals = [dev_row["id"], now(),
+                st.get("clients"), st.get("uptime_s"), st.get("firmware"),
+                rx_bytes if traffic else None, tx_bytes if traffic else None]
+        # Null-safe: only write a column when its source is present.
+        set_clause = ", ".join(
+            f"{c}=excluded.{c}" for c, v in zip(cols, vals) if v is not None
+        )
+        if not set_clause:
+            return
+        placeholders = ", ".join("?" * len(cols))
+        execute(
+            f"INSERT INTO device_status({', '.join(cols)}) VALUES({placeholders}) "
+            f"ON CONFLICT(device_id) DO UPDATE SET {set_clause}",
+            tuple(vals))
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------- OpenWrt: SSH backend
@@ -1163,11 +1203,13 @@ def do_vlan(dev, vlan_id, name, subnet, dhcp, devices, router_id):
             # Router: create routed interface + firewall zone
             ip = subnet.split("/")[0].rsplit(".", 1)[0] + ".1"
             mask = subnet.split("/")[1] if "/" in subnet else "24"
-            mask_full = {"8": "0.0.0.0", "16": "0.0.255.255", "24": "0.0.0.255", "30": "0.0.0.3"}.get(mask, "0.0.0.255")
+            mask_full = {"8": "0.0.0.0", "16": "255.255.0.0",
+                         "24": "255.255.255.0", "30": "255.255.255.252"}.get(
+                mask, "255.255.255.0")
             cmd = f"""uci set network.vlan_{vlan_id}=interface
 uci set network.vlan_{vlan_id}.proto='static'
 uci set network.vlan_{vlan_id}.ipaddr='{ip}'
-uci set network.vlan_{vlan_id}.netmask='255.255.255.{mask_full}'
+uci set network.vlan_{vlan_id}.netmask='{mask_full}'
 uci set network.vlan_{vlan_id}.ifname='br-lan.{vlan_id}'
 """
             if dhcp:
@@ -1321,6 +1363,9 @@ def check_device(dev):
         for msg in st["syslog"][-100:]:
             execute("INSERT OR IGNORE INTO log_entries(device_id, ts, message) VALUES(?,?,?)",
                     (dev["id"], msg["ts"], msg["message"]))
+    # Persist a device_status snapshot (clients/uptime/firmware/traffic) for
+    # the network overview. Never raises — a failed snapshot must not break a check.
+    record_status_snapshot(dev, st)
     return {"status": st, "findings": findings, "health_score": score}
 
 
@@ -1381,6 +1426,130 @@ def list_devices():
     return q("SELECT * FROM devices ORDER BY id")
 
 
+@app.get("/api/network")
+def network_overview():
+    """Read-only aggregate of the whole network: one row per registered device,
+    totals, gateway, VLANs and recent offline events. No SSH. Instant.
+    """
+    rows = q("""SELECT d.id, d.name, d.host, d.role, d.access, d.status,
+                      d.health_score, d.last_checked,
+                      s.clients, s.uptime_s, s.firmware
+               FROM devices d
+               LEFT JOIN device_status s ON s.device_id = d.id
+               ORDER BY d.id""")
+    devices = []
+    for r in rows:
+        devices.append({
+            "id": r["id"], "name": r["name"], "host": r["host"],
+            "role": r["role"], "access": r["access"], "status": r["status"],
+            "health_score": r["health_score"], "last_checked": r["last_checked"],
+            "clients": r["clients"], "uptime_s": r["uptime_s"],
+            "firmware": r["firmware"],
+        })
+
+    # Gateway: settings.network_gateway -> device id, if that device exists.
+    gw_id = None
+    gw_raw = get_setting("network_gateway")
+    if gw_raw not in (None, ""):
+        try:
+            gw_id = int(gw_raw)
+        except (TypeError, ValueError):
+            gw_id = None
+    gateway = None
+    gateway_missing = True
+    if gw_id is not None:
+        gw_rows = q("""SELECT d.id, d.name, d.host, d.status, d.health_score,
+                              d.last_checked, s.uptime_s, s.firmware
+                       FROM devices d
+                       LEFT JOIN device_status s ON s.device_id = d.id
+                       WHERE d.id=?""", (gw_id,))
+        if gw_rows:
+            g = gw_rows[0]
+            gateway = {
+                "id": g["id"], "name": g["name"], "host": g["host"],
+                "status": g["status"], "health_score": g["health_score"],
+                "firmware": g["firmware"], "uptime_s": g["uptime_s"],
+                "last_checked": g["last_checked"],
+            }
+            gateway_missing = False
+
+    # Totals.
+    online = sum(1 for d in devices if d["status"] == "online")
+    offline = sum(1 for d in devices if d["status"] == "offline")
+    clients_sum = 0
+    for d in devices:
+        if d["clients"] is not None:
+            clients_sum += int(d["clients"])
+
+    findings = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for r in q("SELECT severity, COUNT(*) AS c FROM active_findings GROUP BY severity"):
+        sev = (r["severity"] or "").upper()
+        if sev in findings:
+            findings[sev] = int(r["c"])
+
+    # Aggregate current Mbps from the latest 2 traffic samples per device+iface.
+    rx_mbps = tx_mbps = 0.0
+    samples = q("""SELECT device_id, iface, ts, rx_bytes, tx_bytes
+                   FROM traffic_samples ORDER BY device_id, iface, ts DESC""")
+    by_key = {}
+    for s in samples:
+        key = (s["device_id"], s["iface"])
+        by_key.setdefault(key, []).append(s)
+    for key, samps in by_key.items():
+        if len(samps) < 2:
+            continue
+        latest, prev = samps[0], samps[1]
+        try:
+            t_new = datetime.fromisoformat(latest["ts"])
+            t_old = datetime.fromisoformat(prev["ts"])
+            dt = (t_new - t_old).total_seconds()
+        except Exception:
+            continue
+        if dt <= 0:
+            continue
+        rx_mbps += ((latest["rx_bytes"] - prev["rx_bytes"]) * 8) / (dt * 1_000_000)
+        tx_mbps += ((latest["tx_bytes"] - prev["tx_bytes"]) * 8) / (dt * 1_000_000)
+
+    # Status rule.
+    if not devices:
+        status = "offline"
+    elif any(d["status"] == "offline" for d in devices):
+        status = "offline"
+    elif any(d["status"] in ("unknown", "error") for d in devices) or gateway_missing:
+        status = "degraded"
+    else:
+        status = "online"
+
+    recent_offline = []
+    for r in q("SELECT device_name, went_offline, offline_seconds "
+               "FROM offline_events ORDER BY id DESC LIMIT 5"):
+        recent_offline.append({
+            "device_name": r["device_name"],
+            "went_offline": r["went_offline"],
+            "offline_seconds": r["offline_seconds"],
+        })
+
+    vlans = list_vlans()
+
+    return {
+        "status": status,
+        "gateway_missing": gateway_missing,
+        "gateway": gateway,
+        "devices": devices,
+        "totals": {
+            "devices": len(devices),
+            "online": online,
+            "offline": offline,
+            "clients": clients_sum,
+            "rx_mbps": round(rx_mbps, 2),
+            "tx_mbps": round(tx_mbps, 2),
+            "findings": findings,
+        },
+        "vlans": vlans,
+        "recent_offline": recent_offline,
+    }
+
+
 @app.post("/api/devices")
 async def add_device(request: Request):
     d = await request.json()
@@ -1388,11 +1557,12 @@ async def add_device(request: Request):
     if not re.fullmatch(r"[\d.]+", host):
         raise HTTPException(400, "host must be an IPv4 address")
     name = (d.get("name") or host).strip()
+    role = (d.get("role") or "router").strip().lower()
     try:
         did = execute(
             "INSERT INTO devices(name,host,role,access,ssh_port,ssh_user,ssh_password,key_path,"
             "luci_user,luci_pass,luci_port,added_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (name, host, d.get("role") or "router", d.get("access") or "ssh",
+            (name, host, role, d.get("access") or "ssh",
              int(d.get("ssh_port") or 22), d.get("ssh_user") or "root",
              d.get("ssh_password") or "", d.get("key_path") or "",
              d.get("luci_user") or "root", d.get("luci_pass") or "",
@@ -1409,11 +1579,17 @@ async def update_device(request: Request, did: int):
     if not cur:
         raise HTTPException(404, "device not found")
     dev = cur[0]
+    # Ensure role is set for existing rows
+    current_role = dev["role"] or "router"
+    
     def g(k, dflt=None):
         return d.get(k) if d.get(k) is not None else dflt
+    role = g("role", current_role)
+    if role is not None:
+        role = role.strip().lower()
     execute("UPDATE devices SET name=?, role=?, access=?, ssh_port=?, ssh_user=?, ssh_password=?, "
             "key_path=?, luci_user=?, luci_pass=?, luci_port=?, tags=? WHERE id=?",
-            (g("name", dev["name"]), g("role", dev["role"]), g("access", dev["access"]),
+            (g("name", dev["name"]), role, g("access", dev["access"]),
              int(g("ssh_port", dev["ssh_port"] or 22)), g("ssh_user", dev["ssh_user"]),
              g("ssh_password", dev["ssh_password"]), g("key_path", dev["key_path"]),
              g("luci_user", dev["luci_user"]), g("luci_pass", dev["luci_pass"]),
@@ -1931,8 +2107,16 @@ def actions(limit: int = 100):
 
 @app.get("/api/settings")
 def settings_get():
+    gw_raw = get_setting("network_gateway")
+    gw = None
+    if gw_raw not in (None, ""):
+        try:
+            gw = int(gw_raw)
+        except (TypeError, ValueError):
+            gw = None
     return {"audit_interval_min": get_setting("audit_interval_min", "30"),
-            "ui_token_set": bool(get_setting("ui_token", ""))}
+            "ui_token_set": bool(get_setting("ui_token", "")),
+            "network_gateway": gw}
 
 
 @app.put("/api/settings")
@@ -1942,6 +2126,15 @@ async def settings_put(request: Request):
         set_setting("audit_interval_min", str(int(d["audit_interval_min"])))
     if "ui_token" in d:
         set_setting("ui_token", d["ui_token"] or "")
+    if "network_gateway" in d:
+        v = d["network_gateway"]
+        if v in (None, ""):
+            set_setting("network_gateway", "")
+        else:
+            try:
+                set_setting("network_gateway", str(int(v)))
+            except (TypeError, ValueError):
+                set_setting("network_gateway", "")
     return {"ok": True}
 
 

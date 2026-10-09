@@ -27,6 +27,8 @@ main{padding:18px 20px;max-width:1200px;margin:0 auto}
 .b-INFO{background:#2a2f42;color:var(--mut)} .b-LOW{background:#123527;color:var(--ok)}
 .b-MEDIUM{background:#3a2f12;color:var(--warn)} .b-HIGH{background:#3a1520;color:var(--bad)}
 .b-CRITICAL{background:#4a1020;color:var(--crit)}
+.b-bad{background:#4a1020;color:var(--crit)} .b-error{background:#4a1020;color:var(--crit)}
+.bad{color:var(--bad)}
 button.act{background:var(--panel2);color:var(--tx);border:1px solid var(--line);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:13px}
 button.act:hover{border-color:var(--acc)}
 button.pri{background:#1c4d8f;border-color:#2f6fc0}
@@ -76,7 +78,8 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
 <header>
   <h1>ow<span>ctl</span> <span class="pill">OpenWrt control + threat watch</span></h1>
   <nav>
-    <button data-tab="devices" class="on">Devices</button>
+    <button data-tab="network" class="on">Network</button>
+    <button data-tab="devices">Devices</button>
     <button data-tab="threats">Threats</button>
     <button data-tab="sweep">Sweep</button>
     <button data-tab="alerts">Alerting</button>
@@ -88,7 +91,8 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
 </header>
 <main>
-  <section id="tab-devices"></section>
+  <section id="tab-network"></section>
+  <section id="tab-devices" style="display:none"></section>
   <section id="tab-threats" style="display:none"></section>
   <section id="tab-sweep" style="display:none"></section>
   <section id="tab-alerts" style="display:none"></section>
@@ -123,6 +127,7 @@ navBtns.forEach(b=>b.onclick=()=>{
   render(b.dataset.tab);
 });
 function render(tab){
+  if(tab==='network')return renderNetwork();
   if(tab==='devices')return renderDevices();
   if(tab==='threats')return renderThreats();
   if(tab==='sweep')return renderSweep();
@@ -134,6 +139,124 @@ function render(tab){
 }
 function fmtUptime(s){if(!s&&s!==0)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
 function fmtKB(k){return k>1048576?(k/1048576).toFixed(1)+' GB':(k/1024).toFixed(0)+' MB'}
+
+async function renderNetwork() {
+  const host = document.getElementById('tab-network');
+  host.innerHTML = '<p class="muted">Loading network status...</p>';
+  try {
+    const net = await api('/network');
+    const statusColor = net.status === 'online' ? 'var(--ok)' : (net.status === 'degraded' ? 'var(--warn)' : 'var(--bad)');
+    
+    let html = `<div class="row" style="justify-content:space-between;margin-bottom:16px">
+      <h2 style="margin:0">Network Status: <span style="color:${statusColor}">${net.status.toUpperCase()}</span></h2>
+      <div class="row">
+        <button class="act" onclick="networkBulk('check')">Check all</button>
+        <button class="act" onclick="networkBulk('backup')">Backup all</button>
+        <button class="act" onclick="networkBulk('reboot')">Reboot all</button>
+      </div>
+    </div>`;
+
+    html += `<div class="grid" style="margin-bottom:20px">`;
+    const gw = net.gateway;
+    html += `<div class="card">
+      <h3>Gateway ${net.gateway_missing ? '<span class="badge b-CRITICAL">MISSING</span>' : ''}</h3>
+      ${gw ? `
+        <div class="kv"><span>Name</span><strong>${esc(gw.name)}</strong></div>
+        <div class="kv"><span>Host</span><span>${esc(gw.host)}</span></div>
+        <div class="kv"><span>Status</span><span class="badge b-${gw.status}">${gw.status}</span></div>
+        <div class="kv"><span>Firmware</span><span class="small">${esc(gw.firmware)}</span></div>
+        <div class="kv"><span>Uptime</span><span>${fmtUptime(gw.uptime_s)}</span></div>
+      ` : '<p class="muted">No gateway set. Assign one in the table below.</p>'}
+    </div>`;
+
+    html += `<div class="card">
+      <h3>Totals</h3>
+      <div class="kv"><span>Devices</span><span>${net.totals.online} online / ${net.totals.devices} total</span></div>
+      <div class="kv"><span>Clients</span><span>${net.totals.clients || 0}</span></div>
+      <div class="kv"><span>Traffic</span><span>RX ${net.totals.rx_mbps.toFixed(1)} Mbps / TX ${net.totals.tx_mbps.toFixed(1)} Mbps</span></div>
+      <div class="row" style="margin-top:8px">
+        ${Object.entries(net.totals.findings).filter(([_,v])=>v>0).map(([k,v])=>`<span class="badge b-${k}" style="margin-right:4px">${v} ${k}</span>`).join('')}
+      </div>
+    </div>`;
+    html += `</div>`;
+
+    html += `<h3>Devices</h3>
+    <div class="card" style="padding:0;overflow:hidden">
+    <table>
+      <thead><tr><th>Device</th><th>Host</th><th>Role</th><th>Status</th><th>Clients</th><th>Uptime</th><th></th></tr></thead>
+      <tbody>
+        ${net.devices.map(d => `
+          <tr style="cursor:pointer" onclick="networkDrill(${d.id})">
+            <td><strong>${esc(d.name)}</strong>${net.gateway && net.gateway.id === d.id ? ' <span class="pill">(Gateway)</span>' : ''}</td>
+            <td class="small">${esc(d.host)}</td>
+            <td class="small">${esc(d.role)}</td>
+            <td><span class="badge b-${d.status}">${d.status}</span></td>
+            <td>${d.clients ?? '—'}</td>
+            <td class="small">${fmtUptime(d.uptime_s)}</td>
+            <td onclick="event.stopPropagation()">
+              ${(net.gateway && net.gateway.id === d.id) ? '' : `<button class="act pill" onclick="setGateway(${d.id})">Set as gateway</button>`}
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+    </div>
+    <div id="network-detail" style="margin-top:20px"></div>`;
+
+    html += `<div class="grid" style="margin-top:20px">
+      <div class="card">
+        <h3>VLANs</h3>
+        ${net.vlans.length ? net.vlans.map(v => `<div class="kv"><span>${esc(v.name)} (ID ${v.id})</span><span>${esc(v.subnet)} ${v.dhcp?'(DHCP)':''}</span></div>`).join('') : '<p class="muted">No VLANs detected.</p>'}
+      </div>
+      <div class="card">
+        <h3>Recent Offline</h3>
+        ${net.recent_offline.length ? net.recent_offline.map(r => `<div class="kv"><span>${esc(r.device_name)}</span><span class="bad">${fmtUptime(r.offline_seconds)} ago</span></div>`).join('') : '<p class="muted">None.</p>'}
+      </div>
+    </div>`;
+    host.innerHTML = html;
+  } catch(e) { host.innerHTML = `<p class="bad">Error: ${esc(e.message)}</p>`; }
+}
+
+async function networkBulk(action) {
+  toast(`Running ${action} on all devices...`);
+  try {
+    const devs = await api('/devices');
+    const ids = devs.map(d => d.id);
+    const r = await api('/bulk', {method:'POST', body:JSON.stringify({ids, action})});
+    const host = document.getElementById('network-detail');
+    host.innerHTML = `<h3>Bulk ${action} results</h3>
+    <div class="card">
+      ${r.results.map(res => `
+        <div class="row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 0">
+          <span>${esc(res.name)}</span>
+          <div class="row">
+            ${res.ok ? '<span class="badge b-online">OK</span>' : `<span class="badge b-bad">FAIL</span> <span class="small bad">${esc(res.error)}</span>`}
+          </div>
+        </div>
+      `).join('')}
+      <div class="row fsec"><button class="act" onclick="this.closest('.card').parentElement.innerHTML=''">Close</button></div>
+    </div>`;
+  } catch(e) { toast(String(e), true); }
+}
+
+async function networkDrill(id) {
+  toast('Fetching status...');
+  try {
+    const r = await api(`/devices/${id}/check`, {method:'POST'});
+    const host = document.getElementById('network-detail');
+    host.innerHTML = `<h3>${esc(r.status.name)} Detail</h3><div id="devinfo-${id}" class="card"></div>`;
+    showDevInfo(id, r.status);
+    host.scrollIntoView({behavior:'smooth'});
+  } catch(e) { toast(String(e), true); }
+}
+
+async function setGateway(id) {
+  try {
+    await api('/settings', {method:'PUT', body:JSON.stringify({network_gateway: id})});
+    toast('Gateway updated');
+    renderNetwork();
+  } catch(e) { toast(String(e), true); }
+}
 
 async function renderDevices(){
   const devs=await api('/devices');
@@ -537,7 +660,7 @@ function selectAccess(onOk){
 async function promptAdd(){
   const name=prompt('Name (e.g. main-router):');if(!name)return;
   const host=prompt('Host IPv4 (e.g. 192.168.1.1):');if(!host)return;
-  const role=prompt('Role (router / AP / mesh / other):')||'router';
+  const role=prompt('Role (router / ap / switch / other):')||'router';
   let access;
   await new Promise(r=>selectAccess(v=>{access=v;r()}));
   if(!access)return;
@@ -765,7 +888,7 @@ async function renderAlerts(){
       :'<p class="muted">No alerts logged yet.</p>'})();
 }
 
-render('devices');
+render('network');
 function toggleTheme(){document.body.classList.toggle('light')}
 // ponytail: auto-refresh every 60s on devices tab
 startPolling(60000);
@@ -830,7 +953,9 @@ async function loadLogs(){
 async function renderVlans(){
   const el=document.getElementById('tab-vlans');
   const devs=await api('/devices');
-  const router=devs.find(d=>d.role==='router')||devs[0];
+  const cfg=await api('/settings').catch(()=>({}));
+  const gwId=cfg.network_gateway;
+  const router=devs.find(d=>d.id===gwId)||devs.find(d=>d.role==='router')||devs[0];
   let html=`<h2>VLAN Configuration</h2>
     <p class="muted">Create and manage VLANs across your network. Each VLAN isolates devices into separate broadcast domains.</p>
     <div class="card">
@@ -902,7 +1027,7 @@ async function renderWifi(){
   html+=`</div>`;
   el.innerHTML=html;
   // Pre-load current config for each device
-  for(const d of devs){
+  for(const d of wifi_devs){
     try{
       const cfg=await api(`/devices/${d.id}/wifi-config`);
       const el=document.getElementById(`wifi-config-${d.id}`);
