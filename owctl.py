@@ -118,6 +118,14 @@ def init_db():
         action TEXT, detail TEXT, result TEXT, error TEXT)""")
     execute("""CREATE TABLE IF NOT EXISTS vlans(
         vlan_id TEXT PRIMARY KEY, name TEXT, subnet TEXT, dhcp INTEGER, created_at TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS qos(
+        device_id INTEGER PRIMARY KEY, enabled INTEGER, interface TEXT,
+        download_kbps INTEGER, upload_kbps INTEGER, qdisc TEXT, ecn INTEGER, ts TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS fw_rules(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, kind TEXT, name TEXT,
+        proto TEXT, src_dport INTEGER, dest_ip TEXT, dest_port INTEGER,
+        src_zone TEXT, dst_zone TEXT, target TEXT, ts TEXT,
+        UNIQUE(device_id, kind, name))""")
     execute("""CREATE TABLE IF NOT EXISTS device_status(
         id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER UNIQUE, ts TEXT,
         clients INTEGER, uptime_s INTEGER, firmware TEXT, rx_bytes INTEGER, tx_bytes INTEGER)""")
@@ -2080,6 +2088,149 @@ def list_vlans():
     rows = q("SELECT * FROM vlans ORDER BY CAST(vlan_id AS INTEGER) DESC, vlan_id DESC")
     return [{"id": r["vlan_id"], "name": r["name"], "subnet": r["subnet"],
              "dhcp": bool(r["dhcp"])} for r in rows]
+
+
+# ─────────────────────────── QoS + firewall API ─────────────────────────────
+def _require_device(did):
+    rows = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not rows:
+        raise HTTPException(404, "device not found")
+    return rows[0]
+
+
+def _read_live_qos(dev):
+    """Read the live QoS config from the box (sqm, then nft-qos). None when unconfigured."""
+    c = _ssh_connect(dev)
+    try:
+        out, _err, _st = _exec_capture(c, "uci show sqm 2>/dev/null; true", timeout=30)
+        res = parse_sqm(out)
+        if res is None:
+            out2, _e2, _s2 = _exec_capture(c, "uci show nft-qos 2>/dev/null; true", timeout=30)
+            res = parse_sqm(out2)
+        return res
+    finally:
+        c.close()
+
+
+def _read_live_firewall(dev):
+    """Read the live firewall config from the box."""
+    c = _ssh_connect(dev)
+    try:
+        out, _err, _st = _exec_capture(c, "uci show firewall 2>/dev/null; true", timeout=30)
+        return parse_firewall(out)
+    finally:
+        c.close()
+
+
+def _saved_qos_row(dev_id):
+    rows = q("SELECT * FROM qos WHERE device_id=?", (dev_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    return {"enabled": bool(r["enabled"]), "interface": r["interface"],
+            "download_kbps": r["download_kbps"], "upload_kbps": r["upload_kbps"],
+            "qdisc": r["qdisc"], "ecn": bool(r["ecn"]), "ts": r["ts"]}
+
+
+def _saved_fw_rows(dev_id):
+    rows = q("SELECT * FROM fw_rules WHERE device_id=? ORDER BY kind, name", (dev_id,))
+    return {"forwards": [r for r in rows if r["kind"] == "forward"],
+            "rules": [r for r in rows if r["kind"] == "rule"]}
+
+
+@app.get("/api/qos")
+def qos_read(did: int):
+    """Saved + live QoS config for a device."""
+    dev = _require_device(did)
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "QoS read requires SSH access on this device")
+    return {"saved": _saved_qos_row(dev["id"]), "live": _read_live_qos(dev)}
+
+
+@app.post("/api/qos/apply")
+async def qos_apply(request: Request):
+    """Apply SQM settings to a device and record the saved state."""
+    d = await request.json()
+    dev = _require_device(int(d.get("did") or 0))
+    cfg = {
+        "enabled": bool(d.get("enabled", True)),
+        "interface": d.get("interface") or "wan",
+        "download_kbps": int(d.get("download_kbps") or 0),
+        "upload_kbps": int(d.get("upload_kbps") or 0),
+        "qdisc": d.get("qdisc") or "fq_codel",
+        "ecn": bool(d.get("ecn", False)),
+    }
+    do_qos(dev, cfg, install_if_missing=bool(d.get("install_if_missing", False)))
+    execute("""INSERT INTO qos(device_id, enabled, interface, download_kbps, upload_kbps, qdisc, ecn, ts)
+               VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(device_id) DO UPDATE SET enabled=excluded.enabled,
+                 interface=excluded.interface, download_kbps=excluded.download_kbps,
+                 upload_kbps=excluded.upload_kbps, qdisc=excluded.qdisc, ecn=excluded.ecn, ts=excluded.ts""",
+            (dev["id"], 1 if cfg["enabled"] else 0, cfg["interface"], cfg["download_kbps"],
+             cfg["upload_kbps"], cfg["qdisc"], 1 if cfg["ecn"] else 0, now()))
+    return {"ok": True, "device": dev["name"], "saved": _saved_qos_row(dev["id"])}
+
+
+@app.get("/api/firewall")
+def firewall_read(did: int):
+    """Saved + live firewall config for a device."""
+    dev = _require_device(did)
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "firewall read requires SSH access on this device")
+    return {"saved": _saved_fw_rows(dev["id"]), "live": _read_live_firewall(dev)}
+
+
+@app.post("/api/firewall/apply")
+async def firewall_apply(request: Request):
+    """Apply one firewall change: kind = forward | rule | zone. Record saved state."""
+    d = await request.json()
+    dev = _require_device(int(d.get("did") or 0))
+    kind = (d.get("kind") or "").strip()
+    if kind == "forward":
+        rule = d.get("rule") or {}
+        do_fw_forward(dev, rule)
+        execute("""INSERT INTO fw_rules(device_id, kind, name, proto, src_dport, dest_ip, dest_port, ts)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(device_id, kind, name) DO UPDATE SET proto=excluded.proto,
+                     src_dport=excluded.src_dport, dest_ip=excluded.dest_ip,
+                     dest_port=excluded.dest_port, ts=excluded.ts""",
+                (dev["id"], "forward", (rule.get("name") or "").strip(),
+                 rule.get("proto"), rule.get("src_dport"), rule.get("dest_ip"),
+                 rule.get("dest_port"), now()))
+    elif kind == "rule":
+        rule = d.get("rule") or {}
+        do_fw_rule(dev, rule)
+        execute("""INSERT INTO fw_rules(device_id, kind, name, src_zone, dst_zone, target, ts)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(device_id, kind, name) DO UPDATE SET src_zone=excluded.src_zone,
+                     dst_zone=excluded.dst_zone, target=excluded.target, ts=excluded.ts""",
+                (dev["id"], "rule", (rule.get("name") or "").strip(),
+                 rule.get("src"), rule.get("dest"), rule.get("target"), now()))
+    elif kind == "zone":
+        zone = (d.get("zone") or "").strip()
+        policies = d.get("policies") or {}
+        do_zone_policy(dev, zone, policies)
+    else:
+        raise HTTPException(400, "kind must be one of: forward, rule, zone")
+    return {"ok": True, "device": dev["name"], "kind": kind}
+
+
+@app.delete("/api/firewall/{did}/rule/{name}")
+def firewall_delete_rule(did: int, name: str):
+    dev = _require_device(did)
+    delete_fw_rule(dev, name)
+    execute("DELETE FROM fw_rules WHERE device_id=? AND kind='rule' AND name=?",
+            (dev["id"], name.strip()))
+    return {"ok": True, "device": dev["name"]}
+
+
+@app.delete("/api/firewall/{did}/forward/{name}")
+def firewall_delete_forward(did: int, name: str):
+    dev = _require_device(did)
+    delete_fw_forward(dev, name)
+    execute("DELETE FROM fw_rules WHERE device_id=? AND kind='forward' AND name=?",
+            (dev["id"], name.strip()))
+    return {"ok": True, "device": dev["name"]}
 
 
 def parse_vlan_ids(output):
