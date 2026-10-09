@@ -732,6 +732,107 @@ def calc_health_score(findings):
     return max(0, score)
 
 
+# ─────────────────────────── QoS / SQM ──────────────────────────────────────
+_UCI_LINE_RE = re.compile(r"^([A-Za-z0-9_\-]+)\.(@?[A-Za-z0-9_]+)(?:\.([A-Za-z0-9_]+))?=(.*)$")
+
+
+def _uci_unquote(val: str) -> str:
+    """Strip uci show quoting: single quotes (with escapes) or surrounding double quotes."""
+    if len(val) >= 2:
+        if val[0] == "'" and val[-1] == "'":
+            return val[1:-1].replace("\\'", "'").replace("\\\\", "\\")
+        if val[0] == '"' and val[-1] == '"':
+            return val[1:-1]
+    return val
+
+
+def parse_uci_show(raw: str) -> dict:
+    """Parse `uci show <pkg>` output into {package: {section: {opt: value, 'type': ...}}}.
+
+    Section-declaration lines (`pkg.section=<type>`) store the type under 'type'.
+    Handles both quoted and bare value forms, and skips stderr noise lines
+    (e.g. 'uci: Package sqm is not defined')."""
+    result: dict = {}
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _UCI_LINE_RE.match(line)
+        if not m:
+            continue  # stderr noise, blank, or unexpected shape
+        pkg, section, opt, val = m.groups()
+        section_dict = result.setdefault(pkg, {}).setdefault(section, {})
+        if opt is None:
+            section_dict["type"] = _uci_unquote(val)
+        else:
+            section_dict[opt] = _uci_unquote(val)
+    return result
+
+
+def parse_sqm(raw: str):
+    """Parse `uci show sqm` or `uci show nft-qos` output.
+
+    Returns {backend, enabled, interface, download_kbps, upload_kbps, qdisc, ecn}
+    or None when no QoS config is present (empty output / package missing / stderr noise).
+    With multiple SQM queue sections, the enabled one wins (first enabled, else first).
+    """
+    parsed = parse_uci_show(raw)
+    # luci-app-sqm
+    if "sqm" in parsed:
+        sections = [s for s in parsed["sqm"].values()
+                    if isinstance(s, dict) and any(k != "type" for k in s)]
+        if not sections:
+            return None
+        enabled = [s for s in sections if s.get("enabled") == "1" or s.get("enabled") is True]
+        sec = enabled[0] if enabled else sections[0]
+        qdisc = None
+        for name in ("fq_codel", "cake", "hfsc", "hfs", "layer_cake"):
+            if str(sec.get(name, "0")) in ("1", "true"):
+                qdisc = name
+                break
+        try:
+            dl = int(sec.get("download", "0"))
+        except (TypeError, ValueError):
+            dl = 0
+        try:
+            ul = int(sec.get("upload", "0"))
+        except (TypeError, ValueError):
+            ul = 0
+        return {
+            "backend": "sqm",
+            "enabled": str(sec.get("enabled", "0")) in ("1", "true"),
+            "interface": sec.get("interface"),
+            "download_kbps": dl,
+            "upload_kbps": ul,
+            "qdisc": qdisc,
+            "ecn": str(sec.get("ecn", "0")) in ("1", "true"),
+        }
+    # nft-qos: speeds live in the 'defaults' section
+    if "nft-qos" in parsed:
+        d = parsed["nft-qos"].get("defaults")
+        if not isinstance(d, dict):
+            return None
+        ifaces = d.get("interfaces", "")
+        first_iface = ifaces.split()[0] if ifaces else None
+
+        def _k(name):
+            try:
+                return int(d.get(name, "0"))
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "backend": "nft-qos",
+            "enabled": True,
+            "interface": first_iface,
+            "download_kbps": _k("download"),
+            "upload_kbps": _k("upload"),
+            "qdisc": None,
+            "ecn": None,
+        }
+    return None
+
+
 def apply_findings(dev, st):
     findings = audit_status(st)
     current = {r["rule_id"] for r in q("SELECT * FROM active_findings WHERE device_id=?", (dev["id"],))}
