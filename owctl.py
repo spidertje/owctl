@@ -833,6 +833,63 @@ def parse_sqm(raw: str):
     return None
 
 
+def parse_firewall(raw: str) -> dict:
+    """Parse `uci show firewall` output (fw4 / firewall4 layout).
+
+    Returns {"zones": [...], "redirects": [...], "rules": [...], "defaults": {...}}.
+    Sections are grouped by their declared type: zone → zones, redirect → redirects,
+    rule → rules; the 'defaults' section is kept as a flat dict. Unknown section
+    types are dropped. Empty/noise input yields all-empty lists + empty defaults."""
+    parsed = parse_uci_show(raw)
+    cfg = parsed.get("firewall") or {}
+    out = {"zones": [], "redirects": [], "rules": [], "defaults": {}}
+    for section, body in cfg.items():
+        if not isinstance(body, dict):
+            continue
+        kind = body.get("type")
+        if section == "defaults" or kind == "defaults":
+            out["defaults"] = {k: v for k, v in body.items() if k != "type"}
+        elif kind == "zone":
+            z = {"name": body.get("name"), "network": body.get("network"),
+                 "input": body.get("input"), "output": body.get("output"),
+                 "forward": body.get("forward")}
+            out["zones"].append(z)
+        elif kind == "redirect":
+            r = {"name": body.get("name"), "src": body.get("src"),
+                 "proto": body.get("proto"), "src_dport": body.get("src_dport"),
+                 "dest_ip": body.get("dest_ip"), "dest_port": body.get("dest_port")}
+            out["redirects"].append(r)
+        elif kind == "rule":
+            r = {"name": body.get("name"), "src": body.get("src"), "dest": body.get("dest"),
+                 "target": body.get("target"), "proto": body.get("proto")}
+            for extra in ("limit", "limit_refresh"):
+                if extra in body:
+                    r[extra] = body[extra]
+            out["rules"].append(r)
+    return out
+
+
+def firewall_zone_names(fw: dict):
+    """Names of all zones in a parsed firewall config (skips unnamed)."""
+    return [z["name"] for z in fw.get("zones", []) if z.get("name")]
+
+
+def firewall_find_redirect(fw: dict, name: str):
+    """Return the redirect (port forward) section whose name matches, else None."""
+    for r in fw.get("redirects", []):
+        if r.get("name") == name:
+            return r
+    return None
+
+
+def firewall_find_rule(fw: dict, name: str):
+    """Return the inter-zone rule whose name matches, else None."""
+    for r in fw.get("rules", []):
+        if r.get("name") == name:
+            return r
+    return None
+
+
 def apply_findings(dev, st):
     findings = audit_status(st)
     current = {r["rule_id"] for r in q("SELECT * FROM active_findings WHERE device_id=?", (dev["id"],))}
