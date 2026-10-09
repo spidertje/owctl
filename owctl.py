@@ -265,6 +265,7 @@ echo '##disk##'; df -h /overlay 2>/dev/null | awk 'NR==2 {print $2" used="$5" fr
 echo '##clients##'; iwinfo 2>/dev/null | grep 'Associated STAs' | awk '{s+=$3} END{print s+0}'
 echo '##wan##'; ubus call network.status wan 2>/dev/null | head -c 300
 echo '##fw##'; printf 'in=%s fwd=%s out=%s\n' "$(uci -q get firewall.@defaults[0].input)" "$(uci -q get firewall.@defaults[0].forward)" "$(uci -q get firewall.@defaults[0].output)"
+echo '##qos##'; uci show sqm 2>/dev/null; uci show nft-qos 2>/dev/null
 echo '##dropbear##'; printf 'pwauth=%s port=%s\n' "$(uci -q get dropbear.@dropbear[0].PasswordAuth)" "$(uci -q get dropbear.@dropbear[0].Port)"
 echo '##listeners##'; netstat -tln 2>/dev/null | awk 'NR>1 {n=split($4,a,":"); if (a[n]~/^[0-9]+$/) print a[n]}' | sort -un | tr '\n' ' '; echo
 echo '##ntp##'; uci -q get system.ntp.enabled
@@ -384,6 +385,8 @@ def _build_status(dev, backend, s):
     m = re.search(r'"ipaddr":\s*\[\s*"([^"]+)"', wan)
     st["wan_ip"] = m.group(1) if m else ""
     st.update({("fw_" + k): v for k, v in dict(re.findall(r'(in|fwd|out)=(\S+)', s.get("fw", ""))).items()})
+    # QoS (SQM / nft-qos) config — parsed via parse_sqm; None when the package is absent.
+    st["qos"] = parse_sqm(s.get("qos", ""))
     dbv = dict(re.findall(r'(pwauth|port)=(\S+)', s.get("dropbear", "")))
     st["dropbear_pwauth"] = dbv.get("pwauth", "")
     st["listeners"] = [int(x) for x in s.get("listeners", "").split()]
@@ -644,6 +647,14 @@ def audit_status(st):
         add("fw_forward_accept", "HIGH", "Firewall default FORWARD policy is ACCEPT",
             "All inter-zone forwarding allowed by default",
             "Set forward=DROP and allow only intended traffic")
+    # QoS not shaping on the WAN — latency-sensitive traffic (VoIP, video, gaming)
+    # will suffer under bursts. INFO: many people intentionally leave this off.
+    # st["qos"] is the parse_sqm() result (dict) or None; absent on LuCI-only boxes.
+    qos = st.get("qos")
+    if isinstance(qos, dict) and qos.get("enabled") is False and st.get("wan_up") is not False:
+        add("qos_disabled", "INFO", "QoS (SQM) is not enabled",
+            "No traffic shaping — bursty flows can starve latency-sensitive traffic",
+            "Enable SQM in the QoS tab (fq_codel recommended) if you have latency-sensitive traffic")
     if str(st.get("ntp") or "").lower() in ("false", "0", "disabled"):
         add("ntp_disabled", "LOW", "NTP time sync is disabled",
             "", "Enable system.ntp so logs and certs stay correct")
