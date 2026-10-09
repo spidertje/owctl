@@ -30,13 +30,28 @@ Access modes:
 - `ssh` — root key or password; most features (upgrades, backups, reboot, full audit).
 - `luci` — LuCI web password; status + LuCI config backup + sysupgrade detection.
 
+## QoS / SQM
+
+QoS tab (SSH devices only): read live SQM (`luci-app-sqm`) or `nft-qos` config,
+then apply `{enabled, interface, download_kbps, upload_kbps, qdisc (fq_codel|cake), ecn}`
+with optional package auto-install. Applies idempotently via a named `wan` uci
+section, then `uci commit sqm && sqm restart`.
+
+## Firewall
+
+Firewall tab (SSH devices only): port forwards, inter-zone rules and per-zone
+default policies (input/forward). Reads live `uci show firewall`; applies via
+named uci sections (idempotent re-apply + delete-by-name), then
+`uci commit firewall && fw4 restart`. Saved state is tracked per device for
+diffing against the live box.
+
 ## Threat engine
 
 Checks per device: telnet enabled, SSH password auth, firewall default
 INPUT/FORWARD=ACCEPT, NTP disabled, clock drift, outdated packages, firmware
-(sysupgrade) updates, WAN down, port forwards. New findings fire alerts once,
-re-alert if they disappear and return. Scheduler re-audits every 30 min
-(configurable in code via `audit_interval_min`).
+(sysupgrade) updates, WAN down, port forwards, QoS (SQM) not enabled.
+New findings fire alerts once, re-alert if they disappear and return.
+Scheduler re-audits every 30 min (configurable in code via `audit_interval_min`).
 
 ## Alerting
 
