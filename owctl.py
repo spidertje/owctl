@@ -1819,8 +1819,10 @@ async def token_guard(request, call_next):
         return await call_next(request)
     t = get_setting("ui_token", "") or os.environ.get("OWCTL_TOKEN", "")
     if t and request.url.path.startswith("/api/"):
+        # Header-only auth. (?token= is intentionally NOT accepted — a bearer secret
+        # in the query string leaks into access/proxy logs and browser history.)
         auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {t}" and request.query_params.get("token", "") != t:
+        if auth != f"Bearer {t}":
             return JSONResponse({"error": "unauthorized"}, status_code=401)
     return await call_next(request)
 
