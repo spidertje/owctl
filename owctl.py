@@ -118,6 +118,9 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS owctl_actions(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, device_id INTEGER, device_name TEXT,
         action TEXT, detail TEXT, result TEXT, error TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS api_audit(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, method TEXT, path TEXT,
+        client TEXT, status INTEGER)""")
     execute("""CREATE TABLE IF NOT EXISTS vlans(
         vlan_id TEXT PRIMARY KEY, name TEXT, subnet TEXT, dhcp INTEGER, created_at TEXT)""")
     execute("""CREATE TABLE IF NOT EXISTS qos(
@@ -1877,11 +1880,19 @@ async def token_guard(request, call_next):
 
 @app.middleware("http")
 async def security_headers(request, call_next):
-    """Hardening headers on every response (API + static)."""
+    """Hardening headers on every response (API + static) + audit mutating API calls."""
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
+    # Security: record mutating API requests (who/when/what, with result) for accountability.
+    path = request.url.path
+    if request.method in ("POST", "PUT", "DELETE", "PATCH") and path.startswith("/api/"):
+        try:
+            execute("INSERT INTO api_audit(ts, method, path, client, status) VALUES(?,?,?,?,?)",
+                    (now(), request.method, path, _client_key(request), response.status_code))
+        except Exception:
+            pass  # auditing must never break the request
     return response
 
 
@@ -2769,6 +2780,14 @@ async def settings_put(request: Request):
             except (TypeError, ValueError):
                 set_setting("network_gateway", "")
     return {"ok": True}
+
+
+@app.get("/api/audit/api")
+def api_audit(limit: int = 100):
+    """Recent mutating API requests (who/when/what/result), newest first."""
+    limit = max(1, min(500, limit))
+    rows = q("SELECT ts, method, path, client, status FROM api_audit ORDER BY id DESC LIMIT ?", (limit,))
+    return {"entries": [dict(r) for r in rows]}
 
 
 @app.get("/api/devices/{did}/heartbeat")
