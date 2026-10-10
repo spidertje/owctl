@@ -9,6 +9,26 @@
 .light{--bg:#f0f2f5;--panel:#fff;--panel2:#e8eaf0;--tx:#1a1a2e;--mut:#6b7280;--line:#d1d5db}
 *{box-sizing:border-box}
 body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
+/* login gate */
+#login-gate{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;
+  background:var(--bg);padding:24px}
+#login-gate[hidden]{display:none}
+.lg-box{width:100%;max-width:360px;background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:26px 24px;text-align:center}
+.lg-logo{font-size:40px;line-height:1;margin-bottom:6px}
+.lg-box h1{font-size:24px;margin:2px 0 4px;font-weight:650}
+.lg-box h1 span{color:var(--acc)}
+.lg-sub{color:var(--mut);font-size:13px;margin:0 0 16px}
+.lg-body{display:flex;flex-direction:column;gap:10px}
+#login-token{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--tx);font-size:14px;text-align:center}
+#login-token:focus{outline:2px solid var(--acc);border-color:transparent}
+.lg-err{color:var(--bad);font-size:12.5px;min-height:1em;margin:-4px 0 0}
+.lg-btn{width:100%;padding:10px 12px;border-radius:9px;border:none;cursor:pointer;
+  background:var(--acc);color:#08101e;font-size:14px;font-weight:600}
+.lg-btn:hover{filter:brightness(1.06)}
+.lg-hint{color:var(--mut);font-size:11.5px;margin:14px 0 0;line-height:1.5}
+.lg-hint code{color:var(--acc)}
 header{display:flex;align-items:center;gap:14px;padding:14px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
 header h1{font-size:17px;margin:0;font-weight:600}
 header h1 span{color:var(--acc)}
@@ -75,6 +95,22 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
 </style>
 </head>
 <body>
+<div id="login-gate">
+  <div class="lg-box">
+    <div class="lg-logo">🛰️</div>
+    <h1>ow<span>ctl</span></h1>
+    <p class="lg-sub">OpenWrt control + threat watch — enter your token to unlock.</p>
+    <div class="lg-body">
+      <input id="login-token" type="password" placeholder="Bearer token"
+             autocapitalize="off" spellcheck="false" autocomplete="off" aria-label="owctl token"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();tryLogin(this.value)}"/>
+      <div id="login-err" class="lg-err" role="alert"></div>
+      <button type="button" class="lg-btn" onclick="tryLogin(document.getElementById('login-token').value)">Unlock</button>
+    </div>
+    <p class="lg-hint">Token is stored only in this browser (localStorage) and sent as
+    <code>Authorization: Bearer</code> on every request.</p>
+  </div>
+</div>
 <header>
   <h1>ow<span>ctl</span> <span class="pill">OpenWrt control + threat watch</span></h1>
   <nav>
@@ -92,7 +128,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   </nav>
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
 </header>
-<main>
+<main style="display:none">
   <section id="tab-network"></section>
   <section id="tab-devices" style="display:none"></section>
   <section id="tab-threats" style="display:none"></section>
@@ -114,7 +150,7 @@ async function api(path,opts={}){
   opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
   if(TOKEN)opts.headers['Authorization']='Bearer '+TOKEN;
   const r=await fetch('/api'+path,opts);
-  if(r.status===401){const t=prompt('owctl token:');if(t){TOKEN=t;localStorage.setItem('owctl_token',t);return api(path,opts)}throw new Error('unauthorized')}
+  if(r.status===401){showLogin('Session token rejected — sign in again');throw new Error('unauthorized')}
   const j=await r.json().catch(()=>({}));
   if(!r.ok)throw new Error(j.detail||j.error||r.status);
   return j;
@@ -894,10 +930,54 @@ async function renderAlerts(){
       :'<p class="muted">No alerts logged yet.</p>'})();
 }
 
-render('network');
+function showLogin(msg){
+  const gate=document.getElementById('login-gate');
+  const main=document.querySelector('main');
+  const err=document.getElementById('login-err');
+  if(main)main.style.display='none';
+  if(gate)gate.hidden=false;
+  if(err)err.textContent=msg||'';
+  const inp=document.getElementById('login-token');
+  if(inp){inp.value='';setTimeout(()=>inp.focus(),0);}
+  stopPolling && stopPolling();
+}
+function hideLogin(){
+  const gate=document.getElementById('login-gate');
+  const main=document.querySelector('main');
+  if(gate)gate.hidden=true;
+  if(main)main.style.display='';
+}
+async function verifyToken(t){
+  try{const r=await fetch('/api/network',{headers:{'Authorization':'Bearer '+t}});return r.status===200;}
+  catch(e){return false;}
+}
+async function tryLogin(t){
+  t=(t||'').trim();
+  const err=document.getElementById('login-err');
+  if(!t){if(err)err.textContent='Enter your token';return;}
+  if(err)err.textContent='Checking…';
+  if(await verifyToken(t)){
+    TOKEN=t;localStorage.setItem('owctl_token',t);
+    hideLogin();
+    render('network');
+    startPolling(60000);
+  }else{
+    if(err)err.textContent='Invalid token';
+  }
+}
+function bootApp(){
+  // If a token is already stored, try it silently; otherwise show the gate.
+  if(TOKEN){
+    verifyToken(TOKEN).then(ok=>{
+      if(ok){hideLogin();render('network');startPolling(60000);}
+      else{localStorage.removeItem('owctl_token');showLogin('Token not valid — sign in');}
+    });
+  }else{
+    showLogin();
+  }
+}
 function toggleTheme(){document.body.classList.toggle('light')}
-// ponytail: auto-refresh every 60s on devices tab
-startPolling(60000);
+bootApp();
 
 // Bulk actions
 function toggleAll(checked){
