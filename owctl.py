@@ -1843,6 +1843,28 @@ def _client_key(request) -> str:
     if xf:
         return xf.split(",")[0].strip()
     return (request.client.host if request.client else "") or "unknown"
+
+
+def tls_kwargs():
+    """TLS options for the uvicorn run, from OWCTL_SSL_CERT / OWCTL_SSL_KEY.
+
+    - Neither set -> {} (plain HTTP).
+    - Both set to existing files -> {ssl_certfile, ssl_keyfile}.
+    - Only one set -> raise (a lone cert/key is a misconfiguration that would
+      otherwise silently serve plain HTTP).
+    Use a CA-signed cert in production; for LAN-only, a self-signed cert is fine.
+    """
+    cert = os.environ.get("OWCTL_SSL_CERT", "").strip()
+    key = os.environ.get("OWCTL_SSL_KEY", "").strip()
+    if not cert and not key:
+        return {}
+    if not (cert and key):
+        raise ValueError("owctl: OWCTL_SSL_CERT and OWCTL_SSL_KEY must be set together for TLS")
+    if not os.path.exists(cert):
+        raise ValueError(f"owctl: TLS cert not found: {cert}")
+    if not os.path.exists(key):
+        raise ValueError(f"owctl: TLS key not found: {key}")
+    return {"ssl_certfile": cert, "ssl_keyfile": key}
 # Security: guarantee a token exists so the API is never left open.
 # On first boot this generates a fresh secret, persists it, and prints it once
 # so the operator can retrieve it. Subsequent boots reuse the stored token.
@@ -2843,5 +2865,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="
 if __name__ == "__main__":
     import uvicorn
     threading.Thread(target=_scheduler, daemon=True).start()
-    print(f"owctl: http://{HOST}:{PORT}")
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    _tls = tls_kwargs()
+    _scheme = "https" if _tls else "http"
+    print(f"owctl: {_scheme}://{HOST}:{PORT}" + (" (TLS)" if _tls else ""))
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning", **_tls)
