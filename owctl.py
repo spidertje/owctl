@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -1799,6 +1800,46 @@ def _scheduler():
 # --------------------------------------------------------------------- app
 app = FastAPI(title="owctl")
 init_db()
+
+
+# --------------------------------------------------------------------- security
+_RATELIMIT_MAX = int(os.environ.get("OWCTL_RATELIMIT_MAX", "120"))
+_RATELIMIT_WINDOW = int(os.environ.get("OWCTL_RATELIMIT_WINDOW", "60"))
+
+
+class _RateLimiter:
+    """Fixed-window per-client-IP limiter. Thread-safe; in-memory (per process)."""
+
+    def __init__(self, limit: int, window: int):
+        self.limit = max(1, limit)
+        self.window = max(1, window)
+        self._hits: dict = defaultdict(int)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str):
+        """Return (allowed, retry_after_seconds)."""
+        now = int(time.time())
+        bucket = now // self.window
+        with self._lock:
+            # lazy cleanup of stale buckets to bound memory
+            if len(self._hits) > 4096:
+                self._hits.clear()
+            n = self._hits.get(key, 0)
+            if n < self.limit:
+                self._hits[key] = n + 1
+                return True, 0
+        remaining = (bucket + 1) * self.window - now
+        return False, max(1, remaining)
+
+
+_rate_limiter = _RateLimiter(_RATELIMIT_MAX, _RATELIMIT_WINDOW)
+
+
+def _client_key(request) -> str:
+    xf = request.headers.get("x-forwarded-for", "")
+    if xf:
+        return xf.split(",")[0].strip()
+    return (request.client.host if request.client else "") or "unknown"
 # Security: guarantee a token exists so the API is never left open.
 # On first boot this generates a fresh secret, persists it, and prints it once
 # so the operator can retrieve it. Subsequent boots reuse the stored token.
@@ -1814,6 +1855,13 @@ if _AUTH_GENERATED:
 
 @app.middleware("http")
 async def token_guard(request, call_next):
+    # Rate limiting on the API surface (protects the token endpoint from brute force).
+    # Applied regardless of auth mode so it still guards an explicitly-open instance.
+    if request.url.path.startswith("/api/"):
+        allowed, retry_after = _rate_limiter.allow(_client_key(request))
+        if not allowed:
+            return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
+                                headers={"Retry-After": str(retry_after)})
     # OWCTL_ALLOW_OPEN=1 disables auth (dev/tests only). Production should leave it unset.
     if os.environ.get("OWCTL_ALLOW_OPEN") == "1":
         return await call_next(request)
