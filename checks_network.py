@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 tmp = tempfile.mkdtemp()
 os.environ["OWCTL_DATA"] = tmp
+os.environ["OWCTL_ALLOW_OPEN"] = "1"
 
 import owctl  # noqa: E402
 from fastapi.testclient import TestClient

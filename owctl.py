@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import smtplib
 import socket
 import sqlite3
@@ -167,6 +168,25 @@ def get_setting(k, d=None):
 def set_setting(k, v):
     execute("INSERT INTO settings(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
+
+
+def ensure_auth_token():
+    """Return (token, generated). Precedence: OWCTL_TOKEN env > stored ui_token > generate.
+
+    On first boot (no env token, no stored token) a fresh 48-hex-char secret is
+    generated and persisted to the ui_token setting. Idempotent: a second call
+    reuses the stored token. The token guard (token_guard) enforces it on /api/*.
+    Call this at startup before serving.
+    """
+    env_tok = os.environ.get("OWCTL_TOKEN", "").strip()
+    if env_tok:
+        return env_tok, False
+    stored = (get_setting("ui_token", "") or "").strip()
+    if stored:
+        return stored, False
+    new_tok = secrets.token_hex(24)  # 48 hex chars, 192 bits
+    set_setting("ui_token", new_tok)
+    return new_tok, True
 
 
 # --------------------------------------------- device heartbeats / offline events
@@ -1779,10 +1799,24 @@ def _scheduler():
 # --------------------------------------------------------------------- app
 app = FastAPI(title="owctl")
 init_db()
+# Security: guarantee a token exists so the API is never left open.
+# On first boot this generates a fresh secret, persists it, and prints it once
+# so the operator can retrieve it. Subsequent boots reuse the stored token.
+_AUTH_TOKEN, _AUTH_GENERATED = ensure_auth_token()
+if _AUTH_GENERATED:
+    print("=" * 62, flush=True)
+    print("owctl: no token configured — generated a new one (shown ONCE):", flush=True)
+    print(f"    TOKEN = {_AUTH_TOKEN}", flush=True)
+    print("  Store it now; the API requires `Authorization: Bearer <TOKEN>`.", flush=True)
+    print("  (Set OWCTL_TOKEN env var to override, or change it in Settings.)", flush=True)
+    print("=" * 62, flush=True)
 
 
 @app.middleware("http")
 async def token_guard(request, call_next):
+    # OWCTL_ALLOW_OPEN=1 disables auth (dev/tests only). Production should leave it unset.
+    if os.environ.get("OWCTL_ALLOW_OPEN") == "1":
+        return await call_next(request)
     t = get_setting("ui_token", "") or os.environ.get("OWCTL_TOKEN", "")
     if t and request.url.path.startswith("/api/"):
         auth = request.headers.get("authorization", "")

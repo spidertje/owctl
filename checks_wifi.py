@@ -5,6 +5,7 @@ import os, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 tmp = tempfile.mkdtemp()
 os.environ["OWCTL_DATA"] = tmp
+os.environ["OWCTL_ALLOW_OPEN"] = "1"
 import owctl
 from starlette.testclient import TestClient
 client = TestClient(owctl.app)

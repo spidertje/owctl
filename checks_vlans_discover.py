@@ -1,6 +1,7 @@
 """checks_vlans_discover.py — verify VLAN discovery: parser + subnet/dhcp autofill + endpoint."""
 import os
 os.environ["OWCTL_DATA"] = "/tmp/owctl-disc-test-" + str(os.getpid())
+os.environ["OWCTL_ALLOW_OPEN"] = "1"
 os.makedirs(os.environ["OWCTL_DATA"], exist_ok=True)
 import importlib, owctl
 importlib.reload(owctl)

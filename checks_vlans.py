@@ -1,6 +1,7 @@
 """checks_vlans.py — verify GET /api/vlans + record-on-apply behavior."""
 import os
 os.environ["OWCTL_DATA"] = "/tmp/owctl-vlans-test-" + str(os.getpid())
+os.environ["OWCTL_ALLOW_OPEN"] = "1"
 os.makedirs(os.environ["OWCTL_DATA"], exist_ok=True)
 import importlib
 import owctl
