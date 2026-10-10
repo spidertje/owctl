@@ -16,9 +16,32 @@ pip install -r requirements.txt
 python owctl.py                 # http://<this-host>:8090
 ```
 
-Useful env: `OWCTL_HOST` (default 0.0.0.0), `OWCTL_PORT` (default 8090),
-`OWCTL_DATA` (data dir, default ./data), `OWCTL_TOKEN` (optional bearer token
-for all /api routes).
+Useful env:
+- `OWCTL_HOST` (default 0.0.0.0), `OWCTL_PORT` (default 8090)
+- `OWCTL_DATA` (data dir, default ./data)
+- `OWCTL_TOKEN` — bearer token for all /api routes. **Optional**: if unset and
+  no token is stored, a 48-hex-char token is auto-generated on first boot and
+  printed once to stdout. Send it as `Authorization: Bearer <token>` (header
+  only — the `?token=` query string is not accepted).
+- `OWCTL_SSL_CERT` / `OWCTL_SSL_KEY` — serve over HTTPS (both must be set).
+- `OWCTL_RATELIMIT_MAX` / `OWCTL_RATELIMIT_WINDOW` — API rate limit
+  (default 120 req / 60 s per client IP).
+- `OWCTL_ALLOW_OPEN` — set `1` to disable auth (dev/tests only).
+
+## Security model
+
+- **Auth is always enforced** on `/api/*`. A token always exists: your
+  `OWCTL_TOKEN` env var, the stored `ui_token` (change it in Settings), or an
+  auto-generated one shown once at first startup.
+- **Device credentials are redacted**: `GET /api/devices` returns
+  `has_ssh_password` / `has_luci_pass` booleans, never the raw passwords.
+- **Rate limiting** (429 + `Retry-After`) protects the token endpoint from brute force.
+- **Audit log**: mutating requests (POST/PUT/DELETE/PATCH) are recorded —
+  method, path, client IP, timestamp, status — readable at `GET /api/audit/api`.
+- **Hardening headers** on every response: `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: same-origin`.
+- **TLS** is optional via `OWCTL_SSL_CERT` / `OWCTL_SSL_KEY`; otherwise serve
+  behind a TLS-terminating reverse proxy (Caddy/nginx).
 
 ## Add devices
 
