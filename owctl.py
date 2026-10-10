@@ -1825,6 +1825,16 @@ async def token_guard(request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def security_headers(request, call_next):
+    """Hardening headers on every response (API + static)."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    return response
+
+
 @app.get("/")
 def index():
     return FileResponse(os.path.join(BASE, "static", "index.html"))
