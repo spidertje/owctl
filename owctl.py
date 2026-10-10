@@ -1841,6 +1841,11 @@ def list_devices():
                 ORDER BY d.id""")
     for r in rows:
         r["wifi_capable"] = bool(r["wifi_capable"]) if r["wifi_capable"] is not None else None
+        # Security: never return device credentials to the client. Expose presence only.
+        r["has_ssh_password"] = bool(r.get("ssh_password"))
+        r["has_luci_pass"] = bool(r.get("luci_pass"))
+        r["ssh_password"] = ""
+        r["luci_pass"] = ""
     return rows
 
 
@@ -2005,12 +2010,19 @@ async def update_device(request: Request, did: int):
     role = g("role", current_role)
     if role is not None:
         role = role.strip().lower()
+    # Security: an empty/whitespace password means "keep existing" (the UI only
+    # sends a real value when the user actually changes it). Prevents redaction
+    # from being mistaken for a credential wipe.
+    ssh_pw = (d.get("ssh_password") or "").strip()
+    ssh_pw = ssh_pw if ssh_pw else (dev["ssh_password"] or "")
+    luci_pw = (d.get("luci_pass") or "").strip()
+    luci_pw = luci_pw if luci_pw else (dev["luci_pass"] or "")
     execute("UPDATE devices SET name=?, role=?, access=?, ssh_port=?, ssh_user=?, ssh_password=?, "
             "key_path=?, luci_user=?, luci_pass=?, luci_port=?, tags=? WHERE id=?",
             (g("name", dev["name"]), role, g("access", dev["access"]),
              int(g("ssh_port", dev["ssh_port"] or 22)), g("ssh_user", dev["ssh_user"]),
-             g("ssh_password", dev["ssh_password"]), g("key_path", dev["key_path"]),
-             g("luci_user", dev["luci_user"]), g("luci_pass", dev["luci_pass"]),
+             ssh_pw, g("key_path", dev["key_path"]),
+             g("luci_user", dev["luci_user"]), luci_pw,
              (int(g("luci_port", dev.get("luci_port") or 0)) or None),
              d.get("tags", dev["tags"]), did))
     return {"ok": True}
