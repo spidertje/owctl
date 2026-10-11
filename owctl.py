@@ -2270,12 +2270,12 @@ uci set dhcp.{iface}.start='{start}'
 uci set dhcp.{iface}.limit='{limit}'
 uci set dhcp.{iface}.lease_time='{lease_time}'
 uci commit dhcp
-/etc/init.d/dnsmasq reload
+/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true
 """
         else:
             cmd = f"""uci delete dhcp.{iface}
 uci commit dhcp
-/etc/init.d/dnsmasq reload
+/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true
 """
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode(errors="replace")
@@ -2308,28 +2308,46 @@ def _saved_dhcp_rows(device_id):
     return [{"vlan_id": r["vlan_id"], "iface": r["iface"], "start": r["start"], "limit": r["limit"],
              "lease_time": r["lease_time"], "enabled": bool(r["enabled"])} for r in rows]
 
+def _parse_uci_show(out):
+    """Parse `uci show <pkg>` output into {section: {key: [values]}}. Handles list values a='x' 'y'.
+    Keeps full section names (e.g., 'dhcp.lan') for reliable detection."""
+    sections = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        path, rest = line.split("=", 1)
+        sec, _, key = path.rpartition(".")
+        vals = re.findall(r"'([^']*)'", rest) or (re.findall(r"(\S+)", rest) if rest.strip().startswith("0") or rest.strip().startswith("1") else [])
+        if sec and key:
+            sections.setdefault(sec, {}).setdefault(key, []).extend(vals)
+    return sections
+
 def _read_live_dhcp(dev):
-    """Read live DHCP config from dnsmasq UCI."""
+    """Read live DHCP pools from UCI (odhcpd or dnsmasq)."""
     c = _ssh_connect(dev)
     try:
         out, _err, _st = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
-        sections = {}
-        for line in out.splitlines():
-            m = __import__('re').match(r"^dhcp\.([^.]+)\.(\w+)='?([^']*)'?$", line.strip())
-            if m:
-                sec, key, val = m.groups()
-                sections.setdefault(sec, {})[key] = val
+        sections = _parse_uci_show(out)
         dhcp = []
         for name, attrs in sections.items():
-            if attrs.get("interface"):
-                dhcp.append({
-                    "vlan_id": name.replace("vlan_", "") if name.startswith("vlan_") else name,
-                    "iface": attrs.get("interface", ""),
-                    "start": int(attrs.get("start", 100)),
-                    "limit": int(attrs.get("limit", 150)),
-                    "lease_time": attrs.get("lease_time", "12h"),
-                    "enabled": True
-                })
+            if name.startswith("@host") or name.startswith("@dnsmasq") or name.startswith("@odhcpd") or name.startswith("odhcpd"):
+                continue
+            iface = (attrs.get("interface") or [None])[0]
+            if not iface or attrs.get("ignore", ["0"])[0] == "1":
+                continue
+            # a real pool has a start address or runs as a server
+            if not attrs.get("start") and (attrs.get("dhcpv4") or [""])[0] != "server":
+                continue
+            lease = (attrs.get("leasetime") or attrs.get("lease_time") or ["12h"])[0]
+            dhcp.append({
+                "vlan_id": name.replace("vlan_", "") if name.startswith("vlan_") else name.replace("dhcp.", ""),
+                "iface": iface,
+                "start": int(attrs["start"][0]) if attrs.get("start") and attrs["start"][0].isdigit() else 100,
+                "limit": int(attrs["limit"][0]) if attrs.get("limit") and attrs["limit"][0].isdigit() else 150,
+                "lease_time": lease,
+                "enabled": True,
+            })
         return dhcp
     finally:
         c.close()
@@ -2360,7 +2378,7 @@ async def get_dhcp_leases(request: Request):
 
 @app.post("/api/dns/apply")
 async def apply_dns(request: Request):
-    """Apply DNS servers to a device's dnsmasq config."""
+    """Apply DNS servers for the device's active DHCP/DNS backend (odhcpd or dnsmasq)."""
     d = await request.json()
     did = d.get("did")
     servers = d.get("servers", [])
@@ -2373,16 +2391,37 @@ async def apply_dns(request: Request):
     dev = cur[0]
     if dev["access"] != "ssh":
         raise HTTPException(400, "DNS config requires SSH access")
+    servers = [s.strip() for s in servers if s.strip() and s.strip() != "router"]
+    if not servers:
+        raise HTTPException(400, "provide at least one upstream server")
     c = _ssh_connect(dev)
     try:
-        lines = ["uci delete dhcp.@dnsmasq[0] 2>/dev/null || true",
-                 "uci set dhcp.@dnsmasq[0]=dnsmasq"]
-        for i, srv in enumerate(servers):
-            lines.append(f"uci add_list dhcp.@dnsmasq[0].server='{srv}'")
-        for i, dom in enumerate(search_domains):
-            lines.append(f"uci add_list dhcp.@dnsmasq[0].search='{dom}'")
-        lines.append("uci commit dhcp")
-        lines.append("/etc/init.d/dnsmasq reload")
+        # ponytail: backend detection by uci keys; add other backends here if seen.
+        detect, _e, _s = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
+        # odhcpd (OpenWrt 22.03+) runs DHCP when a section has dhcpv4='server'
+        backend = "odhcpd" if re.search(r"^dhcp\.\w+\.dhcpv4='?server'?$", detect, re.M) else "dnsmasq"
+        if backend == "odhcpd":
+            # DNS is handed to clients via DHCP option 6 (IPv4) and RA-DNS "6,ip,ip" (IPv6).
+            # Preserve existing RA-DNS entries, replace only the dhcp-option=6 entries.
+            lines = [
+                "uci -q delete dhcp.lan.dhcp_option || true",
+            ]
+            for old in re.findall(r"^dhcp\.lan\.dhcp_option='([^']*)'$", detect, re.M):
+                if old.startswith("6,") and not old.startswith("dhcp-option=6,"):
+                    lines.append(f"uci add_list dhcp.lan.dhcp_option='{old}'")
+            for s in servers:
+                lines.append(f"uci add_list dhcp.lan.dhcp_option='dhcp-option=6,{s}'")
+            lines.append("uci commit dhcp")
+            lines.append("/etc/init.d/odhcpd restart 2>/dev/null || /etc/init.d/dnsmasq restart 2>/dev/null || true")
+        else:
+            # dnsmasq backend: keep the @dnsmasq[0] block in-place
+            lines = [
+                "uci -q del_list dhcp.@dnsmasq[0].server || true",
+            ]
+            for s in servers:
+                lines.append(f"uci add_list dhcp.@dnsmasq[0].server='{s}'")
+            lines.append("uci commit dhcp")
+            lines.append("/etc/init.d/dnsmasq restart 2>/dev/null || true")
         cmd = "\n".join(lines)
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode(errors="replace")
@@ -2390,14 +2429,13 @@ async def apply_dns(request: Request):
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"DNS config failed on {dev['name']}: {(err or out)[:200]}")
-        log_action(dev, 'dns', f'servers={",".join(servers)}', ok=True)
-        # Save to DB
+        log_action(dev, 'dns', f'servers={",".join(servers)} backend={backend}', ok=True)
         execute("""INSERT INTO dns(device_id, servers, search_domains, ts)
                    VALUES(?,?,?,?)
                    ON CONFLICT(device_id) DO UPDATE SET
                      servers=excluded.servers, search_domains=excluded.search_domains, ts=excluded.ts""",
                 (dev["id"], ",".join(servers), ",".join(search_domains), now()))
-        return {"device": dev["name"], "ok": True, "servers": servers}
+        return {"device": dev["name"], "ok": True, "servers": servers, "resolver": backend}
     finally:
         c.close()
 
@@ -2417,21 +2455,39 @@ def _saved_dns_rows(device_id):
     return {"servers": [], "search_domains": []}
 
 def _read_live_dns(dev):
-    """Read live DNS config from dnsmasq UCI."""
+    """Read live DNS config from UCI (odhcpd option-6 or dnsmasq block)."""
     c = _ssh_connect(dev)
     try:
         out, _err, _st = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
+        sections = _parse_uci_show(out)
         servers = []
-        search_domains = []
-        for line in out.splitlines():
-            m = __import__('re').match(r"^dhcp\.@dnsmasq\[\d+\]\.(\w+)='?([^']*)'?$", line.strip())
-            if m:
-                key, val = m.groups()
-                if key == "server":
-                    servers.append(val)
-                elif key == "search":
-                    search_domains.append(val)
-        return {"servers": servers, "search_domains": search_domains}
+        resolver = None
+        # odhcpd: DHCP option 6 on lan/vlan sections; bare "6,ip,ip" values are IPv6 RA-DNS, skip them
+        for sec, attrs in sections.items():
+            if sec == "dhcp.lan" or sec.startswith("dhcp.lan.") or re.match(r"^dhcp\.vlan_", sec):
+                for v in attrs.get("dhcp_option", []):
+                    if v == "dhcp-option=6" and len(attrs["dhcp_option"]) >= 2:
+                        servers.extend(x for x in attrs["dhcp_option"][1].split(",") if x)
+                        resolver = "odhcpd"
+                    elif v.startswith("dhcp-option=6,"):
+                        servers.extend(x for x in v.split(",")[1:] if x)
+                        resolver = "odhcpd"
+        
+        # backend detection for return value
+        backend = "odhcpd" if re.search(r"^dhcp\.\w+\.dhcpv4='?server'?$", out, re.M) else "dnsmasq"
+        # dnsmasq block (only inspect if no odhcpd resolver found, so stale blocks don't leak through)
+        if not resolver:
+            for sec, attrs in sections.items():
+                if sec.startswith("dhcp.@dnsmasq") and "server" in attrs:
+                    servers.extend(attrs["server"])
+                    resolver = "dnsmasq"
+        # dedupe, keep order
+        seen, uniq = set(), []
+        for s in servers:
+            if s not in seen:
+                seen.add(s)
+                uniq.append(s)
+        return {"servers": uniq, "search_domains": [], "resolver": resolver}
     finally:
         c.close()
 

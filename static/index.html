@@ -1410,9 +1410,10 @@ async function renderDns(target){
     try{
       const dns = await api(`/dns?did=${router.id}`);
       const dnsBox = document.getElementById('dns-results');
-      if(dns.live && dns.live.servers && dns.live.servers.length){
+      if(dns.live && (dns.live.servers?.length || dns.live.resolver)){
         dnsBox.innerHTML = `<div class="card"><h3>Live DNS (${router.name})</h3>
-          <div class="kv"><span>Servers</span><span>${esc(dns.live.servers.join(', '))}</span></div>
+          <div class="kv"><span>Resolver</span><span><b>${esc(dns.live.resolver||'none detected')}</b></span></div>
+          <div class="kv"><span>Servers</span><span>${esc(dns.live.servers?.join(', ')||'none')}</span></div>
           ${dns.live.search_domains?.length?`<div class="kv"><span>Search</span><span>${esc(dns.live.search_domains.join(', '))}</span></div>`:''}
         </div>`;
         if(NET_ADVANCED){
