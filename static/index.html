@@ -1337,6 +1337,26 @@ async function renderVlans(target){
   html+=`<div id="dns-results" style="margin-top:16px"></div>`;
   
   el.innerHTML=html;
+  // Fetch live DHCP/DNS config for the router device
+  if(NET_ADVANCED && router && router.access==='ssh'){
+    try{
+      const dhcp = await api(`/dhcp?did=${router.id}`);
+      if(dhcp.live && dhcp.live.length){
+        const d = dhcp.live[0];
+        document.getElementById('dhcp-vlan').value = d.vlan_id || 10;
+        document.getElementById('dhcp-iface').value = d.iface || 'vlan_'+(d.vlan_id||10);
+        document.getElementById('dhcp-start').value = d.start || 100;
+        document.getElementById('dhcp-limit').value = d.limit || 150;
+        document.getElementById('dhcp-lease').value = d.lease_time || '12h';
+        document.getElementById('dhcp-enabled').checked = d.enabled !== false;
+      }
+      const dns = await api(`/dns?did=${router.id}`);
+      if(dns.live && dns.live.servers && dns.live.servers.length){
+        document.getElementById('dns-servers').value = dns.live.servers.join('\n');
+        document.getElementById('dns-search').value = (dns.live.search_domains||[]).join(', ');
+      }
+    }catch(e){console.warn('Live config fetch failed:',e)}
+  }
 }
 async function applyVlan(){
   const dids=[...document.querySelectorAll('.vlan-dev-cb:checked')].map(cb=>parseInt(cb.value));

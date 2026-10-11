@@ -123,6 +123,12 @@ def init_db():
         client TEXT, status INTEGER)""")
     execute("""CREATE TABLE IF NOT EXISTS vlans(
         vlan_id TEXT PRIMARY KEY, name TEXT, subnet TEXT, dhcp INTEGER, created_at TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS dhcp(
+        device_id INTEGER, vlan_id TEXT, iface TEXT, start INTEGER, "limit" INTEGER,
+        lease_time TEXT, enabled INTEGER, ts TEXT,
+        PRIMARY KEY(device_id, vlan_id))""")
+    execute("""CREATE TABLE IF NOT EXISTS dns(
+        device_id INTEGER PRIMARY KEY, servers TEXT, search_domains TEXT, ts TEXT)""")
     execute("""CREATE TABLE IF NOT EXISTS qos(
         device_id INTEGER PRIMARY KEY, enabled INTEGER, interface TEXT,
         download_kbps INTEGER, upload_kbps INTEGER, qdisc TEXT, ecn INTEGER, ts TEXT)""")
@@ -2278,7 +2284,53 @@ uci commit dhcp
         if status != 0:
             raise RuntimeError(f"DHCP config failed on {dev['name']}: {(err or out)[:200]}")
         log_action(dev, 'dhcp', f'vlan={vlan_id} enabled={enabled}', ok=True)
+        # Save to DB
+        execute("""INSERT INTO dhcp(device_id, vlan_id, iface, start, "limit", lease_time, enabled, ts)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(device_id, vlan_id) DO UPDATE SET
+                     iface=excluded.iface, start=excluded.start, "limit"=excluded."limit",
+                     lease_time=excluded.lease_time, enabled=excluded.enabled, ts=excluded.ts""",
+                (dev["id"], str(vlan_id), iface, start, limit, lease_time, 1 if enabled else 0, now()))
         return {"device": dev["name"], "ok": True}
+    finally:
+        c.close()
+
+@app.get("/api/dhcp")
+def dhcp_read(did: int):
+    """Saved + live DHCP config for a device."""
+    dev = _require_device(did)
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "DHCP read requires SSH access on this device")
+    return {"saved": _saved_dhcp_rows(dev["id"]), "live": _read_live_dhcp(dev)}
+
+def _saved_dhcp_rows(device_id):
+    rows = q("SELECT * FROM dhcp WHERE device_id=? ORDER BY vlan_id", (device_id,))
+    return [{"vlan_id": r["vlan_id"], "iface": r["iface"], "start": r["start"], "limit": r["limit"],
+             "lease_time": r["lease_time"], "enabled": bool(r["enabled"])} for r in rows]
+
+def _read_live_dhcp(dev):
+    """Read live DHCP config from dnsmasq UCI."""
+    c = _ssh_connect(dev)
+    try:
+        out, _err, _st = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
+        sections = {}
+        for line in out.splitlines():
+            m = __import__('re').match(r"^dhcp\.([^.]+)\.(\w+)='?([^']*)'?$", line.strip())
+            if m:
+                sec, key, val = m.groups()
+                sections.setdefault(sec, {})[key] = val
+        dhcp = []
+        for name, attrs in sections.items():
+            if attrs.get("interface"):
+                dhcp.append({
+                    "vlan_id": name.replace("vlan_", "") if name.startswith("vlan_") else name,
+                    "iface": attrs.get("interface", ""),
+                    "start": int(attrs.get("start", 100)),
+                    "limit": int(attrs.get("limit", 150)),
+                    "lease_time": attrs.get("lease_time", "12h"),
+                    "enabled": True
+                })
+        return dhcp
     finally:
         c.close()
 
@@ -2339,7 +2391,47 @@ async def apply_dns(request: Request):
         if status != 0:
             raise RuntimeError(f"DNS config failed on {dev['name']}: {(err or out)[:200]}")
         log_action(dev, 'dns', f'servers={",".join(servers)}', ok=True)
+        # Save to DB
+        execute("""INSERT INTO dns(device_id, servers, search_domains, ts)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(device_id) DO UPDATE SET
+                     servers=excluded.servers, search_domains=excluded.search_domains, ts=excluded.ts""",
+                (dev["id"], ",".join(servers), ",".join(search_domains), now()))
         return {"device": dev["name"], "ok": True, "servers": servers}
+    finally:
+        c.close()
+
+
+@app.get("/api/dns")
+def dns_read(did: int):
+    """Saved + live DNS config for a device."""
+    dev = _require_device(did)
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "DNS read requires SSH access on this device")
+    return {"saved": _saved_dns_rows(dev["id"]), "live": _read_live_dns(dev)}
+
+def _saved_dns_rows(device_id):
+    rows = q("SELECT * FROM dns WHERE device_id=?", (device_id,))
+    if rows:
+        return {"servers": rows[0]["servers"].split(","), "search_domains": rows[0]["search_domains"].split(",")}
+    return {"servers": [], "search_domains": []}
+
+def _read_live_dns(dev):
+    """Read live DNS config from dnsmasq UCI."""
+    c = _ssh_connect(dev)
+    try:
+        out, _err, _st = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
+        servers = []
+        search_domains = []
+        for line in out.splitlines():
+            m = __import__('re').match(r"^dhcp\.@dnsmasq\[\d+\]\.(\w+)='?([^']*)'?$", line.strip())
+            if m:
+                key, val = m.groups()
+                if key == "server":
+                    servers.append(val)
+                elif key == "search":
+                    search_domains.append(val)
+        return {"servers": servers, "search_domains": search_domains}
     finally:
         c.close()
 
