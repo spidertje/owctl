@@ -321,30 +321,22 @@ async function renderNet(){
   // VLANs
   const v=document.createElement('section'); v.id='net-vlans';
   v.style.marginBottom='20px'; el.appendChild(v);
-  const tmp=document.getElementById('tab-vlans'); const saved=renderVlans;
-  try{ await saved(); }catch(e){ v.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
-  if(tmp){ v.innerHTML = tmp.innerHTML; tmp.innerHTML=''; }
+  try{ await renderVlans(v); }catch(e){ v.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
 
   // QoS
   const q=document.createElement('section'); q.id='net-qos';
   q.style.marginBottom='20px'; el.appendChild(q);
-  try{ await renderQos(); q.innerHTML = document.getElementById('tab-qos').innerHTML;
-     document.getElementById('tab-qos').innerHTML=''; }
-  catch(e){ q.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+  try{ await renderQos(q); }catch(e){ q.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
 
   // Firewall
   const f=document.createElement('section'); f.id='net-firewall';
   f.style.marginBottom='20px'; el.appendChild(f);
-  try{ await renderFirewall(); f.innerHTML = document.getElementById('tab-firewall').innerHTML;
-     document.getElementById('tab-firewall').innerHTML=''; }
-  catch(e){ f.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+  try{ await renderFirewall(f); }catch(e){ f.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
 
   // WiFi
   const w=document.createElement('section'); w.id='net-wifi';
   el.appendChild(w);
-  try{ await renderWifi(); w.innerHTML = document.getElementById('tab-wifi').innerHTML;
-     document.getElementById('tab-wifi').innerHTML=''; }
-  catch(e){ w.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+  try{ await renderWifi(w); }catch(e){ w.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
 }
 
 async function renderDevices(){
@@ -1083,8 +1075,8 @@ async function loadLogs(){
   }catch(e){out.innerHTML=`<p style="color:var(--bad)">Error: ${esc(e.message)}</p>`}
 }
 
-async function renderVlans(){
-  const el=document.getElementById('tab-vlans');
+async function renderVlans(target){
+  const el=target||document.getElementById('tab-vlans');
   const devs=await api('/devices');
   const cfg=await api('/settings').catch(()=>({}));
   const gwId=cfg.network_gateway;
@@ -1137,8 +1129,8 @@ async function applyVlan(){
 }
 
 /* ─────────────────────────── QoS tab ─────────────────────────── */
-async function renderQos(){
-  const el=document.getElementById('tab-qos');
+async function renderQos(target){
+  const el=target||document.getElementById('tab-qos');
   el.innerHTML='<p class="muted">Loading…</p>';
   let devs;
   try{ devs=await api('/devices'); }catch(e){ el.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; return; }
@@ -1218,8 +1210,8 @@ async function applyQos(){
 }
 
 /* ─────────────────────────── Firewall tab ─────────────────────────── */
-async function renderFirewall(){
-  const el=document.getElementById('tab-firewall');
+async function renderFirewall(target){
+  const el=target||document.getElementById('tab-firewall');
   el.innerHTML='<p class="muted">Loading…</p>';
   let devs;
   try{ devs=await api('/devices'); }catch(e){ el.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; return; }
@@ -1336,9 +1328,9 @@ async function fwDelRule(name){
   catch(e){ fwResult(String(e),true); toast(String(e),true); }
 }
 
-async function renderWifi(){
+async function renderWifi(target){
   (async()=>{
-    const el=document.getElementById('tab-wifi');
+    const el=target||document.getElementById('tab-wifi');
     const devs=await api('/devices');
     const wifi_devs = devs.filter(d =>
         d.wifi_capable === true ||
@@ -1428,7 +1420,7 @@ async function cloneWifiModal(srcId){
       let resHtml='<div style="margin-top:10px;font-size:12px">';
       for(const res of r.results){
         if(res.ok){
-          resHtml+=`<div style="color:var(--ok)">✓ ${esc(res.name)}: ${esc((res.applied||[]).join(', ')||\'applied\')}</div>`;
+          resHtml+=`<div style="color:var(--ok)">✓ ${esc(res.name)}: ${esc((res.applied||[]).join(', ')||'applied')}</div>`;
           if(res.skipped&&res.skipped.length) resHtml+=`<div style="color:var(--warn)">  skipped: ${esc(res.skipped.join(', '))}</div>`;
         } else {
           resHtml+=`<div style="color:var(--bad)">✗ ${esc(res.name||res.target_id)}: ${esc(res.detail)}</div>`;
