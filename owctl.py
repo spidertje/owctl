@@ -2236,6 +2236,76 @@ async def apply_vlan(request: Request):
                 (str(vlan_id), name, subnet, 1 if dhcp else 0, now()))
     return {"results": results}
 
+@app.post("/api/dhcp/apply")
+async def apply_dhcp(request: Request):
+    """Apply DHCP config to a VLAN interface on a device."""
+    d = await request.json()
+    did = d.get("did")
+    vlan_id = d.get("vlan_id")
+    iface = d.get("interface", f"vlan_{vlan_id}")
+    start = d.get("start", 100)
+    limit = d.get("limit", 150)
+    lease_time = d.get("lease_time", "12h")
+    enabled = d.get("enabled", True)
+    if not did or not vlan_id:
+        raise HTTPException(400, "did and vlan_id required")
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    dev = cur[0]
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "DHCP config requires SSH access")
+    c = _ssh_connect(dev)
+    try:
+        if enabled:
+            cmd = f"""uci set dhcp.{iface}=dhcp
+uci set dhcp.{iface}.interface='{iface}'
+uci set dhcp.{iface}.start='{start}'
+uci set dhcp.{iface}.limit='{limit}'
+uci set dhcp.{iface}.lease_time='{lease_time}'
+uci commit dhcp
+/etc/init.d/dnsmasq reload
+"""
+        else:
+            cmd = f"""uci delete dhcp.{iface}
+uci commit dhcp
+/etc/init.d/dnsmasq reload
+"""
+        stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
+        out = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace")
+        status = stdout.channel.recv_exit_status()
+        if status != 0:
+            raise RuntimeError(f"DHCP config failed on {dev['name']}: {(err or out)[:200]}")
+        log_action(dev, 'dhcp', f'vlan={vlan_id} enabled={enabled}', ok=True)
+        return {"device": dev["name"], "ok": True}
+    finally:
+        c.close()
+
+@app.get("/api/dhcp/leases")
+async def get_dhcp_leases(request: Request):
+    """Get DHCP leases from a device."""
+    did = request.query_params.get("did")
+    if not did:
+        raise HTTPException(400, "did required")
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    dev = cur[0]
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "DHCP leases require SSH access")
+    c = _ssh_connect(dev)
+    try:
+        _, out, _ = _exec_capture(c, "cat /tmp/dhcp.leases 2>/dev/null", timeout=10)
+        leases = []
+        for line in out.strip().splitlines():
+            p = line.split()
+            if len(p) >= 4:
+                leases.append({"mac": p[1], "ip": p[2], "hostname": p[3] if len(p) > 3 else ""})
+        return {"device": dev["name"], "leases": leases}
+    finally:
+        c.close()
+
 
 @app.get("/api/vlans")
 def list_vlans():

@@ -412,6 +412,11 @@ const NET_TEMPLATES = {
     {id:'iot', label:'IoT Devices', desc:'Isolated IoT, no internet access', payload:{vlan_id:20, name:'IoT Devices', subnet:'192.168.20.0/24', dhcp:true}},
     {id:'kids', label:'Kids / Parental', desc:'Filtered DNS, time schedules', payload:{vlan_id:30, name:'Kids', subnet:'192.168.30.0/24', dhcp:true}},
   ],
+  dhcp: [
+    {id:'standard', label:'Standard DHCP', desc:'Start 100, limit 150, 12h lease', payload:{vlan_id:10, enabled:true, start:100, limit:150, lease_time:'12h'}},
+    {id:'large', label:'Large Pool', desc:'Start 100, limit 500, 24h lease', payload:{vlan_id:10, enabled:true, start:100, limit:500, lease_time:'24h'}},
+    {id:'disabled', label:'Disable DHCP', desc:'Static IPs only on this VLAN', payload:{vlan_id:10, enabled:false}},
+  ],
   qos: [
     {id:'gaming', label:'Gaming', desc:'Low latency priority', payload:{enabled:true, interface:'wan', download_kbps:0, upload_kbps:0, qdisc:'cake', ecn:true, install_if_missing:true}},
     {id:'video', label:'Video Calls', desc:'Prioritize upload for calls', payload:{enabled:true, interface:'wan', download_kbps:0, upload_kbps:0, qdisc:'cake', ecn:true, install_if_missing:true}},
@@ -1255,6 +1260,31 @@ async function renderVlans(target){
     </div>`;
   }
   html+=`<div id="vlan-results" style="margin-top:16px"></div>`;
+  
+  // DHCP Section
+  html+=`<h2 style="margin-top:32px">DHCP Server</h2>
+    <p class="muted">Configure DHCP pools for VLAN interfaces. Runs on the router device.</p>
+    ${netTemplatePills('dhcp')}`;
+  if(NET_ADVANCED){
+    html+=`<div class="card">
+      <h3>Configure DHCP</h3>
+      <div class="row" style="margin-bottom:12px">
+        <div><label>VLAN ID</label><input id="dhcp-vlan" type="number" min="1" max="4094" value="10" style="width:80px"></div>
+        <div><label>Interface</label><input id="dhcp-iface" placeholder="vlan_10" style="width:140px"></div>
+        <div style="display:flex;align-items:flex-end">
+          <label style="margin:0 8px 0 0"><input type="checkbox" id="dhcp-enabled" checked> Enabled</label>
+        </div>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <div><label>Start</label><input id="dhcp-start" type="number" min="1" max="253" value="100" style="width:80px"></div>
+        <div><label>Limit</label><input id="dhcp-limit" type="number" min="1" max="253" value="150" style="width:80px"></div>
+        <div><label>Lease Time</label><input id="dhcp-lease" value="12h" style="width:100px"></div>
+      </div>
+      <button class="act pri" onclick="applyDhcp()">Apply DHCP</button>
+    </div>`;
+  }
+  html+=`<div id="dhcp-results" style="margin-top:16px"></div>`;
+  
   el.innerHTML=html;
 }
 async function applyVlan(){
@@ -1275,6 +1305,24 @@ async function applyVlan(){
   }catch(e){
     document.getElementById('vlan-results').innerHTML=`<div class="card" style="border-color:var(--bad)"><strong>Failed</strong><br>${esc(String(e))}</div>`;
     toast(String(e),true);
+  }
+}
+
+async function applyDhcp(){
+  const did=document.querySelector('#qos-did')?.value || document.querySelector('#fw-did')?.value;
+  if(!did){toast('No SSH device available',true);return}
+  const vlan_id=parseInt(document.getElementById('dhcp-vlan').value);
+  const iface=document.getElementById('dhcp-iface').value||'vlan_'+vlan_id;
+  const start=parseInt(document.getElementById('dhcp-start').value);
+  const limit=parseInt(document.getElementById('dhcp-limit').value);
+  const lease_time=document.getElementById('dhcp-lease').value;
+  const enabled=document.getElementById('dhcp-enabled').checked;
+  try{
+    toast('Applying DHCP...');
+    const r=await api('/dhcp/apply',{method:'POST',body:JSON.stringify({did:parseInt(did),vlan_id,iface,start,limit,lease_time,enabled})});
+    document.getElementById('dhcp-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>DHCP applied</strong> on ${r.device}</div>`;
+  }catch(e){
+    document.getElementById('dhcp-results').innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(e.message||e)}</div>`;
   }
 }
 
