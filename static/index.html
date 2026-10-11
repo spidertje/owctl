@@ -114,17 +114,14 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
 <header>
   <h1>ow<span>ctl</span> <span class="pill">OpenWrt control + threat watch</span></h1>
   <nav>
-    <button data-tab="network" class="on">Network</button>
-    <button data-tab="devices">Devices</button>
-    <button data-tab="threats">Threats</button>
-    <button data-tab="sweep">Sweep</button>
-    <button data-tab="alerts">Alerting</button>
-    <button data-tab="map">Network Map</button>
-    <button data-tab="wifi">WiFi</button>
-    <button data-tab="vlans">VLANs</button>
-    <button data-tab="qos">QoS</button>
-    <button data-tab="firewall">Firewall</button>
-    <button data-tab="logs">Device Logs</button>
+    <button data-tab="network" class="on">Home</button>
+       <button data-tab="devices">Devices</button>
+       <button data-tab="threats">Threats</button>
+       <button data-tab="sweep">Sweep</button>
+       <button data-tab="alerts">Alerting</button>
+       <button data-tab="map">Network Map</button>
+       <button data-tab="net">Network</button>
+       <button data-tab="logs">Device Logs</button>
   </nav>
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
 </header>
@@ -135,10 +132,8 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <section id="tab-sweep" style="display:none"></section>
   <section id="tab-alerts" style="display:none"></section>
   <section id="tab-map" style="display:none"></section>
+  <section id="tab-net" style="display:none"></section>
   <section id="tab-wifi" style="display:none"></section>
-  <section id="tab-vlans" style="display:none"></section>
-  <section id="tab-qos" style="display:none"></section>
-  <section id="tab-firewall" style="display:none"></section>
   <section id="tab-logs" style="display:none"></section>
 </main>
 <div id="toast"></div>
@@ -174,9 +169,7 @@ function render(tab){
   if(tab==='alerts')return renderAlerts();
   if(tab==='map')return renderMap();
   if(tab==='logs')return renderLogs();
-  if(tab==='vlans')return renderVlans();
-  if(tab==='qos')return renderQos();
-  if(tab==='firewall')return renderFirewall();
+  if(tab==='net')return renderNet();
   if(tab==='wifi')return renderWifi();
 }
 function fmtUptime(s){if(!s&&s!==0)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
@@ -247,10 +240,6 @@ async function renderNetwork() {
 
     html += `<div class="grid" style="margin-top:20px">
       <div class="card">
-        <h3>VLANs</h3>
-        ${net.vlans.length ? net.vlans.map(v => `<div class="kv"><span>${esc(v.name)} (ID ${v.id})</span><span>${esc(v.subnet)} ${v.dhcp?'(DHCP)':''}</span></div>`).join('') : '<p class="muted">No VLANs detected.</p>'}
-      </div>
-      <div class="card">
         <h3>Recent Offline</h3>
         ${net.recent_offline.length ? net.recent_offline.map(r => `<div class="kv"><span>${esc(r.device_name)}</span><span class="bad">${fmtUptime(r.offline_seconds)} ago</span></div>`).join('') : '<p class="muted">None.</p>'}
       </div>
@@ -298,6 +287,64 @@ async function setGateway(id) {
     toast('Gateway updated');
     renderNetwork();
   } catch(e) { toast(String(e), true); }
+}
+
+/* ─────────────────────────── Network tab (VLAN · QoS · Firewall · WiFi) ──
+   ponytail: one tab groups all per-device network config so the home page
+   stays a summary. Sub-panels are lazy: each calls its existing render fn
+   against its own section element. */
+async function renderNet(){
+  const el=document.getElementById('tab-net');
+  el.innerHTML='<p class="muted">Loading network configuration…</p>';
+  let html=`<h2>Network</h2>
+    <p class="muted">VLANs, traffic shaping, firewall rules and WiFi — per device.</p>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="card" style="cursor:pointer" onclick="document.getElementById('net-vlans').scrollIntoView({behavior:'smooth'})">
+        <h3>VLANs <span class="pill">→</span></h3>
+        <p class="small muted">Create, apply and discover VLANs across the fleet.</p>
+      </div>
+      <div class="card" style="cursor:pointer" onclick="document.getElementById('net-qos').scrollIntoView({behavior:'smooth'})">
+        <h3>QoS / SQM <span class="pill">→</span></h3>
+        <p class="small muted">Traffic shaping (fq_codel / cake) per device.</p>
+      </div>
+      <div class="card" style="cursor:pointer" onclick="document.getElementById('net-firewall').scrollIntoView({behavior:'smooth'})">
+        <h3>Firewall <span class="pill">→</span></h3>
+        <p class="small muted">Port forwards, inter-zone rules and zone policies.</p>
+      </div>
+      <div class="card" style="cursor:pointer" onclick="document.getElementById('net-wifi').scrollIntoView({behavior:'smooth'})">
+        <h3>WiFi <span class="pill">→</span></h3>
+        <p class="small muted">Guest SSIDs, encryption and VLAN binding.</p>
+      </div>
+    </div>`;
+  el.innerHTML=html;
+
+  // VLANs
+  const v=document.createElement('section'); v.id='net-vlans';
+  v.style.marginBottom='20px'; el.appendChild(v);
+  const tmp=document.getElementById('tab-vlans'); const saved=renderVlans;
+  try{ await saved(); }catch(e){ v.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+  if(tmp){ v.innerHTML = tmp.innerHTML; tmp.innerHTML=''; }
+
+  // QoS
+  const q=document.createElement('section'); q.id='net-qos';
+  q.style.marginBottom='20px'; el.appendChild(q);
+  try{ await renderQos(); q.innerHTML = document.getElementById('tab-qos').innerHTML;
+     document.getElementById('tab-qos').innerHTML=''; }
+  catch(e){ q.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+
+  // Firewall
+  const f=document.createElement('section'); f.id='net-firewall';
+  f.style.marginBottom='20px'; el.appendChild(f);
+  try{ await renderFirewall(); f.innerHTML = document.getElementById('tab-firewall').innerHTML;
+     document.getElementById('tab-firewall').innerHTML=''; }
+  catch(e){ f.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+
+  // WiFi
+  const w=document.createElement('section'); w.id='net-wifi';
+  el.appendChild(w);
+  try{ await renderWifi(); w.innerHTML = document.getElementById('tab-wifi').innerHTML;
+     document.getElementById('tab-wifi').innerHTML=''; }
+  catch(e){ w.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
 }
 
 async function renderDevices(){
@@ -1290,56 +1337,113 @@ async function fwDelRule(name){
 }
 
 async function renderWifi(){
-  const el=document.getElementById('tab-wifi');
-  const devs=await api('/devices');
-  // Only show devices that can actually host WiFi:
-  //   - wifi_capable is the DETECTED radio capability (from `uci show wireless`
-  //     at last check) — true means a radio, false means none. A router with no
-  //     radio is correctly hidden even though its role is 'router'.
-  //   - If a device has never been checked (wifi_capable null), fall back to
-  //     role 'ap' so a freshly-added AP still shows before its first check.
-  const wifi_devs = devs.filter(d =>
-      d.wifi_capable === true ||
-      (d.wifi_capable === null && (d.role || '').toLowerCase() === 'ap'));
-  const vlans=await api('/vlans').catch(()=>[]);
-  let html=`<h2>WiFi Configuration</h2>
-    <p class="muted">Configure guest WiFi networks on each wireless-capable device. Set SSID, password, and optionally bind to a VLAN.</p>`;
-  if(!wifi_devs.length){
-    html+=`<p class="muted">No wireless-capable devices found. Add an AP device to configure WiFi.</p>`;
+  (async()=>{
+    const el=document.getElementById('tab-wifi');
+    const devs=await api('/devices');
+    const wifi_devs = devs.filter(d =>
+        d.wifi_capable === true ||
+        (d.wifi_capable === null && (d.role || '').toLowerCase() === 'ap'));
+    let html=`<h2>WiFi Configuration</h2>
+      <p class="muted">Configured wireless networks across all capability-detected devices. Clone transfers networks to other devices, auto-matching radio bands.</p>`;
+    if(!wifi_devs.length){
+      html+=`<p class="muted">No wireless-capable devices found.</p>`;
+      el.innerHTML=html;
+      return;
+    }
+    html+=`<div class="grid">`;
+    for(const d of wifi_devs){
+      html+=`<div class="card">
+        <h3>${esc(d.name)} <span class="badge b-${d.status}">${d.status}</span></h3>
+        <div class="kv"><span>Host</span><span>${esc(d.host)}</span></div>
+        <div id="wifi-config-${d.id}"><p class="small muted">Loading…</p></div>
+        <div class="row fsec">
+          <button class="act pri" onclick="editWifi(${d.id})">+ Add Guest WiFi</button>
+          <button class="act" onclick="cloneWifiModal(${d.id})">Clone to others…</button>
+        </div>
+      </div>`;
+    }
+    html+=`</div>`;
     el.innerHTML=html;
-    return;
-  }
-  html+=`<div class="grid">`;
-  for(const d of wifi_devs){
-    html+=`<div class="card">
-      <h3>${esc(d.name)} <span class="badge b-${d.status}">${d.status}</span></h3>
-      <div class="kv"><span>IP</span><span>${esc(d.host)}</span></div>
-      <div id="wifi-config-${d.id}"><p class="small muted">Loading…</p></div>
-      <button class="act pri" style="margin-top:12px" onclick="editWifi(${d.id})">Configure WiFi</button>
-    </div>`;
-  }
-  html+=`</div>`;
-  el.innerHTML=html;
-  // Pre-load current config for each device
-  for(const d of wifi_devs){
+
+    for(const d of wifi_devs){
+      try{
+        const cfg=await api(`/devices/${d.id}/wifi-config`);
+        const box=document.getElementById(`wifi-config-${d.id}`);
+        if(!box)continue;
+        const ifaces=cfg.interfaces||[];
+        if(!ifaces.length){
+          box.innerHTML='<p class="small muted">No SSIDs configured</p>';
+          continue;
+        }
+        let list='<div style="margin:8px 0">';
+        for(const i of ifaces){
+          const b=i.band?` · ${i.band}`:'';
+          const mode=i.mode?` (${i.mode})`:'';
+          list+=`<div class="kv">
+            <span><strong>${esc(i.ssid||i.name)}</strong>${b}</span>
+            <span class="small">${esc(i.encryption||'open')}${mode}</span>
+          </div>`;
+        }
+        list+='</div>';
+        box.innerHTML=list;
+      }catch(e){
+        const box=document.getElementById(`wifi-config-${d.id}`);
+        if(box)box.innerHTML=`<p class="small bad">Error: ${esc(e.message||e)}</p>`;
+      }
+    }
+  })();
+}
+
+async function cloneWifiModal(srcId){
+  const devs=await api('/devices');
+  const src=devs.find(d=>d.id===srcId);
+  if(!src)return;
+  const others=devs.filter(d=>d.id!==srcId && d.access==='ssh');
+  if(!others.length){ toast('No other SSH-accessible devices to clone to', true); return; }
+  const modal=document.createElement('div');
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;min-width:360px;max-width:480px">
+    <h3 style="margin:0 0 8px">Clone WiFi from ${esc(src.name)}</h3>
+    <p class="small muted" style="margin:0 0 14px">Copies all SSIDs/keys onto target devices. Maps 2.4GHz → 2.4GHz radio, 5GHz → 5GHz radio automatically.</p>
+    <div style="margin-bottom:14px">
+      <label>Target devices</label>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-top:6px;max-height:180px;overflow:auto">
+        ${others.map(d=>`<label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="clone-tgt-cb" value="${d.id}" checked> ${esc(d.name)} (${esc(d.host)})</label>`).join('')}
+      </div>
+    </div>
+    <div id="clone-results"></div>
+    <div class="row" style="justify-content:flex-end;gap:8px;margin-top:14px">
+      <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
+      <button class="act pri" id="clone-go">Clone WiFi</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.querySelector('#clone-go').onclick=async()=>{
+    const ids=[...modal.querySelectorAll('.clone-tgt-cb:checked')].map(c=>+c.value);
+    if(!ids.length){ toast('Select at least one target device', true); return; }
+    const btn=modal.querySelector('#clone-go');
+    btn.disabled=true; btn.textContent='Cloning…';
     try{
-      const cfg=await api(`/devices/${d.id}/wifi-config`);
-      const el=document.getElementById(`wifi-config-${d.id}`);
-      if(el){
-        if(cfg&&cfg.ssid){
-          el.innerHTML=`<div class="kv"><span>Current SSID</span><span>${esc(cfg.ssid)}</span></div>
-            <div class="kv"><span>Encrypted</span><span>${cfg.encryption||'no'}</span></div>
-            ${cfg.vlan_id?`<div class="kv"><span>VLAN</span><span>${esc(cfg.vlan_id)}</span></div>`:''}
-            <div class="small muted">Last checked: ${esc(cfg.last_check)}</div>`;
-        }else{
-          el.innerHTML='<p class="small muted">No guest WiFi configured</p>';
+      const r=await api(`/devices/${srcId}/wifi-clone`,{method:'POST',body:JSON.stringify({target_ids:ids})});
+      let resHtml='<div style="margin-top:10px;font-size:12px">';
+      for(const res of r.results){
+        if(res.ok){
+          resHtml+=`<div style="color:var(--ok)">✓ ${esc(res.name)}: ${esc((res.applied||[]).join(', ')||\'applied\')}</div>`;
+          if(res.skipped&&res.skipped.length) resHtml+=`<div style="color:var(--warn)">  skipped: ${esc(res.skipped.join(', '))}</div>`;
+        } else {
+          resHtml+=`<div style="color:var(--bad)">✗ ${esc(res.name||res.target_id)}: ${esc(res.detail)}</div>`;
         }
       }
+      resHtml+='</div>';
+      modal.querySelector('#clone-results').innerHTML=resHtml;
+      toast('WiFi clone complete');
+      renderWifi();
     }catch(e){
-      const el=document.getElementById(`wifi-config-${d.id}`);
-      if(el)el.innerHTML='<p class="small muted">Unable to fetch config</p>';
+      toast(String(e), true);
     }
-  }
+    btn.disabled=false; btn.textContent='Clone WiFi';
+  };
+  modal.onclick=e=>{if(e.target===modal)modal.remove()};
 }
 function vlanOpt(v){
   const label='VLAN '+v.id+(v.subnet?` (${v.subnet})`:'');

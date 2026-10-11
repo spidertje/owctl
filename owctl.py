@@ -139,6 +139,11 @@ def init_db():
         execute("ALTER TABLE device_status ADD COLUMN wifi_capable INTEGER")
     except sqlite3.OperationalError:
         pass
+    # Idempotent migration for databases created before the tags column existed.
+    try:
+        execute("ALTER TABLE devices ADD COLUMN tags TEXT")
+    except sqlite3.OperationalError:
+        pass
     # Role normalization: roles are the lowercase enum router/ap/switch/other.
     # Idempotent migration for any rows added before this code shipped.
     try:
@@ -2569,38 +2574,166 @@ async def device_guest_wifi(request: Request, did: int):
 
 @app.get("/api/devices/{did}/wifi-config")
 def get_wifi_config(did: int):
-    """Get current WiFi configuration for a device."""
+    """Get current WiFi configuration for a device: every wifi-iface section
+    (device, ssid, encryption, key presence, network, mode), not just guest ones."""
     cur = q("SELECT * FROM devices WHERE id=?", (did,))
     if not cur:
         raise HTTPException(404, "device not found")
     dev = cur[0]
     c = _ssh_connect(dev)
     try:
-        stdin, stdout, stderr = c.exec_command("uci show wireless 2>/dev/null | grep -E 'guest|ssid|key'", timeout=10)
-        out = stdout.read().decode()
-        if not out or 'wifi-iface' not in out:
-            return {"ssid": None, "encryption": None, "vlan_id": None, "last_check": datetime.now(timezone.utc).isoformat()}
-        lines = out.strip().split('\n')
-        ssid = None
-        encryption = None
-        vlan_id = None
-        for line in lines:
-            if '.ssid=' in line and 'guest' in line.lower():
-                ssid = line.split("=")[1].strip("'\"")
-            elif '.encryption=' in line and 'guest' in line.lower():
-                encryption = line.split("=")[1].strip("'\"")
-            elif '.network=' in line and 'guest' in line.lower():
-                net = line.split("=")[1].strip("'\"")
-                if net.startswith('vlan_'):
-                    vlan_id = net.replace('vlan_', '')
-        return {
-            "ssid": ssid,
-            "encryption": encryption,
-            "vlan_id": vlan_id,
-            "last_check": datetime.now(timezone.utc).isoformat()
-        }
+        out, _err, _st = _exec_capture(c, "uci show wireless 2>/dev/null", timeout=10)
+        ifaces = _parse_wifi_ifaces(out)
+        return {"interfaces": ifaces, "ssid": (ifaces[0]["ssid"] if ifaces else None),
+                "encryption": (ifaces[0]["encryption"] if ifaces else None),
+                "vlan_id": None, "last_check": datetime.now(timezone.utc).isoformat()}
     finally:
         c.close()
+
+
+def _parse_wifi_ifaces(show_out):
+    """Parse `uci show wireless` into radios {name: band} and iface list.
+    Pure + testable. Band comes from .band= (2g/5g/6g) or .hwmode= legacy."""
+    radios, ifaces = {}, []
+    for line in (show_out or "").splitlines():
+        line = line.strip()
+        m = re.match(r"wireless\.([A-Za-z0-9_]+)=wifi-device$", line)
+        if m:
+            radios.setdefault(m.group(1), {})
+            continue
+        m = re.match(r"wireless\.([A-Za-z0-9_]+)=wifi-iface$", line)
+        if m:
+            ifaces.append({"name": m.group(1), "device": None, "ssid": "", "encryption": "",
+                           "has_key": False, "key": "", "network": "", "mode": ""})
+            continue
+        m = re.match(r"wireless\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)='?(.*?)'?$", line)
+        if m:
+            name, key, val = m.group(1), m.group(2), m.group(3)
+            if name in radios and key in ("band", "hwmode", "channel", "htmode"):
+                radios[name][key] = val
+            else:
+                for i in ifaces:
+                    if i["name"] == name:
+                        if key == "key":
+                            i["has_key"] = bool(val)
+                            i["key"] = val
+                        elif key in ("device", "ssid", "encryption", "network", "mode"):
+                            i[key] = val
+                        break
+    band = {}
+    for r, a in radios.items():
+        b = a.get("band") or {"11g": "2g", "11a": "5g", "11ad": "60g"}.get(a.get("hwmode", ""), "")
+        band[r] = b
+    for i in ifaces:
+        i["band"] = band.get(i["device"] or "", "")
+    return ifaces
+
+
+def _wifi_radios(dev):
+    """Return {radio_name: band} for a device (SSH)."""
+    c = _ssh_connect(dev)
+    try:
+        out, _e, _s = _exec_capture(c, "uci show wireless 2>/dev/null", timeout=10)
+        return {r: a.get("band") or a.get("hwmode", "")
+                for r, a in _parse_wifi_radios(out).items()}
+    finally:
+        c.close()
+
+
+def _parse_wifi_radios(show_out):
+    radios = {}
+    for line in (show_out or "").splitlines():
+        line = line.strip()
+        m = re.match(r"wireless\.([A-Za-z0-9_]+)=wifi-device$", line)
+        if m:
+            radios.setdefault(m.group(1), {})
+            continue
+        m = re.match(r"wireless\.([A-Za-z0-9_]+)\.(band|hwmode)='?(.*?)'?$", line)
+        if m and m.group(1) in radios:
+            radios[m.group(1)][m.group(2)] = m.group(3)
+    return radios
+
+
+@app.post("/api/devices/{did}/wifi-clone")
+async def wifi_clone(request: Request, did: int):
+    """Clone the WiFi config of device `did` onto other devices, adapting to
+    target hardware: each source wifi-iface is mapped to a target radio of the
+    same band (2g/5g/6g). If the target has no matching band, the iface is
+    skipped and reported. Ifaces are upserted under a stable per-SSID section
+    name, so re-running updates rather than duplicating."""
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    src = cur[0]
+    body = await request.json()
+    targets = body.get("target_ids") or []
+    if not targets:
+        raise HTTPException(400, "target_ids required")
+    c = _ssh_connect(src)
+    try:
+        out, _e, _s = _exec_capture(c, "uci show wireless 2>/dev/null", timeout=10)
+    finally:
+        c.close()
+    ifaces = [i for i in _parse_wifi_ifaces(out) if i.get("mode") == "ap" or not i.get("mode")]
+    if not ifaces:
+        raise HTTPException(400, f"{src['name']} has no wifi-iface sections to clone")
+    results = []
+    for tid in targets:
+        tcur = q("SELECT * FROM devices WHERE id=?", (tid,))
+        if not tcur:
+            results.append({"target_id": tid, "ok": False, "detail": "device not found"})
+            continue
+        t = tcur[0]
+        if t["access"] != "ssh":
+            results.append({"target_id": tid, "name": t["name"], "ok": False,
+                            "detail": "target needs SSH access"})
+            continue
+        try:
+            radios = _wifi_radios(t)
+            if not radios:
+                results.append({"target_id": tid, "name": t["name"], "ok": False,
+                                "detail": "target has no wireless radios"})
+                continue
+            applied, skipped = [], []
+            cc = _ssh_connect(t)
+            try:
+                for i in ifaces:
+                    want = i.get("band") or ""
+                    radio = next((r for r, b in radios.items() if b == want), None) \
+                        if want else None
+                    if radio is None and want:
+                        skipped.append(f"{i['ssid']} (no {want} radio)")
+                        continue
+                    radio = radio or next(iter(radios))
+                    name = "clone_" + re.sub(r"\W+", "_", i["ssid"] or "iface")[:24]
+                    slug = name
+                    key = i.get("key", "")
+                    cmd = (f"uci set wireless.{slug}=wifi-iface\n"
+                           f"uci set wireless.{slug}.device='{radio}'\n"
+                           f"uci set wireless.{slug}.mode='ap'\n"
+                           f"uci set wireless.{slug}.ssid='{i['ssid']}'\n")
+                    if key:
+                        cmd += f"uci set wireless.{slug}.key='{key}'\n"
+                    if i.get("encryption"):
+                        cmd += f"uci set wireless.{slug}.encryption='{i['encryption']}'\n"
+                    if i.get("network"):
+                        cmd += f"uci set wireless.{slug}.network='{i['network']}'\n"
+                    cmd += "uci commit wireless\nwifi reload\n"
+                    o, e, st = _exec_capture(cc, cmd, timeout=30)
+                    if st != 0:
+                        skipped.append(f"{i['ssid']} (uci failed: {(e or o)[:80]})")
+                    else:
+                        applied.append(f"{i['ssid']} → {radio}")
+            finally:
+                cc.close()
+            results.append({"target_id": tid, "name": t["name"], "ok": True,
+                            "applied": applied, "skipped": skipped})
+            log_action(t, 'wifi_clone', f'source={src["name"]} applied={len(applied)} skipped={len(skipped)}',
+                       ok=True)
+        except Exception as e:
+            results.append({"target_id": tid, "name": t["name"], "ok": False, "detail": str(e)})
+    log_action(src, 'wifi_clone', f'targets={len(targets)}', ok=True)
+    return {"source": src["name"], "results": results}
 
 
 @app.post("/api/devices/{did}/upgrade")
