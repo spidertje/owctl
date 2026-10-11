@@ -1229,8 +1229,9 @@ async function renderVlans(target){
   const gwId=cfg.network_gateway;
   const router=devs.find(d=>d.id===gwId)||devs.find(d=>d.role==='router')||devs[0];
   let html=`${netTemplatePills('vlans')}<h2>VLAN Configuration</h2>
-    <p class="muted">Create and manage VLANs across your network. Each VLAN isolates devices into separate broadcast domains.</p>
-    <div class="card">
+    <p class="muted">Create and manage VLANs across your network. Each VLAN isolates devices into separate broadcast domains.</p>`;
+  if(NET_ADVANCED){
+    html+=`<div class="card">
       <h3>Create New VLAN</h3>
       <div class="row" style="margin-bottom:12px">
         <div><label>VLAN ID</label><input id="vlan-id" type="number" min="1" max="4094" value="10" style="width:80px"></div>
@@ -1250,8 +1251,9 @@ async function renderVlans(target){
         </div>
       </div>
       <button class="act pri" onclick="applyVlan()">Apply VLAN</button>
-    </div>
-    <div id="vlan-results" style="margin-top:16px"></div>`;
+    </div>`;
+  }
+  html+=`<div id="vlan-results" style="margin-top:16px"></div>`;
   el.innerHTML=html;
 }
 async function applyVlan(){
@@ -1288,10 +1290,10 @@ async function renderQos(target){
   try{ const r=await api(`/qos?did=${did}`); saved=r.saved; live=r.live; }
   catch(e){ err=String(e); }
   const src=saved||live||{};
-  el.innerHTML=`${netTemplatePills('qos')}
-  <h2>QoS / SQM</h2>
-  <p class="muted">Traffic shaping via SQM (fq_codel or cake). Speeds in kbit/s. Requires SSH access.</p>
-  <div class="row" style="margin-bottom:16px">
+  let html=`${netTemplatePills('qos')}<h2>QoS / SQM</h2>
+  <p class="muted">Traffic shaping via SQM (fq_codel or cake). Speeds in kbit/s. Requires SSH access.</p>`;
+  if(NET_ADVANCED){
+    html+=`<div class="row" style="margin-bottom:16px">
     <div style="flex:1"><label>Device</label>
       <select id="qos-did" onchange="qosReload()" style="width:100%">
         ${sshDevs.map(d=>`<option value="${d.id}" ${d.id===did?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}
@@ -1330,8 +1332,10 @@ async function renderQos(target){
       <button class="act pri" onclick="applyQos()">Apply QoS</button>
       <span class="muted" style="margin-left:8px">commits + restarts SQM</span>
     </div>
-  </div>
-  <div id="qos-result" style="margin-top:8px"></div>`;
+  </div>`;
+  }
+  html+=`<div id="qos-result" style="margin-top:8px"></div>`;
+  el.innerHTML=html;
 }
 async function qosReload(){ renderQos(); }
 async function applyQos(){
@@ -1370,10 +1374,11 @@ async function renderFirewall(target){
   const zones=(live&&live.zones)||[];
   const fwd=(live&&live.redirects)||[];
   const rules=(live&&live.rules)||[];
-  el.innerHTML=`${netTemplatePills('firewall')}
+  let html=`${netTemplatePills('firewall')}
   <h2>Firewall</h2>
-  <p class="muted">Port forwards, inter-zone rules and zone policies. Changes commit + reload fw4.</p>
-  <div class="row" style="margin-bottom:16px">
+  <p class="muted">Port forwards, inter-zone rules and zone policies. Changes commit + reload fw4.</p>`;
+  if(NET_ADVANCED){
+    html+=`<div class="row" style="margin-bottom:16px">
     <div style="flex:1"><label>Device</label>
       <select id="fw-did" onchange="fwReload()" style="width:100%">
         ${sshDevs.map(d=>`<option value="${d.id}" ${d.id===did?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}
@@ -1427,8 +1432,10 @@ async function renderFirewall(target){
           <span class="muted" style="font-size:11px">input · forward</span>
         </div>`).join('')||'<span class="muted">no zones</span>'}
     </div>
-  </div>
-  <div id="fw-result" style="margin-top:8px"></div>`;
+  </div>`;
+  }
+  html+=`<div id="fw-result" style="margin-top:8px"></div>`;
+  el.innerHTML=html;
 }
 async function fwReload(){ renderFirewall(); }
 function fwResult(msg,bad){const b=document.getElementById('fw-result');b.innerHTML=`<div class="card" style="border-color:var(--${bad?'bad':'ok'})">${esc(msg)}</div>`;}
@@ -1494,12 +1501,14 @@ async function renderWifi(target){
       html+=`<div class="card">
         <h3>${esc(d.name)} <span class="badge b-${d.status}">${d.status}</span></h3>
         <div class="kv"><span>Host</span><span>${esc(d.host)}</span></div>
-        <div id="wifi-config-${d.id}"><p class="small muted">Loading…</p></div>
-        <div class="row fsec">
+        <div id="wifi-config-${d.id}"><p class="small muted">Loading…</p></div>`;
+      if(NET_ADVANCED){
+        html+=`<div class="row fsec">
           <button class="act pri" onclick="editWifi(${d.id})">+ Add WiFi</button>
           <button class="act" onclick="cloneWifiModal(${d.id})">Clone to others…</button>
-        </div>
-      </div>`;
+        </div>`;
+      }
+      html+=`</div>`;
     }
     html+=`</div>`;
     el.innerHTML=html;
