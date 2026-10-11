@@ -50,6 +50,7 @@ main{padding:18px 20px;max-width:1200px;margin:0 auto}
 .b-bad{background:#4a1020;color:var(--crit)} .b-error{background:#4a1020;color:var(--crit)}
 .bad{color:var(--bad)}
 button.act{background:var(--panel2);color:var(--tx);border:1px solid var(--line);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:13px}
+.act[style*="flex-direction:column"]{flex-direction:column;align-items:flex-start;text-align:left;min-width:140px;padding:10px 12px}
 button.act:hover{border-color:var(--acc)}
 button.pri{background:#1c4d8f;border-color:#2f6fc0}
 input,select{background:#0d1322;border:1px solid var(--line);color:var(--tx);padding:7px 10px;border-radius:8px;font-size:13px}
@@ -476,8 +477,11 @@ function setNetAdvanced(on){
 function netTemplatePills(type){
   const tpls = NET_TEMPLATES[type] || [];
   if(!NET_ADVANCED && tpls.length){
-    return `<div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px">
-      ${tpls.map(t=>`<button class="act" onclick="applyNetTemplate('${type}','${t.id}')" title="${esc(t.desc)}">${esc(t.label)}</button>`).join('')}
+    return `<div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:flex-start">
+      ${tpls.map(t=>`<button class="act" onclick="applyNetTemplate('${type}','${t.id}')" style="flex-direction:column;align-items:flex-start;text-align:left;min-width:140px">
+        <strong>${esc(t.label)}</strong>
+        <span class="small muted" style="font-weight:normal">${esc(t.desc)}</span>
+      </button>`).join('')}
       <button class="act" onclick="setNetAdvanced(true)" style="margin-left:auto">Advanced →</button>
     </div>`;
   }
