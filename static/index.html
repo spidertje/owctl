@@ -1228,8 +1228,9 @@ async function renderVlans(target){
   const cfg=await api('/settings').catch(()=>({}));
   const gwId=cfg.network_gateway;
   const router=devs.find(d=>d.id===gwId)||devs.find(d=>d.role==='router')||devs[0];
-  let html=`${netTemplatePills('vlans')}<h2>VLAN Configuration</h2>
-    <p class="muted">Create and manage VLANs across your network. Each VLAN isolates devices into separate broadcast domains.</p>`;
+  let html=`<h2>VLAN Configuration</h2>
+    <p class="muted">Create and manage VLANs across your network. Each VLAN isolates devices into separate broadcast domains.</p>
+    ${netTemplatePills('vlans')}`;
   if(NET_ADVANCED){
     html+=`<div class="card">
       <h3>Create New VLAN</h3>
@@ -1290,8 +1291,9 @@ async function renderQos(target){
   try{ const r=await api(`/qos?did=${did}`); saved=r.saved; live=r.live; }
   catch(e){ err=String(e); }
   const src=saved||live||{};
-  let html=`${netTemplatePills('qos')}<h2>QoS / SQM</h2>
-  <p class="muted">Traffic shaping via SQM (fq_codel or cake). Speeds in kbit/s. Requires SSH access.</p>`;
+  let html=`<h2>QoS / SQM</h2>
+  <p class="muted">Traffic shaping via SQM (fq_codel or cake). Speeds in kbit/s. Requires SSH access.</p>
+  ${netTemplatePills('qos')}`;
   if(NET_ADVANCED){
     html+=`<div class="row" style="margin-bottom:16px">
     <div style="flex:1"><label>Device</label>
@@ -1374,9 +1376,9 @@ async function renderFirewall(target){
   const zones=(live&&live.zones)||[];
   const fwd=(live&&live.redirects)||[];
   const rules=(live&&live.rules)||[];
-  let html=`${netTemplatePills('firewall')}
-  <h2>Firewall</h2>
-  <p class="muted">Port forwards, inter-zone rules and zone policies. Changes commit + reload fw4.</p>`;
+  let html=`<h2>Firewall</h2>
+  <p class="muted">Port forwards, inter-zone rules and zone policies. Changes commit + reload fw4.</p>
+  ${netTemplatePills('firewall')}`;
   if(NET_ADVANCED){
     html+=`<div class="row" style="margin-bottom:16px">
     <div style="flex:1"><label>Device</label>
@@ -1489,8 +1491,9 @@ async function renderWifi(target){
     const wifi_devs = devs.filter(d =>
         d.wifi_capable === true ||
         (d.wifi_capable === null && (d.role || '').toLowerCase() === 'ap'));
-    let html=`${netTemplatePills('wifi')}<h2>WiFi Configuration</h2>
-      <p class="muted">Configured wireless networks across all capability-detected devices. Clone transfers networks to other devices, auto-matching radio bands.</p>`;
+    let html=`<h2>WiFi Configuration</h2>
+      <p class="muted">Configured wireless networks across all capability-detected devices. Clone transfers networks to other devices, auto-matching radio bands.</p>
+      ${netTemplatePills('wifi')}`;
     if(!wifi_devs.length){
       html+=`<p class="muted">No wireless-capable devices found.</p>`;
       el.innerHTML=html;
