@@ -2306,6 +2306,43 @@ async def get_dhcp_leases(request: Request):
     finally:
         c.close()
 
+@app.post("/api/dns/apply")
+async def apply_dns(request: Request):
+    """Apply DNS servers to a device's dnsmasq config."""
+    d = await request.json()
+    did = d.get("did")
+    servers = d.get("servers", [])
+    search_domains = d.get("search_domains", [])
+    if not did:
+        raise HTTPException(400, "did required")
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    dev = cur[0]
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "DNS config requires SSH access")
+    c = _ssh_connect(dev)
+    try:
+        lines = ["uci delete dhcp.@dnsmasq[0] 2>/dev/null || true",
+                 "uci set dhcp.@dnsmasq[0]=dnsmasq"]
+        for i, srv in enumerate(servers):
+            lines.append(f"uci add_list dhcp.@dnsmasq[0].server='{srv}'")
+        for i, dom in enumerate(search_domains):
+            lines.append(f"uci add_list dhcp.@dnsmasq[0].search='{dom}'")
+        lines.append("uci commit dhcp")
+        lines.append("/etc/init.d/dnsmasq reload")
+        cmd = "\n".join(lines)
+        stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
+        out = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace")
+        status = stdout.channel.recv_exit_status()
+        if status != 0:
+            raise RuntimeError(f"DNS config failed on {dev['name']}: {(err or out)[:200]}")
+        log_action(dev, 'dns', f'servers={",".join(servers)}', ok=True)
+        return {"device": dev["name"], "ok": True, "servers": servers}
+    finally:
+        c.close()
+
 
 @app.get("/api/vlans")
 def list_vlans():

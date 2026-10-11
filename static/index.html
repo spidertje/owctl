@@ -417,6 +417,12 @@ const NET_TEMPLATES = {
     {id:'large', label:'Large Pool', desc:'Start 100, limit 500, 24h lease', payload:{vlan_id:10, enabled:true, start:100, limit:500, lease_time:'24h'}},
     {id:'disabled', label:'Disable DHCP', desc:'Static IPs only on this VLAN', payload:{vlan_id:10, enabled:false}},
   ],
+  dns: [
+    {id:'standard', label:'Standard DNS', desc:'1.1.1.1 + 8.8.8.8', payload:{servers:['1.1.1.1','8.8.8.8'], search_domains:[]}},
+    {id:'secure', label:'Secure DNS', desc:'Cloudflare 1.1.1.1 + Quad9', payload:{servers:['1.1.1.1','1.0.0.1'], search_domains:[]}},
+    {id:'filter', label:'Filtered DNS', desc:'Block malware + adult sites', payload:{servers:['1.1.1.1','1.0.0.1'], search_domains:['family-filter-dns.clean.famshield.net']}},
+    {id:'local', label:'Local DNS', desc:'Router only, no upstream', payload:{servers:['router'], search_domains:[]}},
+  ],
   qos: [
     {id:'gaming', label:'Gaming', desc:'Low latency priority', payload:{enabled:true, interface:'wan', download_kbps:0, upload_kbps:0, qdisc:'cake', ecn:true, install_if_missing:true}},
     {id:'video', label:'Video Calls', desc:'Prioritize upload for calls', payload:{enabled:true, interface:'wan', download_kbps:0, upload_kbps:0, qdisc:'cake', ecn:true, install_if_missing:true}},
@@ -474,6 +480,10 @@ async function applyNetTemplate(type, tplId){
       applyFirewallTemplate(tpl.payload);
     }else if(type==='wifi'){
       applyWifiTemplate(tpl.payload);
+    }else if(type==='dhcp'){
+      applyDhcpTemplate(tpl.payload);
+    }else if(type==='dns'){
+      applyDnsTemplate(tpl.payload);
     }
   }catch(e){toast(String(e),true)}
 }
@@ -547,6 +557,30 @@ async function applyWifiTemplate(payload){
   try{
     await api(`/devices/${did}/guest-wifi`,{method:'POST',body:JSON.stringify(payload)});
     toast('WiFi template applied');
+    renderNet();
+  }catch(e){toast(String(e),true)}
+}
+async function applyDhcpTemplate(payload){
+  const devs=await api('/devices');
+  const sshDevs=devs.filter(d=>d.access==='ssh');
+  if(!sshDevs.length){toast('No SSH devices',true);return}
+  const did=sshDevs[0].id;
+  const body={...payload, did};
+  try{
+    await api('/dhcp/apply',{method:'POST',body:JSON.stringify(body)});
+    toast('DHCP template applied');
+    renderNet();
+  }catch(e){toast(String(e),true)}
+}
+async function applyDnsTemplate(payload){
+  const devs=await api('/devices');
+  const sshDevs=devs.filter(d=>d.access==='ssh');
+  if(!sshDevs.length){toast('No SSH devices',true);return}
+  const did=sshDevs[0].id;
+  const body={...payload, did};
+  try{
+    await api('/dns/apply',{method:'POST',body:JSON.stringify(body)});
+    toast('DNS template applied');
     renderNet();
   }catch(e){toast(String(e),true)}
 }
@@ -1285,6 +1319,23 @@ async function renderVlans(target){
   }
   html+=`<div id="dhcp-results" style="margin-top:16px"></div>`;
   
+  // DNS Section
+  html+=`<h2 style="margin-top:32px">DNS</h2>
+    <p class="muted">Configure upstream DNS servers for the network. Applies to all DHCP clients.</p>
+    ${netTemplatePills('dns')}`;
+  if(NET_ADVANCED){
+    html+=`<div class="card">
+      <h3>Configure DNS</h3>
+      <div style="margin-bottom:12px"><label>DNS Servers (one per line, or 'router' for local only)</label>
+        <textarea id="dns-servers" rows="2" style="width:100%;box-sizing:border-box">1.1.1.1
+8.8.8.8</textarea></div>
+      <div style="margin-bottom:12px"><label>Search Domains (optional, comma-separated)</label>
+        <input id="dns-search" placeholder="home.lan" style="width:100%"></div>
+      <button class="act pri" onclick="applyDns()">Apply DNS</button>
+    </div>`;
+  }
+  html+=`<div id="dns-results" style="margin-top:16px"></div>`;
+  
   el.innerHTML=html;
 }
 async function applyVlan(){
@@ -1323,6 +1374,21 @@ async function applyDhcp(){
     document.getElementById('dhcp-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>DHCP applied</strong> on ${r.device}</div>`;
   }catch(e){
     document.getElementById('dhcp-results').innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(e.message||e)}</div>`;
+  }
+}
+
+async function applyDns(){
+  const did=document.querySelector('#qos-did')?.value || document.querySelector('#fw-did')?.value;
+  if(!did){toast('No SSH device available',true);return}
+  const servers=document.getElementById('dns-servers').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!servers.length){toast('Enter at least one DNS server',true);return}
+  const search_domains=document.getElementById('dns-search').value.split(',').map(s=>s.trim()).filter(Boolean);
+  try{
+    toast('Applying DNS...');
+    const r=await api('/dns/apply',{method:'POST',body:JSON.stringify({did:parseInt(did),servers,search_domains})});
+    document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>DNS applied</strong> on ${r.device}: ${r.servers.join(', ')}</div>`;
+  }catch(e){
+    document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(e.message||e)}</div>`;
   }
 }
 
