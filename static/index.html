@@ -1337,11 +1337,30 @@ async function renderVlans(target){
   html+=`<div id="dns-results" style="margin-top:16px"></div>`;
   
   el.innerHTML=html;
-  // Fetch live DHCP/DNS config for the router device
-  if(NET_ADVANCED && router && router.access==='ssh'){
+  // Fetch live DHCP/DNS config for the router device (always show)
+  if(router && router.access==='ssh'){
     try{
       const dhcp = await api(`/dhcp?did=${router.id}`);
+      const dns = await api(`/dns?did=${router.id}`);
+      // Show live config summary in simple mode
+      const dhcpBox = document.getElementById('dhcp-results');
       if(dhcp.live && dhcp.live.length){
+        const rows = dhcp.live.map(d=>`<div class="kv"><span>${esc(d.iface)}</span><span>start=${d.start} limit=${d.limit} lease=${d.lease_time} ${d.enabled?'enabled':'disabled'}</span></div>`).join('');
+        dhcpBox.innerHTML = `<div class="card"><h3>Live DHCP (${router.name})</h3>${rows}</div>`;
+      }else{
+        dhcpBox.innerHTML = '<p class="muted">No DHCP configured on router.</p>';
+      }
+      const dnsBox = document.getElementById('dns-results');
+      if(dns.live && dns.live.servers && dns.live.servers.length){
+        dnsBox.innerHTML = `<div class="card"><h3>Live DNS (${router.name})</h3>
+          <div class="kv"><span>Servers</span><span>${esc(dns.live.servers.join(', '))}</span></div>
+          ${dns.live.search_domains?.length?`<div class="kv"><span>Search</span><span>${esc(dns.live.search_domains.join(', '))}</span></div>`:''}
+        </div>`;
+      }else{
+        dnsBox.innerHTML = '<p class="muted">No upstream DNS configured on router.</p>';
+      }
+      // Pre-fill advanced forms
+      if(NET_ADVANCED && dhcp.live && dhcp.live.length){
         const d = dhcp.live[0];
         document.getElementById('dhcp-vlan').value = d.vlan_id || 10;
         document.getElementById('dhcp-iface').value = d.iface || 'vlan_'+(d.vlan_id||10);
@@ -1350,8 +1369,7 @@ async function renderVlans(target){
         document.getElementById('dhcp-lease').value = d.lease_time || '12h';
         document.getElementById('dhcp-enabled').checked = d.enabled !== false;
       }
-      const dns = await api(`/dns?did=${router.id}`);
-      if(dns.live && dns.live.servers && dns.live.servers.length){
+      if(NET_ADVANCED && dns.live && dns.live.servers && dns.live.servers.length){
         document.getElementById('dns-servers').value = dns.live.servers.join('\n');
         document.getElementById('dns-search').value = (dns.live.search_domains||[]).join(', ');
       }
