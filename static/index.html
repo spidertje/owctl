@@ -298,6 +298,12 @@ async function renderNet(){
   el.innerHTML='<p class="muted">Loading network configuration…</p>';
   let html=`<h2>Network</h2>
     <p class="muted">VLANs, traffic shaping, firewall rules and WiFi — per device.</p>
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
+      <span></span>
+      <button class="act" onclick="setNetAdvanced(!NET_ADVANCED)">
+        ${NET_ADVANCED ? '← Simple' : 'Advanced →'}
+      </button>
+    </div>
     <div class="grid" style="margin-bottom:16px">
       <div class="card" style="cursor:pointer" onclick="document.getElementById('net-vlans').scrollIntoView({behavior:'smooth'})">
         <h3>VLANs <span class="pill">→</span></h3>
@@ -398,6 +404,147 @@ function filterDevices(q){
   });
 }
 let _pollTm=null;
+let NET_ADVANCED = localStorage.getItem('net_advanced') === 'true';
+
+const NET_TEMPLATES = {
+  vlans: [
+    {id:'guest', label:'Guest Network', desc:'Isolated guest access with DHCP', payload:{vlan_id:10, name:'Guest Network', subnet:'192.168.10.0/24', dhcp:true}},
+    {id:'iot', label:'IoT Devices', desc:'Isolated IoT, no internet access', payload:{vlan_id:20, name:'IoT Devices', subnet:'192.168.20.0/24', dhcp:true}},
+    {id:'kids', label:'Kids / Parental', desc:'Filtered DNS, time schedules', payload:{vlan_id:30, name:'Kids', subnet:'192.168.30.0/24', dhcp:true}},
+  ],
+  qos: [
+    {id:'gaming', label:'Gaming', desc:'Low latency priority', payload:{enabled:true, interface:'wan', download_kbps:0, upload_kbps:0, qdisc:'cake', ecn:true, install_if_missing:true}},
+    {id:'video', label:'Video Calls', desc:'Prioritize upload for calls', payload:{enabled:true, interface:'wan', download_kbps:0, upload_kbps:0, qdisc:'cake', ecn:true, install_if_missing:true}},
+    {id:'wfh', label:'Work From Home', desc:'Balanced for work traffic', payload:{enabled:true, interface:'wan', download_kbps:0, upload_kbps:0, qdisc:'fq_codel', ecn:true, install_if_missing:true}},
+    {id:'unlimited', label:'Unlimited', desc:'Disable QoS', payload:{enabled:false, interface:'wan', download_kbps:0, upload_kbps:0, qdisc:'fq_codel', ecn:false}},
+  ],
+  firewall: [
+    {id:'secure', label:'Secure Home', desc:'Block WAN→LAN, isolate guest VLAN', payload:{forwards:[], rules:[], zones:{lan:{input:'ACCEPT',forward:'DROP'},wan:{input:'DROP',forward:'DROP'},guest:{input:'REJECT',forward:'REJECT'}}}},
+    {id:'open', label:'Open Lab', desc:'Allow all inter-VLAN', payload:{forwards:[], rules:[], zones:{lan:{input:'ACCEPT',forward:'ACCEPT'},wan:{input:'DROP',forward:'ACCEPT'}}}},
+    {id:'parental', label:'Parental', desc:'Block adult/malware via DNS + schedules', payload:{forwards:[], rules:[], zones:{lan:{input:'ACCEPT',forward:'DROP'},wan:{input:'DROP',forward:'DROP'}}}},
+  ],
+  wifi: [
+    {id:'guest', label:'Guest WiFi', desc:'WPA2, VLAN=Guest, rate limited', payload:{ssid:'Guest', password:'changeme123', encryption:'psk2'}},
+    {id:'iot', label:'IoT WiFi', desc:'WPA2, VLAN=IoT, no LAN access', payload:{ssid:'IoT-Devices', password:'changeme123', encryption:'psk2'}},
+    {id:'main', label:'Main WiFi', desc:'WPA3, full LAN access', payload:{ssid:'Home', password:'changeme123', encryption:'sae'}},
+  ],
+};
+
+function setNetAdvanced(on){
+  NET_ADVANCED = on;
+  localStorage.setItem('net_advanced', on);
+  // Re-render current network tab if visible
+  const netTab = document.getElementById('tab-net');
+  if(netTab && netTab.style.display !== 'none'){
+    renderNet();
+  }
+}
+
+function netTemplatePills(type){
+  const tpls = NET_TEMPLATES[type] || [];
+  if(!NET_ADVANCED && tpls.length){
+    return `<div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px">
+      ${tpls.map(t=>`<button class="act" onclick="applyNetTemplate('${type}','${t.id}')" title="${esc(t.desc)}">${esc(t.label)}</button>`).join('')}
+      <button class="act" onclick="setNetAdvanced(true)" style="margin-left:auto">Advanced →</button>
+    </div>`;
+  }
+  if(NET_ADVANCED){
+    return `<div class="row" style="margin-bottom:12px"><button class="act" onclick="setNetAdvanced(false)" style="margin-right:auto">← Simple</button></div>`;
+  }
+  return '';
+}
+
+async function applyNetTemplate(type, tplId){
+  const tpl = (NET_TEMPLATES[type]||[]).find(t=>t.id===tplId);
+  if(!tpl)return;
+  if(!confirm(`Apply "${tpl.label}" template?\n${tpl.desc}`))return;
+  try{
+    if(type==='vlans'){
+      // Need to select router and devices - open a mini modal
+      applyVlanTemplate(tpl.payload);
+    }else if(type==='qos'){
+      // Apply to first SSH device or selected
+      applyQosTemplate(tpl.payload);
+    }else if(type==='firewall'){
+      applyFirewallTemplate(tpl.payload);
+    }else if(type==='wifi'){
+      applyWifiTemplate(tpl.payload);
+    }
+  }catch(e){toast(String(e),true)}
+}
+
+async function applyVlanTemplate(p){
+  const devs=await api('/devices');
+  const sshDevs=devs.filter(d=>d.access==='ssh');
+  if(!sshDevs.length){toast('No SSH devices',true);return}
+  const router=sshDevs.find(d=>d.role==='router')||sshDevs[0];
+  const modal=document.createElement('div');
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;min-width:360px">
+    <h3 style="margin:0 0 12px">Apply VLAN Template</h3>
+    <p class="small muted" style="margin:0 0 14px">Select member devices (router auto-selected)</p>
+    <div style="display:flex;flex-direction:column;gap:6px;max-height:180px;overflow:auto;margin-bottom:14px">
+      ${sshDevs.map(d=>`<label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="tpl-vlan-cb" value="${d.id}" ${d.id===router.id?'checked disabled':''}> ${esc(d.name)} (${esc(d.host)})${d.id===router.id?' (router)':''}</label>`).join('')}
+    </div>
+    <div class="row" style="justify-content:flex-end;gap:8px">
+      <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
+      <button class="act pri" onclick="confirmVlanTemplate(this,${JSON.stringify(p).replace(/"/g,'"')})">Apply</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.onclick=e=>{if(e.target===modal)modal.remove()};
+}
+function confirmVlanTemplate(btn, payload){
+  const dids=[...document.querySelectorAll('.tpl-vlan-cb:checked')].map(c=>+c.value);
+  const modal=btn.closest('div[style*=fixed]');
+  modal.remove();
+  api('/vlans/apply',{method:'POST',body:JSON.stringify({...payload, devices:dids, router_id:dids[0]})}).then(r=>{
+    toast('VLAN template applied');
+    renderNet();
+  }).catch(e=>toast(String(e),true));
+}
+
+async function applyQosTemplate(payload){
+  const devs=await api('/devices');
+  const sshDevs=devs.filter(d=>d.access==='ssh');
+  if(!sshDevs.length){toast('No SSH devices',true);return}
+  const did=sshDevs[0].id;
+  const body={...payload, did};
+  try{
+    await api('/qos/apply',{method:'POST',body:JSON.stringify(body)});
+    toast('QoS template applied');
+    renderNet();
+  }catch(e){toast(String(e),true)}
+}
+
+async function applyFirewallTemplate(payload){
+  const devs=await api('/devices');
+  const sshDevs=devs.filter(d=>d.access==='ssh');
+  if(!sshDevs.length){toast('No SSH devices',true);return}
+  const did=sshDevs[0].id;
+  // Simplified: just apply zone policies
+  try{
+    await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'zone',zone:'lan',policies:payload.zones.lan})});
+    await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'zone',zone:'wan',policies:payload.zones.wan})});
+    if(payload.zones.guest){
+      await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'zone',zone:'guest',policies:payload.zones.guest})});
+    }
+    toast('Firewall template applied');
+    renderNet();
+  }catch(e){toast(String(e),true)}
+}
+
+async function applyWifiTemplate(payload){
+  const devs=await api('/devices');
+  const wifiDevs=devs.filter(d=>d.wifi_capable===true||(d.wifi_capable===null&&(d.role||'').toLowerCase()==='ap'));
+  if(!wifiDevs.length){toast('No WiFi devices',true);return}
+  const did=wifiDevs[0].id;
+  try{
+    await api(`/devices/${did}/guest-wifi`,{method:'POST',body:JSON.stringify(payload)});
+    toast('WiFi template applied');
+    renderNet();
+  }catch(e){toast(String(e),true)}
+}
 function startPolling(ms=60000){
   stopPolling();
   renderDevices();
@@ -1081,7 +1228,7 @@ async function renderVlans(target){
   const cfg=await api('/settings').catch(()=>({}));
   const gwId=cfg.network_gateway;
   const router=devs.find(d=>d.id===gwId)||devs.find(d=>d.role==='router')||devs[0];
-  let html=`<h2>VLAN Configuration</h2>
+  let html=`${netTemplatePills('vlans')}<h2>VLAN Configuration</h2>
     <p class="muted">Create and manage VLANs across your network. Each VLAN isolates devices into separate broadcast domains.</p>
     <div class="card">
       <h3>Create New VLAN</h3>
@@ -1141,7 +1288,7 @@ async function renderQos(target){
   try{ const r=await api(`/qos?did=${did}`); saved=r.saved; live=r.live; }
   catch(e){ err=String(e); }
   const src=saved||live||{};
-  el.innerHTML=`
+  el.innerHTML=`${netTemplatePills('qos')}
   <h2>QoS / SQM</h2>
   <p class="muted">Traffic shaping via SQM (fq_codel or cake). Speeds in kbit/s. Requires SSH access.</p>
   <div class="row" style="margin-bottom:16px">
@@ -1223,7 +1370,7 @@ async function renderFirewall(target){
   const zones=(live&&live.zones)||[];
   const fwd=(live&&live.redirects)||[];
   const rules=(live&&live.rules)||[];
-  el.innerHTML=`
+  el.innerHTML=`${netTemplatePills('firewall')}
   <h2>Firewall</h2>
   <p class="muted">Port forwards, inter-zone rules and zone policies. Changes commit + reload fw4.</p>
   <div class="row" style="margin-bottom:16px">
@@ -1335,7 +1482,7 @@ async function renderWifi(target){
     const wifi_devs = devs.filter(d =>
         d.wifi_capable === true ||
         (d.wifi_capable === null && (d.role || '').toLowerCase() === 'ap'));
-    let html=`<h2>WiFi Configuration</h2>
+    let html=`${netTemplatePills('wifi')}<h2>WiFi Configuration</h2>
       <p class="muted">Configured wireless networks across all capability-detected devices. Clone transfers networks to other devices, auto-matching radio bands.</p>`;
     if(!wifi_devs.length){
       html+=`<p class="muted">No wireless-capable devices found.</p>`;
