@@ -293,56 +293,78 @@ async function setGateway(id) {
    ponytail: one tab groups all per-device network config so the home page
    stays a summary. Sub-panels are lazy: each calls its existing render fn
    against its own section element. */
-async function renderNet(){
+let _currentNetSection = null;
+
+async function renderNet(activeSection){
   const el=document.getElementById('tab-net');
-  el.innerHTML='<p class="muted">Loading network configuration…</p>';
+  _currentNetSection = activeSection || _currentNetSection;
   let html=`<h2>Network</h2>
-    <p class="muted">VLANs, traffic shaping, firewall rules and WiFi — per device.</p>
+    <p class="muted">Click a subject to view and configure.</p>
     <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
       <span></span>
-      <button class="act" onclick="setNetAdvanced(!NET_ADVANCED)">
+      <button class="act" onclick="setNetAdvanced(!NET_ADVANCED);renderNet(_currentNetSection)">
         ${NET_ADVANCED ? '← Simple' : 'Advanced →'}
       </button>
     </div>
-    <div class="grid" style="margin-bottom:16px">
-      <div class="card" style="cursor:pointer" onclick="document.getElementById('net-vlans').scrollIntoView({behavior:'smooth'})">
+    <div class="grid" style="margin-bottom:24px">
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='vlans'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('vlans')">
         <h3>VLANs <span class="pill">→</span></h3>
-        <p class="small muted">Create, apply and discover VLANs across the fleet.</p>
+        <p class="small muted">Subnets, isolation and tagging.</p>
       </div>
-      <div class="card" style="cursor:pointer" onclick="document.getElementById('net-qos').scrollIntoView({behavior:'smooth'})">
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='dhcp'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('dhcp')">
+        <h3>DHCP <span class="pill">→</span></h3>
+        <p class="small muted">IP pools, lease times and static leases.</p>
+      </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='dns'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('dns')">
+        <h3>DNS <span class="pill">→</span></h3>
+        <p class="small muted">Upstream resolvers and search domains.</p>
+      </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='qos'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('qos')">
         <h3>QoS / SQM <span class="pill">→</span></h3>
-        <p class="small muted">Traffic shaping (fq_codel / cake) per device.</p>
+        <p class="small muted">Traffic shaping and latency priority.</p>
       </div>
-      <div class="card" style="cursor:pointer" onclick="document.getElementById('net-firewall').scrollIntoView({behavior:'smooth'})">
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='firewall'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('firewall')">
         <h3>Firewall <span class="pill">→</span></h3>
-        <p class="small muted">Port forwards, inter-zone rules and zone policies.</p>
+        <p class="small muted">Port forwards, zone rules and policies.</p>
       </div>
-      <div class="card" style="cursor:pointer" onclick="document.getElementById('net-wifi').scrollIntoView({behavior:'smooth'})">
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='wifi'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('wifi')">
         <h3>WiFi <span class="pill">→</span></h3>
-        <p class="small muted">Guest SSIDs, encryption and VLAN binding.</p>
+        <p class="small muted">SSIDs, encryption and configuration clone.</p>
       </div>
-    </div>`;
+    </div>
+    <div id="net-detail"></div>`;
   el.innerHTML=html;
 
-  // VLANs
-  const v=document.createElement('section'); v.id='net-vlans';
-  v.style.marginBottom='20px'; el.appendChild(v);
-  try{ await renderVlans(v); }catch(e){ v.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+  if(_currentNetSection){
+    loadNetSection(_currentNetSection);
+  }
+}
 
-  // QoS
-  const q=document.createElement('section'); q.id='net-qos';
-  q.style.marginBottom='20px'; el.appendChild(q);
-  try{ await renderQos(q); }catch(e){ q.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+async function loadNetSection(name){
+  _currentNetSection = name;
+  // Update card borders
+  document.querySelectorAll('#tab-net .grid .card').forEach(c=>{
+    c.style.borderColor='var(--line)';
+  });
+  event?.currentTarget?.style && (event.currentTarget.style.borderColor='var(--pri)');
+  
+  const box=document.getElementById('net-detail');
+  if(!box)return;
+  box.innerHTML='<p class="muted">Loading…</p>';
 
-  // Firewall
-  const f=document.createElement('section'); f.id='net-firewall';
-  f.style.marginBottom='20px'; el.appendChild(f);
-  try{ await renderFirewall(f); }catch(e){ f.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
-
-  // WiFi
-  const w=document.createElement('section'); w.id='net-wifi';
-  el.appendChild(w);
-  try{ await renderWifi(w); }catch(e){ w.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; }
+  if(name==='vlans'){
+    await renderVlans(box);
+  }else if(name==='dhcp'){
+    await renderDhcp(box);
+  }else if(name==='dns'){
+    await renderDns(box);
+  }else if(name==='qos'){
+    await renderQos(box);
+  }else if(name==='firewall'){
+    await renderFirewall(box);
+  }else if(name==='wifi'){
+    await renderWifi(box);
+  }
 }
 
 async function renderDevices(){
@@ -1294,14 +1316,30 @@ async function renderVlans(target){
     </div>`;
   }
   html+=`<div id="vlan-results" style="margin-top:16px"></div>`;
-  
-  // DHCP Section
-  html+=`<h2 style="margin-top:32px">DHCP Server</h2>
+  el.innerHTML=html;
+  // Show discovered VLANs live
+  try{
+    const vlans=await api('/vlans');
+    if(vlans.length){
+      const box=document.getElementById('vlan-results');
+      box.innerHTML=`<div class="card"><h3>Configured VLANs</h3>`+
+        vlans.map(v=>`<div class="kv"><span>VLAN ${v.id} — ${esc(v.name||'')}</span><span>${esc(v.subnet||'')}${v.dhcp?' · DHCP':''}</span></div>`).join('')+`</div>`;
+    }
+  }catch(e){}
+}
+async function renderDhcp(target){
+  const el=target||document.getElementById('tab-dhcp');
+  const devs=await api('/devices');
+  const router=devs.find(d=>d.role==='router')||devs.find(d=>d.access==='ssh')||devs[0];
+  let html=`<h2>DHCP Server</h2>
     <p class="muted">Configure DHCP pools for VLAN interfaces. Runs on the router device.</p>
     ${netTemplatePills('dhcp')}`;
   if(NET_ADVANCED){
     html+=`<div class="card">
       <h3>Configure DHCP</h3>
+      <div class="row" style="margin-bottom:12px">
+        <div><label>Device</label><select id="dhcp-did" style="width:100%">${devs.filter(d=>d.access==='ssh').map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
+      </div>
       <div class="row" style="margin-bottom:12px">
         <div><label>VLAN ID</label><input id="dhcp-vlan" type="number" min="1" max="4094" value="10" style="width:80px"></div>
         <div><label>Interface</label><input id="dhcp-iface" placeholder="vlan_10" style="width:140px"></div>
@@ -1318,14 +1356,41 @@ async function renderVlans(target){
     </div>`;
   }
   html+=`<div id="dhcp-results" style="margin-top:16px"></div>`;
-  
-  // DNS Section
-  html+=`<h2 style="margin-top:32px">DNS</h2>
+  el.innerHTML=html;
+  // Fetch live DHCP config (always show)
+  if(router && router.access==='ssh'){
+    try{
+      const dhcp = await api(`/dhcp?did=${router.id}`);
+      const dhcpBox = document.getElementById('dhcp-results');
+      if(dhcp.live && dhcp.live.length){
+        const rows = dhcp.live.map(d=>`<div class="kv"><span>${esc(d.iface)}</span><span>start=${d.start} limit=${d.limit} lease=${d.lease_time} ${d.enabled?'enabled':'disabled'}</span></div>`).join('');
+        dhcpBox.innerHTML = `<div class="card"><h3>Live DHCP (${router.name})</h3>${rows}</div>`;
+        if(NET_ADVANCED){
+          const d = dhcp.live[0];
+          document.getElementById('dhcp-vlan').value = d.vlan_id || 10;
+          document.getElementById('dhcp-iface').value = d.iface || 'vlan_'+(d.vlan_id||10);
+          document.getElementById('dhcp-start').value = d.start || 100;
+          document.getElementById('dhcp-limit').value = d.limit || 150;
+          document.getElementById('dhcp-lease').value = d.lease_time || '12h';
+          document.getElementById('dhcp-enabled').checked = d.enabled !== false;
+        }
+      }else{
+        dhcpBox.innerHTML = '<p class="muted">No DHCP configured on this device.</p>';
+      }
+    }catch(e){console.warn('DHCP live fetch failed:',e)}
+  }
+}
+async function renderDns(target){
+  const el=target||document.getElementById('tab-dns');
+  const devs=await api('/devices');
+  const router=devs.find(d=>d.role==='router')||devs.find(d=>d.access==='ssh')||devs[0];
+  let html=`<h2>DNS</h2>
     <p class="muted">Configure upstream DNS servers for the network. Applies to all DHCP clients.</p>
     ${netTemplatePills('dns')}`;
   if(NET_ADVANCED){
     html+=`<div class="card">
       <h3>Configure DNS</h3>
+      <div style="margin-bottom:12px"><label>Device</label><select id="dns-did">${devs.filter(d=>d.access==='ssh').map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
       <div style="margin-bottom:12px"><label>DNS Servers (one per line, or 'router' for local only)</label>
         <textarea id="dns-servers" rows="2" style="width:100%;box-sizing:border-box">1.1.1.1
 8.8.8.8</textarea></div>
@@ -1335,45 +1400,25 @@ async function renderVlans(target){
     </div>`;
   }
   html+=`<div id="dns-results" style="margin-top:16px"></div>`;
-  
   el.innerHTML=html;
-  // Fetch live DHCP/DNS config for the router device (always show)
+  // Fetch live DNS config (always show)
   if(router && router.access==='ssh'){
     try{
-      const dhcp = await api(`/dhcp?did=${router.id}`);
       const dns = await api(`/dns?did=${router.id}`);
-      // Show live config summary in simple mode
-      const dhcpBox = document.getElementById('dhcp-results');
-      if(dhcp.live && dhcp.live.length){
-        const rows = dhcp.live.map(d=>`<div class="kv"><span>${esc(d.iface)}</span><span>start=${d.start} limit=${d.limit} lease=${d.lease_time} ${d.enabled?'enabled':'disabled'}</span></div>`).join('');
-        dhcpBox.innerHTML = `<div class="card"><h3>Live DHCP (${router.name})</h3>${rows}</div>`;
-      }else{
-        dhcpBox.innerHTML = '<p class="muted">No DHCP configured on router.</p>';
-      }
       const dnsBox = document.getElementById('dns-results');
       if(dns.live && dns.live.servers && dns.live.servers.length){
         dnsBox.innerHTML = `<div class="card"><h3>Live DNS (${router.name})</h3>
           <div class="kv"><span>Servers</span><span>${esc(dns.live.servers.join(', '))}</span></div>
           ${dns.live.search_domains?.length?`<div class="kv"><span>Search</span><span>${esc(dns.live.search_domains.join(', '))}</span></div>`:''}
         </div>`;
+        if(NET_ADVANCED){
+          document.getElementById('dns-servers').value = dns.live.servers.join('\n');
+          document.getElementById('dns-search').value = (dns.live.search_domains||[]).join(', ');
+        }
       }else{
-        dnsBox.innerHTML = '<p class="muted">No upstream DNS configured on router.</p>';
+        dnsBox.innerHTML = '<p class="muted">No upstream DNS configured on this device.</p>';
       }
-      // Pre-fill advanced forms
-      if(NET_ADVANCED && dhcp.live && dhcp.live.length){
-        const d = dhcp.live[0];
-        document.getElementById('dhcp-vlan').value = d.vlan_id || 10;
-        document.getElementById('dhcp-iface').value = d.iface || 'vlan_'+(d.vlan_id||10);
-        document.getElementById('dhcp-start').value = d.start || 100;
-        document.getElementById('dhcp-limit').value = d.limit || 150;
-        document.getElementById('dhcp-lease').value = d.lease_time || '12h';
-        document.getElementById('dhcp-enabled').checked = d.enabled !== false;
-      }
-      if(NET_ADVANCED && dns.live && dns.live.servers && dns.live.servers.length){
-        document.getElementById('dns-servers').value = dns.live.servers.join('\n');
-        document.getElementById('dns-search').value = (dns.live.search_domains||[]).join(', ');
-      }
-    }catch(e){console.warn('Live config fetch failed:',e)}
+    }catch(e){console.warn('DNS live fetch failed:',e)}
   }
 }
 async function applyVlan(){
@@ -1398,7 +1443,7 @@ async function applyVlan(){
 }
 
 async function applyDhcp(){
-  const did=document.querySelector('#qos-did')?.value || document.querySelector('#fw-did')?.value;
+  const did=document.getElementById('dhcp-did')?.value || document.querySelector('#qos-did')?.value || document.querySelector('#fw-did')?.value;
   if(!did){toast('No SSH device available',true);return}
   const vlan_id=parseInt(document.getElementById('dhcp-vlan').value);
   const iface=document.getElementById('dhcp-iface').value||'vlan_'+vlan_id;
@@ -1416,7 +1461,7 @@ async function applyDhcp(){
 }
 
 async function applyDns(){
-  const did=document.querySelector('#qos-did')?.value || document.querySelector('#fw-did')?.value;
+  const did=document.getElementById('dns-did')?.value || document.querySelector('#qos-did')?.value || document.querySelector('#fw-did')?.value;
   if(!did){toast('No SSH device available',true);return}
   const servers=document.getElementById('dns-servers').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if(!servers.length){toast('Enter at least one DNS server',true);return}
