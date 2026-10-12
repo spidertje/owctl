@@ -961,6 +961,140 @@ def _uci_quote(v) -> str:
     return "'" + str(v).replace("'", "'\\''") + "'"
 
 
+def _uci_values(rest: str) -> list:
+    """Split a `uci show` value string into a list of values.
+
+    Handles single-quoted values (which may contain spaces/commas, e.g. list
+    options like ``dhcp_option='a' 'b'``) and bare unquoted values — uci show
+    prints values unquoted unless they need quoting (``enabled=1``,
+    ``dhcpv4=server``, ``leasetime=12h``, ``server=8.8.8.8``)."""
+    rest = (rest or "").strip()
+    if not rest:
+        return []
+    vals, i, n = [], 0, len(rest)
+    while i < n:
+        while i < n and rest[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        if rest[i] == "'":
+            j = rest.find("'", i + 1)
+            if j == -1:
+                vals.append(rest[i + 1:])
+                break
+            vals.append(rest[i + 1:j])
+            i = j + 1
+        else:
+            j = i
+            while j < n and not rest[j].isspace():
+                j += 1
+            vals.append(rest[i:j])
+            i = j
+    return vals
+
+
+def _uci_list_values(raw: str, section: str, key: str) -> list:
+    """Collect every value of ``section.key`` from raw ``uci show`` text.
+
+    The value may be a single value or a list rendered on one line."""
+    vals = []
+    prefix = f"{section}.{key}="
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if line.startswith(prefix):
+            vals.extend(_uci_values(line[len(prefix):]))
+    return vals
+
+
+def build_wifi_clone_cmds(iface: dict, radio: str) -> tuple:
+    """Uci script (no commit) to create/update one wifi-iface on a target radio.
+    Pure (no I/O). The caller adds ``uci commit wireless`` + ``wifi reload``
+    once per target. All values go through :func:`_uci_quote`; the section name
+    is derived from a sanitized SSID so it is always a valid uci id."""
+    ssid = str(iface.get("ssid") or "")
+    slug = "clone_" + re.sub(r"\W+", "_", ssid or "iface")[:24].strip("_") or "iface"
+    key = str(iface.get("key") or "")
+    enc = str(iface.get("encryption") or "")
+    net = str(iface.get("network") or "")
+    lines = [
+        f"uci set wireless.{slug}=wifi-iface",
+        f"uci set wireless.{slug}.device={_uci_quote(radio)}",
+        f"uci set wireless.{slug}.mode={_uci_quote('ap')}",
+        f"uci set wireless.{slug}.ssid={_uci_quote(ssid)}",
+    ]
+    if key:
+        lines.append(f"uci set wireless.{slug}.key={_uci_quote(key)}")
+    if enc:
+        lines.append(f"uci set wireless.{slug}.encryption={_uci_quote(enc)}")
+    if net:
+        lines.append(f"uci set wireless.{slug}.network={_uci_quote(net)}")
+    return slug, "\n".join(lines) + "\n"
+
+
+def build_dhcp_apply_cmds(iface: str, start, limit, lease_time: str) -> str:
+    """Uci script to create/update a DHCP pool section. Pure (no I/O).
+
+    Uses the dnsmasq/odhcpd ``leasetime`` option (no underscore) so the value
+    actually takes effect, and sets ``dhcpv4=server`` so the pool serves on
+    both backends. All values go through :func:`_uci_quote`.
+    ``uci set`` upserts, so re-applying updates in place (no duplicate section)."""
+    iface = str(iface).strip()
+    if not re.match(r"^[A-Za-z0-9_]+$", iface):
+        raise HTTPException(400, "invalid interface name")
+    lines = [
+        f"uci set dhcp.{iface}=dhcp",
+        f"uci set dhcp.{iface}.interface={_uci_quote(iface)}",
+        f"uci set dhcp.{iface}.start={_uci_quote(start)}",
+        f"uci set dhcp.{iface}.limit={_uci_quote(limit)}",
+        f"uci set dhcp.{iface}.leasetime={_uci_quote(lease_time)}",
+        f"uci set dhcp.{iface}.dhcpv4={_uci_quote('server')}",
+        "uci commit dhcp",
+        "/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: list = None) -> str:
+    """Uci script to set DNS for the active DHCP/DNS backend. Pure (no I/O).
+
+    odhcpd: DNS is delivered via DHCP option 6. Replaces the ``dhcp-option=6,``
+    entries and the bare ``dhcp-option=6`` marker, but PRESERVES every other
+    ``dhcp_option`` entry (notably IPv6 RA-DNS ``6,<addr>``) so existing IPv6
+    DNS is not silently dropped on re-apply.
+
+    dnsmasq: clears the ``@dnsmasq[0].server`` list by removing each existing
+    value individually (``del_list`` requires a value), then adds the new ones.
+
+    An empty ``servers`` list is valid: it clears all upstream servers ("local
+    only" / router-resolved). Callers validate the empty case before calling."""
+    servers = [str(s).strip() for s in (servers or []) if str(s).strip()]
+    if backend == "odhcpd":
+        lines = []
+        # Preserve every dhcp_option entry that is not an IPv4 option-6 DNS
+        # entry. Option-6 servers are `dhcp-option=6,<ip>` (or the bare marker
+        # `dhcp-option=6`); IPv6 RA-DNS entries look like `6,<addr>` and MUST
+        # be kept, or the router stops advertising IPv6 DNS on re-apply.
+        keep = [v for v in _uci_list_values(detect, "dhcp.lan", "dhcp_option")
+                if not (v == "dhcp-option=6" or v.startswith("dhcp-option=6,"))]
+        for v in keep:
+            lines.append(f"uci set dhcp.lan.dhcp_option={_uci_quote(v)}")
+        for s in servers:
+            lines.append(f"uci add_list dhcp.lan.dhcp_option={_uci_quote('dhcp-option=6,' + s)}")
+        lines.append("uci commit dhcp")
+        lines.append("/etc/init.d/odhcpd restart 2>/dev/null || /etc/init.d/dnsmasq restart 2>/dev/null || true")
+        return "\n".join(lines) + "\n"
+    # dnsmasq backend: keep the @dnsmasq[0] block in-place.
+    existing = _uci_list_values(detect, "dhcp.@dnsmasq[0]", "server")
+    lines = []
+    for v in existing:
+        lines.append(f"uci -q del_list dhcp.@dnsmasq[0].server={_uci_quote(v)} || true")
+    for s in servers:
+        lines.append(f"uci add_list dhcp.@dnsmasq[0].server={_uci_quote(s)}")
+    lines.append("uci commit dhcp")
+    lines.append("/etc/init.d/dnsmasq restart 2>/dev/null || true")
+    return "\n".join(lines) + "\n"
+
+
 def _fw_commit(cmd: str) -> str:
     """Finish a firewall mutation script: commit + reload so changes go live."""
     return cmd + "uci commit firewall && fw4 restart\n"
@@ -2264,19 +2398,14 @@ async def apply_dhcp(request: Request):
     c = _ssh_connect(dev)
     try:
         if enabled:
-            cmd = f"""uci set dhcp.{iface}=dhcp
-uci set dhcp.{iface}.interface='{iface}'
-uci set dhcp.{iface}.start='{start}'
-uci set dhcp.{iface}.limit='{limit}'
-uci set dhcp.{iface}.lease_time='{lease_time}'
-uci commit dhcp
-/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true
-"""
+            cmd = build_dhcp_apply_cmds(iface, start, limit, lease_time)
         else:
-            cmd = f"""uci delete dhcp.{iface}
-uci commit dhcp
-/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true
-"""
+            _iface = str(iface).strip()
+            if not re.match(r"^[A-Za-z0-9_]+$", _iface):
+                raise HTTPException(400, "invalid interface name")
+            cmd = (f"uci -q delete dhcp.{_iface} || true\n"
+                   "uci commit dhcp\n"
+                   "/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true\n")
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
@@ -2310,7 +2439,8 @@ def _saved_dhcp_rows(device_id):
 
 def _parse_uci_show(out):
     """Parse `uci show <pkg>` output into {section: {key: [values]}}. Handles list values a='x' 'y'.
-    Keeps full section names (e.g., 'dhcp.lan') for reliable detection."""
+    Keeps full section names (e.g., 'dhcp.lan') for reliable detection.
+    Values are split via `_uci_values`, which handles quoted, bare, and list forms."""
     sections = {}
     for line in out.splitlines():
         line = line.strip()
@@ -2318,7 +2448,7 @@ def _parse_uci_show(out):
             continue
         path, rest = line.split("=", 1)
         sec, _, key = path.rpartition(".")
-        vals = re.findall(r"'([^']*)'", rest) or (re.findall(r"(\S+)", rest) if rest.strip().startswith("0") or rest.strip().startswith("1") else [])
+        vals = _uci_values(rest)
         if sec and key:
             sections.setdefault(sec, {}).setdefault(key, []).extend(vals)
     return sections
@@ -2340,8 +2470,9 @@ def _read_live_dhcp(dev):
             if not attrs.get("start") and (attrs.get("dhcpv4") or [""])[0] != "server":
                 continue
             lease = (attrs.get("leasetime") or attrs.get("lease_time") or ["12h"])[0]
+            _vm = re.match(r"vlan_(\d+)$", name)
             dhcp.append({
-                "vlan_id": name.replace("vlan_", "") if name.startswith("vlan_") else name.replace("dhcp.", ""),
+                "vlan_id": int(_vm.group(1)) if _vm else None,
                 "iface": iface,
                 "start": int(attrs["start"][0]) if attrs.get("start") and attrs["start"][0].isdigit() else 100,
                 "limit": int(attrs["limit"][0]) if attrs.get("limit") and attrs["limit"][0].isdigit() else 150,
@@ -2391,38 +2522,19 @@ async def apply_dns(request: Request):
     dev = cur[0]
     if dev["access"] != "ssh":
         raise HTTPException(400, "DNS config requires SSH access")
-    servers = [s.strip() for s in servers if s.strip() and s.strip() != "router"]
-    if not servers:
-        raise HTTPException(400, "provide at least one upstream server")
+    # 'router' is a template sentinel meaning "local only, no upstream"; it is
+    # not a real server and must not be written to the device.
+    raw_servers = [str(s).strip() for s in (servers or []) if str(s).strip()]
+    servers = [s for s in raw_servers if s != "router"]
+    if not raw_servers:
+        raise HTTPException(400, "provide at least one upstream server (or 'router' for local-only)")
     c = _ssh_connect(dev)
     try:
         # ponytail: backend detection by uci keys; add other backends here if seen.
         detect, _e, _s = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
         # odhcpd (OpenWrt 22.03+) runs DHCP when a section has dhcpv4='server'
         backend = "odhcpd" if re.search(r"^dhcp\.\w+\.dhcpv4='?server'?$", detect, re.M) else "dnsmasq"
-        if backend == "odhcpd":
-            # DNS is handed to clients via DHCP option 6 (IPv4) and RA-DNS "6,ip,ip" (IPv6).
-            # Preserve existing RA-DNS entries, replace only the dhcp-option=6 entries.
-            lines = [
-                "uci -q delete dhcp.lan.dhcp_option || true",
-            ]
-            for old in re.findall(r"^dhcp\.lan\.dhcp_option='([^']*)'$", detect, re.M):
-                if old.startswith("6,") and not old.startswith("dhcp-option=6,"):
-                    lines.append(f"uci add_list dhcp.lan.dhcp_option='{old}'")
-            for s in servers:
-                lines.append(f"uci add_list dhcp.lan.dhcp_option='dhcp-option=6,{s}'")
-            lines.append("uci commit dhcp")
-            lines.append("/etc/init.d/odhcpd restart 2>/dev/null || /etc/init.d/dnsmasq restart 2>/dev/null || true")
-        else:
-            # dnsmasq backend: keep the @dnsmasq[0] block in-place
-            lines = [
-                "uci -q del_list dhcp.@dnsmasq[0].server || true",
-            ]
-            for s in servers:
-                lines.append(f"uci add_list dhcp.@dnsmasq[0].server='{s}'")
-            lines.append("uci commit dhcp")
-            lines.append("/etc/init.d/dnsmasq restart 2>/dev/null || true")
-        cmd = "\n".join(lines)
+        cmd = build_dns_cmds(backend, detect, servers, search_domains)
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
@@ -2462,14 +2574,12 @@ def _read_live_dns(dev):
         sections = _parse_uci_show(out)
         servers = []
         resolver = None
-        # odhcpd: DHCP option 6 on lan/vlan sections; bare "6,ip,ip" values are IPv6 RA-DNS, skip them
+        # odhcpd: DNS is delivered via DHCP option 6 (`dhcp-option=6,<ip>`).
+        # Bare `6,<addr>` values are IPv6 RA-DNS and must NOT be read as IPv4 servers.
         for sec, attrs in sections.items():
             if sec == "dhcp.lan" or sec.startswith("dhcp.lan.") or re.match(r"^dhcp\.vlan_", sec):
                 for v in attrs.get("dhcp_option", []):
-                    if v == "dhcp-option=6" and len(attrs["dhcp_option"]) >= 2:
-                        servers.extend(x for x in attrs["dhcp_option"][1].split(",") if x)
-                        resolver = "odhcpd"
-                    elif v.startswith("dhcp-option=6,"):
+                    if v.startswith("dhcp-option=6,"):
                         servers.extend(x for x in v.split(",")[1:] if x)
                         resolver = "odhcpd"
         
@@ -2835,6 +2945,8 @@ def get_wifi_config(did: int):
     if not cur:
         raise HTTPException(404, "device not found")
     dev = cur[0]
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "WiFi config read requires SSH access on this device")
     c = _ssh_connect(dev)
     try:
         out, _err, _st = _exec_capture(c, "uci show wireless 2>/dev/null", timeout=10)
@@ -2848,33 +2960,43 @@ def get_wifi_config(did: int):
 
 def _parse_wifi_ifaces(show_out):
     """Parse `uci show wireless` into radios {name: band} and iface list.
-    Pure + testable. Band comes from .band= (2g/5g/6g) or .hwmode= legacy."""
+    Pure + testable. Band comes from .band= (2g/5g/6g) or .hwmode= legacy.
+
+    Radio sections and wifi-iface sections are tracked as separate sets so a
+    radio attribute (e.g. `radio0.type`) is never mistaken for an iface option
+    (which would otherwise clobber the iface's `device` field and lose its band)."""
     radios, ifaces = {}, []
+    radio_names, iface_names = set(), set()
     for line in (show_out or "").splitlines():
         line = line.strip()
         m = re.match(r"wireless\.([A-Za-z0-9_]+)=wifi-device$", line)
         if m:
-            radios.setdefault(m.group(1), {})
+            name = m.group(1)
+            radios.setdefault(name, {})
+            radio_names.add(name)
             continue
         m = re.match(r"wireless\.([A-Za-z0-9_]+)=wifi-iface$", line)
         if m:
+            iface_names.add(m.group(1))
             ifaces.append({"name": m.group(1), "device": None, "ssid": "", "encryption": "",
                            "has_key": False, "key": "", "network": "", "mode": ""})
             continue
         m = re.match(r"wireless\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)='?(.*?)'?$", line)
-        if m:
-            name, key, val = m.group(1), m.group(2), m.group(3)
-            if name in radios and key in ("band", "hwmode", "channel", "htmode"):
+        if not m:
+            continue
+        name, key, val = m.group(1), m.group(2), m.group(3)
+        if name in radio_names:
+            if key in ("band", "hwmode", "channel", "htmode"):
                 radios[name][key] = val
-            else:
-                for i in ifaces:
-                    if i["name"] == name:
-                        if key == "key":
-                            i["has_key"] = bool(val)
-                            i["key"] = val
-                        elif key in ("device", "ssid", "encryption", "network", "mode"):
-                            i[key] = val
-                        break
+        elif name in iface_names:
+            for i in ifaces:
+                if i["name"] == name:
+                    if key == "key":
+                        i["has_key"] = bool(val)
+                        i["key"] = val
+                    elif key in ("device", "ssid", "encryption", "network", "mode"):
+                        i[key] = val
+                    break
     band = {}
     for r, a in radios.items():
         b = a.get("band") or {"11g": "2g", "11a": "5g", "11ad": "60g"}.get(a.get("hwmode", ""), "")
@@ -2952,33 +3074,54 @@ async def wifi_clone(request: Request, did: int):
             applied, skipped = [], []
             cc = _ssh_connect(t)
             try:
+                # Resolve each source iface to a target radio and build its uci
+                # script (no commit yet). Bandless sources are reported, not
+                # guessed onto "first radio", to avoid silent mis-targeting.
+                plans = []  # (ssid, radio, slug, cmd)
                 for i in ifaces:
                     want = i.get("band") or ""
-                    radio = next((r for r, b in radios.items() if b == want), None) \
-                        if want else None
-                    if radio is None and want:
-                        skipped.append(f"{i['ssid']} (no {want} radio)")
+                    if not want:
+                        skipped.append(f"{i.get('ssid') or i['name']} (source has no band; not targeting a radio)")
                         continue
-                    radio = radio or next(iter(radios))
-                    name = "clone_" + re.sub(r"\W+", "_", i["ssid"] or "iface")[:24]
-                    slug = name
-                    key = i.get("key", "")
-                    cmd = (f"uci set wireless.{slug}=wifi-iface\n"
-                           f"uci set wireless.{slug}.device='{radio}'\n"
-                           f"uci set wireless.{slug}.mode='ap'\n"
-                           f"uci set wireless.{slug}.ssid='{i['ssid']}'\n")
-                    if key:
-                        cmd += f"uci set wireless.{slug}.key='{key}'\n"
-                    if i.get("encryption"):
-                        cmd += f"uci set wireless.{slug}.encryption='{i['encryption']}'\n"
-                    if i.get("network"):
-                        cmd += f"uci set wireless.{slug}.network='{i['network']}'\n"
-                    cmd += "uci commit wireless\nwifi reload\n"
-                    o, e, st = _exec_capture(cc, cmd, timeout=30)
-                    if st != 0:
-                        skipped.append(f"{i['ssid']} (uci failed: {(e or o)[:80]})")
+                    radio = next((r for r, b in radios.items() if b == want), None)
+                    if radio is None:
+                        skipped.append(f"{i.get('ssid') or i['name']} (no {want} radio)")
+                        continue
+                    slug, cmd = build_wifi_clone_cmds(i, radio)
+                    plans.append((i.get("ssid") or slug, radio, slug, cmd))
+                # Dedupe by target section slug: two source ifaces with the same
+                # SSID map to the same `clone_<ssid>` section; keep the first.
+                seen_slugs, unique_plans = set(), []
+                for p in plans:
+                    if p[2] in seen_slugs:
+                        skipped.append(f"{p[0]} (same target section as an earlier SSID; skipped)")
                     else:
-                        applied.append(f"{i['ssid']} → {radio}")
+                        seen_slugs.add(p[2])
+                        unique_plans.append(p)
+                plans = unique_plans
+                if plans:
+                    # Clobber guard: a section id we are about to `uci set` must
+                    # not already exist as a NON-wifi-iface section (which would
+                    # have its type/options wiped). Existing wifi-iface sections
+                    # are safe to re-upsert (idempotent re-clone).
+                    safe = []
+                    for ssid, radio, slug, cmd in plans:
+                        o, _e, _st = _exec_capture(cc,
+                            f"uci -q get wireless.{slug} 2>/dev/null", timeout=15)
+                        typ = (o or "").strip()
+                        if typ and typ != "wifi-iface":
+                            skipped.append(f"{ssid} (target section '{slug}' is a '{typ}', not wifi-iface; left untouched)")
+                        else:
+                            safe.append((ssid, radio, slug, cmd))
+                    if safe:
+                        script = "".join(p[3] for p in safe) + "uci commit wireless\nwifi reload\n"
+                        o, e, st = _exec_capture(cc, script, timeout=60)
+                        if st != 0:
+                            for ssid, radio, slug, _cmd in safe:
+                                skipped.append(f"{ssid} (uci failed: {(e or o)[:80]})")
+                        else:
+                            for ssid, radio, slug, _cmd in safe:
+                                applied.append(f"{ssid} → {radio}")
             finally:
                 cc.close()
             results.append({"target_id": tid, "name": t["name"], "ok": True,
