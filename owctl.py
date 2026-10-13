@@ -171,6 +171,11 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS device_status(
         id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER UNIQUE, ts TEXT,
         clients INTEGER, uptime_s INTEGER, firmware TEXT, rx_bytes INTEGER, tx_bytes INTEGER)""")
+    for _col, _typ in (("installed_pkgs", "TEXT"), ("obsolete_pkgs", "TEXT"), ("meshd", "TEXT")):
+        try:
+            execute(f"ALTER TABLE device_status ADD COLUMN {_col} {_typ}")
+        except sqlite3.OperationalError:
+            pass
     # Idempotent migration for databases created before wifi_capable existed.
     try:
         execute("ALTER TABLE device_status ADD COLUMN wifi_capable INTEGER")
@@ -406,6 +411,16 @@ def record_status_snapshot(dev_row, st):
                 st.get("clients"), st.get("uptime_s"), st.get("firmware"),
                 rx_bytes if traffic else None, tx_bytes if traffic else None,
                 wifi_capable]
+        # Packages + mesh: JSON-encoded so the same row carries the full
+        # software inventory. Only written when the gather script produced
+        # data (None stays NULL, never an empty string).
+        import json as _json
+        installed = st.get("installed")
+        obsolete = st.get("obsolete")
+        meshd = st.get("meshd")
+        if installed is not None or obsolete is not None or meshd is not None:
+            cols += ["installed_pkgs", "obsolete_pkgs", "meshd"]
+            vals += [_json.dumps(installed or []), _json.dumps(obsolete or []), meshd]
         # Null-safe: only write a column when its source is present.
         set_clause = ", ".join(
             f"{c}=excluded.{c}" for c, v in zip(cols, vals) if v is not None
@@ -440,10 +455,13 @@ echo '##ntp##'; uci -q get system.ntp.enabled
 echo '##redirects##'; i=0; while uci -q get "firewall.@redirect[$i].name" >/dev/null 2>&1; do printf '%s %s %s\n' "$i" "$(uci -q get "firewall.@redirect[$i].name")" "$(uci -q get "firewall.@redirect[$i].dest_port")"; i=$((i+1)); done
 echo '##upgradable##'; opkg list-upgradable 2>/dev/null
 echo '##interfaces##'; ifconfig 2>/dev/null | awk '/^[a-z]/&&!/Loopback/{name=$1} /inet addr:/{split($2,a,":"); printf "%s %s\n", name, a[2]}'
+echo '##meshd##'; if [ -x /usr/sbin/meshd ]; then echo 'meshd'; elif [ -x /usr/bin/batmand ]; then echo 'batmand'; elif uci -q show wireless | grep -qi 'mesh\|802.11s\|batadv'; then echo 'uci'; else echo ''; fi
 echo '##wireless##'; iwinfo 2>/dev/null | awk '/ESSID:/{essid=$0; gsub(/.*ESSID: *"/, "", essid); gsub(/".*/, "", essid)} /Mode:.*Channel:/{chan=$0; gsub(/.*Channel: */, "", chan); gsub(/ .*/, "", chan)} /Encryption:/{enc=$0; gsub(/.*Encryption: */, "", enc); printf "%s\t%s\t%s\n", essid, chan, enc}'; echo
 echo '##stations##'; iwinfo 2>/dev/null | awk '/ESSID:/{essid=$0; gsub(/.*ESSID: *"/, "", essid); gsub(/".*/, "", essid)} /Associated STAs:/{stas=$0; gsub(/.*Associated STAs: */, "", stas); gsub(/ .*/, "", stas); if (essid) print essid"\t"stas}'; echo
 echo '##neighbors##'; ip neigh show 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/{print $1"\t"$3"\t"$5}'
 echo '##dhcp##'; cat /tmp/dhcp.leases 2>/dev/null
+echo '##installed##'; opkg list-installed 2>/dev/null
+echo '##obsolete##'; comm -23 <(opkg list-installed 2>/dev/null | awk '{print $1}' | sort) <(opkg list 2>/dev/null | awk '{print $1}' | sort) | tr '\n' ' '; echo
 echo '##config##'; sha256sum /etc/config/* 2>/dev/null | awk '{print $2"="$1}'
 echo '##traffic##'; awk 'NR>2{gsub(/:/,"",$1); printf "%s %s %s\n", $1, $2, $10}' /proc/net/dev
 echo '##thermal##'; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null
@@ -618,6 +636,19 @@ def _build_status(dev, backend, s):
         if len(p) >= 4:
             dhcp.append({"mac": p[1], "ip": p[2], "hostname": p[3] if len(p) > 3 else ""})
     st["dhcp"] = dhcp
+    # Installed packages (opkg list-installed: name version desc per line)
+    installed = []
+    for line in s.get("installed", "").splitlines():
+        p = line.split()
+        if len(p) >= 2:
+            installed.append({"pkg": p[0], "version": p[1]})
+    st["installed"] = installed
+    # Obsolete packages: installed but not in any feed (no longer available)
+    st["obsolete"] = [x.strip() for x in s.get("obsolete", "").split() if x.strip()]
+    # Mesh daemon: 802.11s / batman / meshd presence
+    meshd = s.get("meshd", "").strip().lower()
+    st["meshd"] = meshd or None
+
     # Parse config hashes: /etc/config/file hash
     st["config_hashes"] = {}
     for line in s.get("config", "").splitlines():
@@ -830,6 +861,21 @@ def audit_status(st):
         pkgs = ", ".join(p.get("pkg", "?") for p in st["upgradable"][:8])
         add("outdated_packages", "MEDIUM", f"{len(st['upgradable'])} package(s) have updates",
             pkgs, "Review in the Updates tab and apply")
+    # Obsolete packages: installed but no longer in any feed. They are dead
+    # weight (security patches stop landing) and a sign to remove them.
+    obsolete = st.get("obsolete") or []
+    if obsolete:
+        add("obsolete_packages", "MEDIUM",
+            f"{len(obsolete)} installed package(s) are no longer in any feed",
+            ", ".join(obsolete[:8]),
+            "opkg remove <pkg> to drop them; re-add from a feed if still needed")
+
+    # Mesh daemon: 802.11s / batman-adv. INFO only — mesh is a deliberate
+    # topology choice, not a threat, but worth surfacing in the WiFi tab.
+    if st.get("meshd"):
+        add("mesh_enabled", "INFO", "Mesh (802.11s / batman-adv) is configured",
+            st["meshd"], "Confirm the mesh topology is intentional")
+
     if st.get("sysupgrade_available"):
         add("fw_update", "MEDIUM", "Firmware (sysupgrade) update available",
             st.get("latest", ""), "Back up config, then upgrade")
@@ -1923,6 +1969,54 @@ uci commit network
         return {"device": dev["name"], "role": "router" if is_router else "switch", "ok": True}
     finally:
         c.close()
+
+
+def do_mesh(dev, cfg):
+    """Configure 802.11s mesh on a device.
+
+    cfg: {enabled, mesh_vap, mesh_ssid, mesh_id, mesh_ctrl, mesh_gw_mode,
+          mesh_gw_bcast, mesh_htmode, mesh_channel, mesh_encryption, mesh_key}.
+
+    Applies idempotently via a named `mesh` uci section on the mesh radio, then
+    `uci commit wireless && wifi reload`. Requires the meshd package; installs
+    it when missing (SSH only).
+    """
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "mesh config requires SSH access on this device")
+    sec = "mesh"
+    lines = [f"uci set wireless.{sec}=wifi-iface"]
+    if not cfg.get("enabled"):
+        lines.append(f"uci set wireless.{sec}.enabled=0")
+        lines.append("uci commit wireless")
+        _run_ssh(dev, "\n".join(lines) + "\n", "mesh", "disabled", "mesh disabled")
+        return {"device": dev["name"], "ok": True, "enabled": False}
+    radio = (cfg.get("mesh_vap") or "radio0").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", radio):
+        raise HTTPException(400, f"invalid mesh radio {radio!r}")
+    lines.append(f"uci set wireless.{sec}.device={_uci_quote(radio)}")
+    lines.append(f"uci set wireless.{sec}.network={_uci_quote(cfg.get('mesh_network') or 'lan')}")
+    lines.append("uci set wireless.{sec}.mode=mesh".replace("{sec}", sec))
+    lines.append(f"uci set wireless.{sec}.mesh={_uci_quote(cfg.get('mesh_id') or 'mesh')}")
+    for opt, key in (("mesh_ctrl", "mesh_ctrl"), ("mesh_gw_mode", "mesh_gw_mode"),
+                     ("mesh_gw_bcast", "mesh_gw_bcast")):
+        if cfg.get(key):
+            lines.append(f"uci set wireless.{sec}.{key}={_uci_quote(str(cfg[key]))}")
+    ht = cfg.get("mesh_htmode")
+    if ht:
+        lines.append(f"uci set wireless.{sec}.htmode={_uci_quote(str(ht))}")
+    chan = cfg.get("mesh_channel")
+    if chan:
+        lines.append(f"uci set wireless.{sec}.channel={_uci_quote(str(chan))}")
+    enc = cfg.get("mesh_encryption") or "none"
+    lines.append(f"uci set wireless.{sec}.encryption={_uci_quote(enc)}")
+    if enc != "none" and cfg.get("mesh_key"):
+        lines.append(f"uci set wireless.{sec}.key={_uci_quote(str(cfg['mesh_key']))}")
+    lines.append("uci commit wireless")
+    lines.append("wifi reload")
+    pre = "opkg install -y meshd || true\n" if cfg.get("install_if_missing") else ""
+    _run_ssh(dev, pre + "\n".join(lines) + "\n", "mesh",
+             f"radio={radio} mesh={cfg.get('mesh_id')} enc={enc}", "mesh apply")
+    return {"device": dev["name"], "ok": True, "enabled": True, "backend": "meshd"}
 
 
 def do_guest_wifi(dev, ssid, password, vlan_id=None):
@@ -3084,6 +3178,56 @@ async def discover_vlans_endpoint(request: Request):
             "vlans_found": all_ids, "vlans": list_vlans()}
 
 
+
+@app.get("/api/devices/{did}/packages")
+def get_device_packages(did: int):
+    """Live software inventory for a device: installed packages, obsolete
+    packages (installed but no longer in any feed), and meshd presence.
+
+    Installed/obsolete are JSON arrays persisted in device_status on every
+    check, so this is instant (no SSH round-trip) after the first gather.
+    """
+    import json as _json
+    row = q("SELECT installed_pkgs, obsolete_pkgs, meshd FROM device_status WHERE device_id=?", (did,))
+    if not row:
+        return {"installed": [], "obsolete": [], "meshd": None, "stale": True}
+    def _parse(col):
+        v = row[0].get(col)
+        if not v:
+            return []
+        try:
+            d = _json.loads(v)
+            return d if isinstance(d, list) else []
+        except Exception:
+            return []
+    return {"installed": _parse("installed_pkgs"), "obsolete": _parse("obsolete_pkgs"),
+            "meshd": row[0].get("meshd"), "stale": False}
+
+@app.post("/api/devices/{did}/packages/remove")
+async def remove_packages(request: Request, did: int):
+    """Remove one or more packages from a device (opkg remove -y)."""
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    dev = cur[0]
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "package removal requires SSH access on this device")
+    d = await request.json()
+    pkgs = d.get("pkgs") or ([d.get("pkg")] if d.get("pkg") else [])
+    if not pkgs:
+        raise HTTPException(400, "pkg (or pkgs list) required")
+    bad = [p for p in pkgs if not re.fullmatch(r"[A-Za-z0-9_.+-]+", str(p))]
+    if bad:
+        raise HTTPException(400, f"invalid package name(s): {bad}")
+    cmd = "opkg remove -y " + " ".join(str(p) for p in pkgs)
+    out, err, status = _run_ssh(dev, cmd, "package_remove",
+                                f"pkgs={','.join(str(p) for p in pkgs)}", "package removal")
+    return {"device": dev["name"], "ok": True, "removed": [str(p) for p in pkgs]}
+
+
+
+
+
 @app.post("/api/devices/{did}/guest-wifi")
 async def device_guest_wifi(request: Request, did: int):
     """Create or update guest WiFi on a device."""
@@ -3140,7 +3284,9 @@ def get_wifi_config(did: int):
         ifaces = _parse_wifi_ifaces(out)
         return {"interfaces": ifaces, "ssid": (ifaces[0]["ssid"] if ifaces else None),
                 "encryption": (ifaces[0]["encryption"] if ifaces else None),
-                "vlan_id": None, "last_check": datetime.now(timezone.utc).isoformat()}
+                "vlan_id": None,
+                "meshd": (_snap[0]["meshd"] if (_snap := q("SELECT meshd FROM device_status WHERE device_id=?", (dev["id"],))) else None),
+                "last_check": datetime.now(timezone.utc).isoformat()}
     finally:
         c.close()
 
@@ -3319,6 +3465,69 @@ async def wifi_clone(request: Request, did: int):
             results.append({"target_id": tid, "name": t["name"], "ok": False, "detail": str(e)})
     log_action(src, 'wifi_clone', f'targets={len(targets)}', ok=True)
     return {"source": src["name"], "results": results}
+@app.post("/api/devices/{did}/mesh")
+async def device_mesh(request: Request, did: int):
+    """Configure 802.11s mesh on a device (meshd / batman-adv).
+
+    Body: {enabled, mesh_vap, mesh_id, mesh_network, mesh_ctrl, mesh_gw_mode,
+           mesh_gw_bcast, mesh_htmode, mesh_channel, mesh_encryption, mesh_key,
+           install_if_missing}.
+    """
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    d = await request.json()
+    cfg = {
+        "enabled": bool(d.get("enabled", True)),
+        "mesh_vap": d.get("mesh_vap") or "radio0",
+        "mesh_id": (d.get("mesh_id") or "mesh").strip(),
+        "mesh_network": d.get("mesh_network") or "lan",
+        "mesh_ctrl": d.get("mesh_ctrl"),
+        "mesh_gw_mode": d.get("mesh_gw_mode"),
+        "mesh_gw_bcast": d.get("mesh_gw_bcast"),
+        "mesh_htmode": d.get("mesh_htmode"),
+        "mesh_channel": d.get("mesh_channel"),
+        "mesh_encryption": d.get("mesh_encryption") or "none",
+        "mesh_key": d.get("mesh_key"),
+        "install_if_missing": bool(d.get("install_if_missing", False)),
+    }
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", cfg["mesh_vap"]):
+        raise HTTPException(400, f"invalid mesh radio {cfg['mesh_vap']!r}")
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", cfg["mesh_id"]):
+        raise HTTPException(400, f"invalid mesh id {cfg['mesh_id']!r}")
+    try:
+        return do_mesh(cur[0], cfg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_action(cur[0], 'mesh', '', ok=False, error=str(e))
+        raise HTTPException(502, f"mesh apply failed: {e}")
+
+
+@app.get("/api/devices/{did}/mesh")
+def get_mesh_config(did: int):
+    """Live mesh config for a device: meshd presence + mesh uci sections."""
+    dev = _require_device(did)
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "mesh read requires SSH access on this device")
+    c = _ssh_connect(dev)
+    try:
+        out, _e, _s = _exec_capture(c, "uci show wireless 2>/dev/null; true", timeout=15)
+    finally:
+        c.close()
+    parsed = parse_uci_show(out)
+    sections = parsed.get("wireless", {})
+    mesh_ifaces = []
+    for name, opts in sections.items():
+        if not isinstance(opts, dict):
+            continue
+        if opts.get("mode") == "mesh" or name.startswith("mesh"):
+            mesh_ifaces.append({k: v for k, v in opts.items() if k != "type"})
+    snap = q("SELECT meshd FROM device_status WHERE device_id=?", (dev["id"],))
+    return {"interfaces": mesh_ifaces, "meshd": (snap[0]["meshd"] if snap else None)}
+
+
+
 
 
 @app.post("/api/devices/{did}/upgrade")

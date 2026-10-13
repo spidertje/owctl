@@ -1743,7 +1743,69 @@ async function renderWifi(target){
       html+=`</div>`;
     }
     html+=`</div>`;
+    // --- Packages (installed + obsolete) ---
+    html+=`<div class="card" style="margin-top:16px">
+      <h3>Installed packages <span class="pill" id="pkg-count" style="margin-left:8px;font-size:11px">…</span></h3>
+      <p class="small muted">Live from opkg. Obsolete packages are installed but no longer in any feed — safe to remove.</p>
+      ${wifi_devs.map(d=>`<div style="margin:8px 0">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <strong>${esc(d.name)}</strong>
+          ${NET_ADVANCED?`<button class="act" onclick="packagesModal(${d.id})">Manage</button>`:''}
+        </div>
+        <div id="pkg-summary-${d.id}" class="small muted">Loading…</div>
+      </div>`).join('')}
+    </div>`;
     el.innerHTML=html;
+
+    for(const d of wifi_devs){
+      try{
+        const pk=await api(`/devices/${d.id}/packages`);
+        const el=document.getElementById(`pkg-summary-${d.id}`);
+        if(!el)continue;
+        if(pk.stale){ el.innerHTML=`<span class="muted">no data yet — run a check</span>`; continue; }
+        const obs=pk.obsolete||[];
+        const total=(pk.installed||[]).length;
+        el.innerHTML=`<span class="small">${total} installed`;
+        if(obs.length){
+          el.innerHTML+=` · <span style="color:var(--warn)">${obs.length} obsolete</span>`;
+          el.innerHTML+=` <button class="act" style="font-size:11px;padding:1px 6px" onclick="packagesModal(${d.id})">review</button>`;
+        }
+        el.innerHTML+=`</span>`;
+      }catch(e){
+        const el=document.getElementById(`pkg-summary-${d.id}`);
+        if(el)el.innerHTML=`<span class="small bad">error</span>`;
+      }
+    }
+    // --- Mesh (802.11s) ---
+    html+=`<div class="card" style="margin-top:16px">
+      <h3>Mesh (802.11s / batman-adv) <span class="pill" id="mesh-badge" style="margin-left:8px;font-size:11px">detecting…</span></h3>
+      <p class="small muted">Turn the device into a mesh node. Requires the meshd package; owctl installs it when missing.</p>
+      ${wifi_devs.map(d=>`<div class="row" style="margin:8px 0;align-items:center;justify-content:space-between">
+        <span><strong>${esc(d.name)}</strong> <span class="small muted">${esc(d.host)}</span></span>
+        <span id="mesh-status-${d.id}" class="small muted">…</span>
+        ${NET_ADVANCED?`<button class="act" onclick="meshModal(${d.id})">Configure mesh</button>`:''}
+      </div>`).join('')}
+    </div>`;
+    el.innerHTML=html;
+
+    for(const d of wifi_devs){
+      try{
+        const cfg=await api(`/devices/${d.id}/mesh`);
+        const st=document.getElementById(`mesh-status-${d.id}`);
+        if(st){
+          if(cfg.interfaces&&cfg.interfaces.length){
+            const i=cfg.interfaces[0];
+            st.innerHTML=`<span style="color:var(--ok)">✓ mesh iface · mode=${esc(i.mode||'?')} · mesh=${esc(i.mesh||'?')}</span>`;
+          }else{
+            st.innerHTML=`<span class="muted">not configured</span>`;
+          }
+        }
+      }catch(e){
+        const st=document.getElementById(`mesh-status-${d.id}`);
+        if(st)st.innerHTML=`<span class="small bad">error</span>`;
+      }
+    }
+
 
     for(const d of wifi_devs){
       try{
@@ -1825,6 +1887,125 @@ async function cloneWifiModal(srcId){
   };
   modal.onclick=e=>{if(e.target===modal)modal.remove()};
 }
+async function meshModal(did){
+  const devs=await api('/devices');
+  const d=devs.find(x=>x.id===did);
+  if(!d)return;
+  let cfg=null;
+  try{ cfg=await api(`/devices/${did}/mesh`); }catch(e){}
+  const modal=document.createElement('div');
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;min-width:420px;max-width:560px">
+    <h3 style="margin:0 0 4px">Mesh configuration · ${esc(d.name)}</h3>
+    <p class="small muted" style="margin:0 0 14px">${esc(d.host)} — 802.11s mesh (meshd)</p>
+    <div class="row" style="margin-bottom:10px">
+      <div style="flex:1"><label>Mesh ID</label><input id="mesh-id" value="mesh" style="width:100%"></div>
+      <div style="flex:1"><label>Radio (VAP)</label><select id="mesh-vap" style="width:100%"></select></div>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <div style="flex:1"><label>Network</label><input id="mesh-net" value="lan" style="width:100%"></div>
+      <div style="flex:1"><label>HT mode</label><select id="mesh-ht" style="width:100%"><option value="">— inherit —</option><option value="HT20">HT20</option><option value="HT40">HT40</option></select></div>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <div style="flex:1"><label>Channel</label><input id="mesh-chan" type="number" min="0" max="196" value="" style="width:100%"></div>
+      <div style="flex:1"><label>Encryption</label><select id="mesh-enc" style="width:100%"><option value="none">none</option><option value="psk2">psk2</option><option value="sae">sae</option></select></div>
+    </div>
+    <div id="mesh-key-row" style="margin-bottom:10px"><label>Mesh key (passphrase)</label><input id="mesh-key" type="password" value="" style="width:100%"></div>
+    <label style="display:flex;align-items:center;gap:6px;margin-bottom:14px"><input type="checkbox" id="mesh-gw" checked> Act as mesh gateway</label>
+    <div id="mesh-results"></div>
+    <div class="row" style="justify-content:flex-end;gap:8px;margin-top:14px">
+      <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
+      <button class="act pri" id="mesh-save">Apply mesh</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  // populate radios
+  try{
+    const wcfg=await api(`/devices/${did}/wifi-config`);
+    const radios=[...new Set((wcfg.interfaces||[]).map(i=>i.device).filter(Boolean))];
+    const sel=modal.querySelector('#mesh-vap');
+    if(radios.length){ radios.forEach(r=>sel.add(new Option(r,r))); } else { sel.add(new Option('radio0','radio0')); }
+  }catch(e){}
+  modal.querySelector('#mesh-enc').onchange=()=>{
+    modal.querySelector('#mesh-key-row').style.display = modal.querySelector('#mesh-enc').value==='none' ? 'none' : '';
+  };
+  modal.querySelector('#mesh-save').onclick=async()=>{
+    const enc=modal.querySelector('#mesh-enc').value;
+    const body={
+      enabled:true,
+      mesh_vap:modal.querySelector('#mesh-vap').value,
+      mesh_id:modal.querySelector('#mesh-id').value,
+      mesh_network:modal.querySelector('#mesh-net').value,
+      mesh_htmode:modal.querySelector('#mesh-ht').value,
+      mesh_channel:modal.querySelector('#mesh-chan').value,
+      mesh_encryption:enc,
+      mesh_key:enc==='none'?'':modal.querySelector('#mesh-key').value,
+      mesh_gw_mode:modal.querySelector('#mesh-gw').checked?'gwb':'no',
+      install_if_missing:true,
+    };
+    const btn=modal.querySelector('#mesh-save');
+    btn.disabled=true; btn.textContent='Applying…';
+    try{
+      await api(`/devices/${did}/mesh`,{method:'POST',body:JSON.stringify(body)});
+      modal.querySelector('#mesh-results').innerHTML='<div style="color:var(--ok);margin-top:10px">Mesh applied · wifi reload issued</div>';
+      toast('Mesh configured on '+d.name);
+      renderWifi();
+      setTimeout(()=>modal.remove(),1200);
+    }catch(e){
+      modal.querySelector('#mesh-results').innerHTML='<div style="color:var(--bad);margin-top:10px">'+esc(String(e))+'</div>';
+      toast(String(e),true);
+    }
+    btn.disabled=false; btn.textContent='Apply mesh';
+  };
+  modal.onclick=e=>{if(e.target===modal)modal.remove()};
+}
+async function packagesModal(did){
+  const devs=await api('/devices');
+  const d=devs.find(x=>x.id===did);
+  if(!d)return;
+  let pk=null;
+  try{ pk=await api(`/devices/${did}/packages`); }catch(e){}
+  const modal=document.createElement('div');
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center';
+  const installed=(pk&&pk.installed)||[];
+  const obsolete=(pk&&pk.obsolete)||[];
+  const stale=pk&&pk.stale;
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;min-width:460px;max-width:620px;max-height:80vh;overflow:auto">
+    <h3 style="margin:0 0 4px">Installed packages · ${esc(d.name)}</h3>
+    <p class="small muted" style="margin:0 0 14px">${installed.length} installed · ${obsolete.length} obsolete</p>
+    ${stale?`<p class="small muted">No data yet — run a device check first.</p>`:''}
+    ${obsolete.length?`<div style="margin-bottom:14px">
+      <h4 style="margin:0 0 6px;color:var(--warn)">Obsolete (no longer in any feed)</h4>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${obsolete.map(p=>`<span style="background:rgba(245,181,68,.12);border:1px solid var(--warn);border-radius:999px;padding:2px 10px;font-size:12px;display:flex;align-items:center;gap:6px">${esc(p)} <button class="act" style="font-size:11px;padding:0 5px" onclick="removePkg(${did},'${esc(p)}')">×</button></span>`).join('')}
+      </div>
+    </div>`:''}
+    <div style="margin-bottom:14px">
+      <h4 style="margin:0 0 6px">Installed (${installed.length})</h4>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;max-height:240px;overflow:auto">
+        ${installed.map(p=>`<span style="background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:2px 10px;font-size:12px">${esc(p)}</span>`).join('')}
+      </div>
+    </div>
+    <div class="row" style="justify-content:flex-end;gap:8px">
+      <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.onclick=e=>{if(e.target===modal)modal.remove()};
+}
+
+async function removePkg(did, pkg){
+  if(!confirm(`Remove ${pkg} from device ${did}?`))return;
+  try{
+    await api(`/devices/${did}/packages/remove`,{method:'POST',body:JSON.stringify({pkg})});
+    toast(pkg+' removed');
+    renderWifi();
+  }catch(e){ toast(String(e),true); }
+}
+
+
+
+
 function vlanOpt(v){
   const label='VLAN '+v.id+(v.subnet?` (${v.subnet})`:'');
   return `<option value="${v.id}">${esc(label)}</option>`;
