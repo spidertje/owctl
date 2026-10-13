@@ -1,3 +1,17 @@
+# Copyright (C) 2026 spidertje
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# version 2 as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #!/usr/bin/env python3
 """owctl — centralized control + threat detection for OpenWrt devices.
 
@@ -8,6 +22,7 @@ config backups, and configurable alerting (dashboard / email / Telegram / webhoo
 Run:  python owctl.py   (serves API + dashboard, default 0.0.0.0:8090)
 """
 import base64
+import bcrypt
 import json
 import os
 import re
@@ -86,6 +101,22 @@ def init_db():
         execute("ALTER TABLE devices ADD COLUMN health_score INTEGER")
     except sqlite3.OperationalError:
         pass
+    # Users + roles. ponytail: two roles only — admin (everything) and
+    # observer (read-only). Per-device ACLs are overkill for a 2-box LAN;
+    # upgrade by adding a `device_acl(user_id, device_id)` join table.
+    execute("""CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'observer',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        last_login TEXT)""")
+    execute("""CREATE TABLE IF NOT EXISTS sessions(
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        created REAL NOT NULL,
+        exp REAL NOT NULL)""")
     execute("""CREATE TABLE IF NOT EXISTS config_hashes(
         id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER, ts TEXT,
         hash TEXT, UNIQUE(device_id, ts))""")
@@ -186,22 +217,124 @@ def set_setting(k, v):
 
 
 def ensure_auth_token():
-    """Return (token, generated). Precedence: OWCTL_TOKEN env > stored ui_token > generate.
+    """Return (token, generated). Precedence: OWCTL_TOKEN env > stored ui_token > none.
 
-    On first boot (no env token, no stored token) a fresh 48-hex-char secret is
-    generated and persisted to the ui_token setting. Idempotent: a second call
-    reuses the stored token. The token guard (token_guard) enforces it on /api/*.
-    Call this at startup before serving.
+    Password login is the primary auth (see /api/auth/login). The bearer token
+    is kept only as an opt-in back door: it must be explicitly set via the
+    OWCTL_TOKEN env var or the settings API — it is never auto-generated.
     """
     env_tok = os.environ.get("OWCTL_TOKEN", "").strip()
     if env_tok:
         return env_tok, False
     stored = (get_setting("ui_token", "") or "").strip()
-    if stored:
-        return stored, False
-    new_tok = secrets.token_hex(24)  # 48 hex chars, 192 bits
-    set_setting("ui_token", new_tok)
-    return new_tok, True
+    return stored, False
+
+
+# --------------------------------------------- password-based admin auth
+# ponytail: two roles only — admin (everything) and observer (read-only).
+# Per-device ACLs are overkill for a 2-box LAN; upgrade by adding a
+# `device_acl(user_id, device_id)` join table if that ever matters.
+_ROLES = {"admin", "observer"}
+_SESSION_TTL = 86400  # 24h
+# Read-only paths that observers are always allowed to hit (even POST, where
+# the action is a query, not a mutation — e.g. /api/devices/{did}/check is a
+# connectivity probe, not a config change).
+_OBSERVER_OK_POST = {
+    "/api/devices/{did}/check", "/api/devices/{did}/test",
+    "/api/devices/{did}/heartbeat", "/api/sweep",
+}
+# Mutating paths observers can never touch, even if the route is a POST.
+_ADMIN_ONLY_PATHS = {
+    "/api/devices", "/api/devices/{did}", "/api/devices/{did}/backup",
+    "/api/devices/{did}/restore", "/api/devices/{did}/reboot",
+    "/api/devices/{did}/upgrade", "/api/devices/{did}/push-key",
+    "/api/devices/{did}/guest-wifi", "/api/devices/{did}/wifi-clone",
+    "/api/dhcp/apply", "/api/dns/apply", "/api/firewall/apply",
+    "/api/qos/apply", "/api/vlans/apply", "/api/vlans/discover",
+    "/api/alerts/config", "/api/bulk", "/api/digest",
+    "/api/findings/ack", "/api/settings",
+}
+
+
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+def ensure_admin_password():
+    """Return the stored admin password hash, or None if none is set yet."""
+    return (get_setting("admin_password_hash", "") or "").strip() or None
+
+
+def _user_by_id(uid):
+    rows = q("SELECT * FROM users WHERE id=?", (uid,))
+    return rows[0] if rows else None
+
+
+def _user_by_username(username):
+    rows = q("SELECT * FROM users WHERE username=?", (username,))
+    return rows[0] if rows else None
+
+
+def _create_session(user_id: int) -> str:
+    tok = secrets.token_hex(32)
+    now = time.time()
+    execute("INSERT INTO sessions(token, user_id, created, exp) VALUES(?,?,?,?)",
+            (tok, user_id, now, now + _SESSION_TTL))
+    # Keep the table bounded — evict anything older than 2x TTL.
+    execute("DELETE FROM sessions WHERE exp < ?", (now - _SESSION_TTL,))
+    return tok
+
+
+def _session_user(token: str):
+    if not token:
+        return None
+    ts = time.time()
+    rows = q("""SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
+               WHERE s.token=? AND s.exp>? AND u.enabled=1""",
+             (token, ts))
+    if rows:
+        execute("UPDATE users SET last_login=? WHERE id=?",
+                (now(), rows[0]["id"]))
+        return rows[0]
+    execute("DELETE FROM sessions WHERE token=?", (token,))
+    return None
+
+
+def _purge_expired_sessions():
+    execute("DELETE FROM sessions WHERE exp < ?", (time.time(),))
+
+
+def _ensure_default_admin():
+    """On first boot, no admin exists. Seed one admin account (password set at
+    first login) so the system is never left without an admin."""
+    if not q("SELECT 1 FROM users LIMIT 1"):
+        execute("INSERT INTO users(username, password_hash, role, enabled, created_at) "
+                "VALUES('admin', ?, 'admin', 1, ?)",
+                ("", now()))
+
+
+def _normalize_path(pattern):
+    """/api/devices/{did} -> regex for /api/devices/123."""
+    return re.sub(r"/\{[^/}]+\}", "/[^/]+", re.escape(pattern)) + r"$"
+
+
+_ADMIN_ONLY_RE = [re.compile(_normalize_path(p)) for p in _ADMIN_ONLY_PATHS]
+_OBSERVER_OK_RE = [re.compile(_normalize_path(p)) for p in _OBSERVER_OK_POST]
+
+
+def _observer_allowed(path: str, method: str) -> bool:
+    if method == "GET":
+        return True
+    if any(rx.match(path) for rx in _ADMIN_ONLY_RE):
+        return False
+    return any(rx.match(path) for rx in _OBSERVER_OK_RE)
 
 
 # --------------------------------------------- device heartbeats / offline events
@@ -1990,21 +2123,57 @@ def _client_key(request) -> str:
     return (request.client.host if request.client else "") or "unknown"
 
 
+def _gen_selfsigned(cert_path: str, key_path: str) -> None:
+    """Generate a self-signed cert if neither exists. ponytail: one-shot fallback;
+    replace with a CA-signed cert in production by setting OWCTL_SSL_CERT/KEY."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime as _dt
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "192.168.55.179"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "owctl"),
+    ])
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + _dt.timedelta(days=365))
+        .sign(key, hashes.SHA256())
+    )
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(key_path, "wb") as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    os.chmod(key_path, 0o600)
+
+
 def tls_kwargs():
     """TLS options for the uvicorn run, from OWCTL_SSL_CERT / OWCTL_SSL_KEY.
 
-    - Neither set -> {} (plain HTTP).
-    - Both set to existing files -> {ssl_certfile, ssl_keyfile}.
-    - Only one set -> raise (a lone cert/key is a misconfiguration that would
-      otherwise silently serve plain HTTP).
-    Use a CA-signed cert in production; for LAN-only, a self-signed cert is fine.
+    HTTPS is mandatory: a cert/key pair is required. If neither is set, a
+    self-signed cert is generated on first boot and stored under DATA_DIR.
+    Use a CA-signed cert in production by setting OWCTL_SSL_CERT/KEY.
     """
     cert = os.environ.get("OWCTL_SSL_CERT", "").strip()
     key = os.environ.get("OWCTL_SSL_KEY", "").strip()
-    if not cert and not key:
-        return {}
     if not (cert and key):
-        raise ValueError("owctl: OWCTL_SSL_CERT and OWCTL_SSL_KEY must be set together for TLS")
+        # fall back to a generated self-signed pair in DATA_DIR
+        cert = os.path.join(DATA_DIR, "cert.pem")
+        key = os.path.join(DATA_DIR, "key.pem")
+        if not (os.path.exists(cert) and os.path.exists(key)):
+            _gen_selfsigned(cert, key)
     if not os.path.exists(cert):
         raise ValueError(f"owctl: TLS cert not found: {cert}")
     if not os.path.exists(key):
@@ -2035,13 +2204,31 @@ async def token_guard(request, call_next):
     # OWCTL_ALLOW_OPEN=1 disables auth (dev/tests only). Production should leave it unset.
     if os.environ.get("OWCTL_ALLOW_OPEN") == "1":
         return await call_next(request)
+    path = request.url.path
+    if path.startswith("/api/auth"):
+        return await call_next(request)
+    # Session-token auth (password login).
+    sess = request.headers.get("authorization", "").split(" ", 1)
+    if len(sess) == 2 and sess[0].lower() == "bearer":
+        user = _session_user(sess[1].strip())
+        if user:
+            if user["role"] == "admin":
+                return await call_next(request)
+            if _observer_allowed(path, request.method):
+                return await call_next(request)
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        # Valid bearer header but no matching session → unauthorized.
+        if path.startswith("/api/"):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    # Legacy bearer token fallback = admin.
     t = get_setting("ui_token", "") or os.environ.get("OWCTL_TOKEN", "")
-    if t and request.url.path.startswith("/api/"):
-        # Header-only auth. (?token= is intentionally NOT accepted — a bearer secret
-        # in the query string leaks into access/proxy logs and browser history.)
+    if t and path.startswith("/api/"):
         auth = request.headers.get("authorization", "")
         if auth != f"Bearer {t}":
             return JSONResponse({"error": "unauthorized"}, status_code=401)
+    # No auth at all on an API path → reject.
+    if path.startswith("/api/"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     return await call_next(request)
 
 
@@ -3313,7 +3500,97 @@ def settings_get():
             gw = None
     return {"audit_interval_min": get_setting("audit_interval_min", "30"),
             "ui_token_set": bool(get_setting("ui_token", "")),
+            "admin_password_set": bool(ensure_admin_password()),
             "network_gateway": gw}
+
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request):
+    """User login. On first boot (no users) the caller must register as admin."""
+    d = await request.json()
+    username = (d.get("username") or "").strip()
+    password = (d.get("password") or "").strip()
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+    # First-boot: no users at all. Register the caller as the admin.
+    users = q("SELECT 1 FROM users LIMIT 1")
+    if not users:
+        _ensure_default_admin()
+    user = _user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    if not user["enabled"]:
+        raise HTTPException(status_code=403, detail="account disabled")
+    if not user["password_hash"]:
+        # Password not yet set — seed it (first-time admin setup).
+        user["password_hash"] = _hash_password(password)
+        execute("UPDATE users SET password_hash=?, role='admin' WHERE id=?",
+                (user["password_hash"], user["id"]))
+    elif not _verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    tok = _create_session(user["id"])
+    return {"session": tok, "expires_in": _SESSION_TTL, "role": user["role"]}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    auth = request.headers.get("authorization", "").split(" ", 1)
+    if len(auth) == 2 and auth[0].lower() == "bearer":
+        execute("DELETE FROM sessions WHERE token=?", (auth[1].strip(),))
+    return {"ok": True}
+
+
+@app.get("/api/users")
+def users_list():
+    rows = q("SELECT id, username, role, enabled, last_login FROM users ORDER BY id")
+    return [{"id": r["id"], "username": r["username"], "role": r["role"],
+             "enabled": bool(r["enabled"]),
+             "last_login": r["last_login"]}
+            for r in rows]
+
+
+@app.post("/api/users")
+async def users_create(request: Request):
+    d = await request.json()
+    username = (d.get("username") or "").strip()
+    password = (d.get("password") or "").strip()
+    role = (d.get("role") or "observer").strip()
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+    if role not in _ROLES:
+        raise HTTPException(status_code=400, detail=f"role must be one of {_ROLES}")
+    if _user_by_username(username):
+        raise HTTPException(status_code=409, detail="username exists")
+    execute("INSERT INTO users(username, password_hash, role, enabled, created_at) VALUES(?,?,?,?,?)",
+            (username, _hash_password(password), role, 1, now()))
+    return {"ok": True}
+
+
+@app.put("/api/users/{uid}")
+async def users_update(uid: int, request: Request):
+    d = await request.json()
+    if not d:
+        raise HTTPException(status_code=400, detail="request body required")
+    user = _user_by_id(uid)
+    if not user:
+        raise HTTPException(status_code=404, detail="user not found")
+    updates = {}
+    if "role" in d and d["role"] in _ROLES:
+        updates["role"] = d["role"]
+    if "enabled" in d:
+        updates["enabled"] = int(bool(d["enabled"]))
+    if "password" in d and d["password"]:
+        updates["password_hash"] = _hash_password(d["password"])
+    if updates:
+        execute(f"UPDATE users SET {', '.join(k+'=?' for k in updates)} WHERE id=?",
+                (*updates.values(), uid))
+    return {"ok": True}
+
+
+@app.delete("/api/users/{uid}")
+def users_delete(uid: int):
+    execute("DELETE FROM users WHERE id=?", (uid,))
+    return {"ok": True}
 
 
 @app.put("/api/settings")
@@ -3321,6 +3598,8 @@ async def settings_put(request: Request):
     d = await request.json()
     if "audit_interval_min" in d:
         set_setting("audit_interval_min", str(int(d["audit_interval_min"])))
+    if "admin_password" in d and d["admin_password"]:
+        set_setting("admin_password_hash", _hash_password(d["admin_password"]))
     if "ui_token" in d:
         set_setting("ui_token", d["ui_token"] or "")
     if "network_gateway" in d:
@@ -3396,6 +3675,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="
 if __name__ == "__main__":
     import uvicorn
     threading.Thread(target=_scheduler, daemon=True).start()
+    _ensure_default_admin()
     _tls = tls_kwargs()
     _scheme = "https" if _tls else "http"
     print(f"owctl: {_scheme}://{HOST}:{PORT}" + (" (TLS)" if _tls else ""))

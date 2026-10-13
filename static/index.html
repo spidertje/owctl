@@ -1,3 +1,19 @@
+<!--
+  Copyright (C) 2026 spidertje
+
+  This program is free software; you can redistribute it and/or
+  modify it under the terms of the GNU General Public License
+  version 2 as published by the Free Software Foundation.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+-->
 <!doctype html>
 <html lang="en">
 <head>
@@ -20,9 +36,9 @@ body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var
 .lg-box h1 span{color:var(--acc)}
 .lg-sub{color:var(--mut);font-size:13px;margin:0 0 16px}
 .lg-body{display:flex;flex-direction:column;gap:10px}
-#login-token{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
+#login-pass{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
   background:var(--panel2);color:var(--tx);font-size:14px;text-align:center}
-#login-token:focus{outline:2px solid var(--acc);border-color:transparent}
+#login-pass:focus{outline:2px solid var(--acc);border-color:transparent}
 .lg-err{color:var(--bad);font-size:12.5px;min-height:1em;margin:-4px 0 0}
 .lg-btn{width:100%;padding:10px 12px;border-radius:9px;border:none;cursor:pointer;
   background:var(--acc);color:#08101e;font-size:14px;font-weight:600}
@@ -100,29 +116,35 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <div class="lg-box">
     <div class="lg-logo">🛰️</div>
     <h1>ow<span>ctl</span></h1>
-    <p class="lg-sub">OpenWrt control + threat watch — enter your token to unlock.</p>
+    <p class="lg-sub">OpenWrt control + threat watch — sign in with your account.</p>
     <div class="lg-body">
-      <input id="login-token" type="password" placeholder="Bearer token"
-             autocapitalize="off" spellcheck="false" autocomplete="off" aria-label="owctl token"
-             onkeydown="if(event.key==='Enter'){event.preventDefault();tryLogin(this.value)}"/>
+      <input id="login-user" type="text" placeholder="Username"
+             autocomplete="username" autocapitalize="none" spellcheck="false"
+             aria-label="username"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('login-pass').focus()}"/>
+      <input id="login-pass" type="password" placeholder="Password"
+             autocapitalize="off" spellcheck="false" autocomplete="current-password"
+             aria-label="password"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();tryLogin()}"/>
       <div id="login-err" class="lg-err" role="alert"></div>
-      <button type="button" class="lg-btn" onclick="tryLogin(document.getElementById('login-token').value)">Unlock</button>
+      <button type="button" class="lg-btn" onclick="tryLogin()">Sign in</button>
     </div>
-    <p class="lg-hint">Token is stored only in this browser (localStorage) and sent as
-    <code>Authorization: Bearer</code> on every request.</p>
+    <p class="lg-hint">On first boot, pick your admin password. Sessions last 24h and
+    are stored only in this browser; the server forgets them on restart.</p>
   </div>
 </div>
 <header>
   <h1>ow<span>ctl</span> <span class="pill">OpenWrt control + threat watch</span></h1>
   <nav>
     <button data-tab="network" class="on">Home</button>
-       <button data-tab="devices">Devices</button>
-       <button data-tab="threats">Threats</button>
-       <button data-tab="sweep">Sweep</button>
-       <button data-tab="alerts">Alerting</button>
-       <button data-tab="map">Network Map</button>
-       <button data-tab="net">Network</button>
-       <button data-tab="logs">Device Logs</button>
+     <button data-tab="devices">Devices</button>
+     <button data-tab="threats">Threats</button>
+     <button data-tab="sweep">Sweep</button>
+     <button data-tab="alerts">Alerting</button>
+     <button data-tab="map">Network Map</button>
+     <button data-tab="net">Network</button>
+     <button data-tab="logs">Device Logs</button>
+     <button data-tab="users" class="adm-only" style="display:none">Users</button>
   </nav>
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
 </header>
@@ -136,12 +158,14 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <section id="tab-net" style="display:none"></section>
   <section id="tab-wifi" style="display:none"></section>
   <section id="tab-logs" style="display:none"></section>
+  <section id="tab-users" style="display:none"></section>
 </main>
 <div id="toast"></div>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let TOKEN=localStorage.getItem('owctl_token')||'';
+let TOKEN=localStorage.getItem('owctl_session')||'';
+let ROLE=localStorage.getItem('owctl_role')||'';
 async function api(path,opts={}){
   opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
   if(TOKEN)opts.headers['Authorization']='Bearer '+TOKEN;
@@ -172,6 +196,7 @@ function render(tab){
   if(tab==='logs')return renderLogs();
   if(tab==='net')return renderNet();
   if(tab==='wifi')return renderWifi();
+  if(tab==='users')return renderUsers();
 }
 function fmtUptime(s){if(!s&&s!==0)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m'}
 function fmtKB(k){return k>1048576?(k/1048576).toFixed(1)+' GB':(k/1024).toFixed(0)+' MB'}
@@ -1188,7 +1213,7 @@ function showLogin(msg){
   if(main)main.style.display='none';
   if(gate)gate.hidden=false;
   if(err)err.textContent=msg||'';
-  const inp=document.getElementById('login-token');
+  const inp=document.getElementById('login-pass');
   if(inp){inp.value='';setTimeout(()=>inp.focus(),0);}
   stopPolling && stopPolling();
 }
@@ -1198,34 +1223,36 @@ function hideLogin(){
   if(gate)gate.hidden=true;
   if(main)main.style.display='';
 }
-async function verifyToken(t){
+async function verifySession(t){
   try{const r=await fetch('/api/network',{headers:{'Authorization':'Bearer '+t}});return r.status===200;}
   catch(e){return false;}
 }
-async function tryLogin(t){
-  t=(t||'').trim();
+async function tryLogin(){
+  const u=(document.getElementById('login-user')||{}).value||'';
+  const p=(document.getElementById('login-pass')||{}).value||'';
   const err=document.getElementById('login-err');
-  if(!t){if(err)err.textContent='Enter your token';return;}
+  if(!u||!p){if(err)err.textContent='Enter your username and password';return;}
   if(err)err.textContent='Checking…';
-  if(await verifyToken(t)){
-    TOKEN=t;localStorage.setItem('owctl_token',t);
-    hideLogin();
-    render('network');
-    startPolling(60000);
-  }else{
-    if(err)err.textContent='Invalid token';
-  }
+  try{
+    const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok && j.session){
+      TOKEN=j.session;localStorage.setItem('owctl_session',j.session);
+      ROLE=(j.role||'').toLowerCase();localStorage.setItem('owctl_role',ROLE);
+      hideLogin();render('network');startPolling(60000);showAdminUI();
+      return;
+    }
+    if(err)err.textContent=j.detail||'Sign-in failed';
+  }catch(e){if(err)err.textContent='Network error';}
 }
+function showAdminUI(){document.querySelectorAll('.adm-only').forEach(el=>el.style.display='')}
 function bootApp(){
-  // If a token is already stored, try it silently; otherwise show the gate.
   if(TOKEN){
-    verifyToken(TOKEN).then(ok=>{
-      if(ok){hideLogin();render('network');startPolling(60000);}
-      else{localStorage.removeItem('owctl_token');showLogin('Token not valid — sign in');}
+    verifySession(TOKEN).then(ok=>{
+      if(ok){hideLogin();render('network');startPolling(60000);showAdminUI();}
+      else{localStorage.removeItem('owctl_session');localStorage.removeItem('owctl_role');ROLE='';showLogin();}
     });
-  }else{
-    showLogin();
-  }
+  }else{showLogin();}
 }
 function toggleTheme(){document.body.classList.toggle('light')}
 bootApp();
@@ -1858,6 +1885,41 @@ async function editWifi(did){
     disc.disabled=false;disc.textContent='⟳ discover';
   };
   modal.onclick=e=>{if(e.target===modal)modal.remove()};
+}
+function renderUsers(){
+  const el=document.getElementById('tab-users');if(!el)return;
+  el.innerHTML='<div class="panel"><h2>User management</h2><div id="user-list"></div><h3>Add user</h3><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+    '<input id="u-new-name" placeholder="Username" style="padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)">'+
+    '<input id="u-new-pass" type="password" placeholder="Password" style="padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)">'+
+    '<select id="u-new-role" style="padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)">'+
+    '<option value="observer">Observer</option><option value="admin">Admin</option></select>'+
+    '<button onclick="addUser()" style="padding:6px 14px;border-radius:6px;border:none;background:var(--acc);color:#08101e;cursor:pointer">Add</button>'+
+    '</div></div>';
+  loadUsers();
+}
+async function loadUsers(){
+  const el=document.getElementById('user-list');if(!el)return;
+  try{
+    const users=await api('/users');
+    el.innerHTML=users.length?'<table class="ut">'+users.map(u=>`<tr><td>${esc(u.username)}</td><td><span class="pill" style="font-size:11px">${esc(u.role)}</span></td><td>${u.enabled?'<span style="color:var(--ok)">active</span>':'<span style="color:var(--bad)">disabled</span>'}</td><td>${u.last_login||''}</td><td>${u.id!==1?`<button onclick="toggleUser(${u.id},${u.enabled?0:1})" style="padding:3px 8px;border-radius:5px;border:1px solid var(--line);background:transparent;color:var(--tx);cursor:pointer">${u.enabled?'Disable':'Enable'}</button><button onclick="deleteUser(${u.id})" style="padding:3px 8px;border-radius:5px;border:1px solid var(--bad);background:transparent;color:var(--bad);cursor:pointer;margin-left:4px">Delete</button>`:''}</td></tr>`).join(''):'<p>No users.</p>';
+  }catch(e){el.textContent='Error loading users: '+e.message;}
+}
+async function addUser(){
+  const name=(document.getElementById('u-new-name')||{}).value||'';
+  const pass=(document.getElementById('u-new-pass')||{}).value||'';
+  const role=(document.getElementById('u-new-role')||{}).value||'observer';
+  if(!name||!pass){toast('Name and password required',true);return;}
+  try{await api('/users',{method:'POST',body:JSON.stringify({username:name,password:pass,role})});toast('User created');loadUsers();}
+  catch(e){toast(e.message,true);}
+}
+async function toggleUser(uid,on){
+  try{await api('/users/'+uid,{method:'PUT',body:JSON.stringify({enabled:on})});loadUsers();}
+  catch(e){toast(e.message,true);}
+}
+async function deleteUser(uid){
+  if(!confirm('Delete this user?'))return;
+  try{await api('/users/'+uid,{method:'DELETE'});toast('Deleted');loadUsers();}
+  catch(e){toast(e.message,true);}
 }
 </script>
 </body>
