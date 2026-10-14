@@ -22,7 +22,7 @@
 <title>owctl — OpenWrt control</title>
 <style>
 :root{--bg:#0f1420;--panel:#161d2e;--panel2:#1c2540;--tx:#dbe4f5;--mut:#8b98b8;--acc:#4da3ff;--ok:#39c07f;--warn:#f5b544;--bad:#f4636e;--crit:#ff5470;--line:#26314f}
-.light{--bg:#f0f2f5;--panel:#fff;--panel2:#e8eaf0;--tx:#1a1a2e;--mut:#6b7280;--line:#d1d5db}
+.light{--bg:#f0f2f5;--panel:#fff;--panel2:#e8eaf0;--tx:#1a1a2e;--mut:#6b7280;--acc:#2563eb;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--crit:#e11d48;--line:#d1d5db}
 *{box-sizing:border-box}
 body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
 /* login gate */
@@ -45,6 +45,9 @@ body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var
 .lg-btn:hover{filter:brightness(1.06)}
 .lg-hint{color:var(--mut);font-size:11.5px;margin:14px 0 0;line-height:1.5}
 .lg-hint code{color:var(--acc)}
+/* generic section panel (e.g. Users tab) */
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+.panel h2{margin:0 0 12px;font-size:17px}
 header{display:flex;align-items:center;gap:14px;padding:14px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
 header h1{font-size:17px;margin:0;font-weight:600}
 header h1 span{color:var(--acc)}
@@ -944,6 +947,10 @@ function drawTrafficChart(canvas,data){
   // Find max for scaling
   const max=Math.max(...data.flatMap(d=>[d.rx,d.tx]));
   if(!max)return;
+  // Resolve theme tokens to concrete colors (Canvas 2D cannot read var()/hex
+  // only; resolving here keeps the chart in light/dark mode).
+  const cssv=n=>(getComputedStyle(document.documentElement).getPropertyValue(n)||'').trim()||'#888';
+  const colRX=cssv('--acc'),colTX=cssv('--bad'),colMut=cssv('--mut');
   // Draw RX and TX lines
   const drawLine=(key,color)=>{
     ctx.strokeStyle=color;ctx.lineWidth=1.5;ctx.beginPath();
@@ -954,10 +961,10 @@ function drawTrafficChart(canvas,data){
     });
     ctx.stroke();
   };
-  drawLine('rx','#4da3ff');
-  drawLine('tx','#ff6b6b');
+  drawLine('rx',colRX);
+  drawLine('tx',colTX);
   // Labels
-  ctx.fillStyle='var(--mut)';ctx.font='9px sans-serif';
+  ctx.fillStyle=colMut;ctx.font='9px sans-serif';
   ctx.fillText('RX',4,12);ctx.fillText('TX',20,12);
 }
 function selectAccess(onOk){
@@ -1745,7 +1752,7 @@ async function renderWifi(target){
     html+=`</div>`;
     // --- Packages (installed + obsolete) ---
     html+=`<div class="card" style="margin-top:16px">
-      <h3>Installed packages <span class="pill" id="pkg-count" style="margin-left:8px;font-size:11px">…</span></h3>
+      <h3>Installed packages</h3>
       <p class="small muted">Live from opkg. Obsolete packages are installed but no longer in any feed — safe to remove.</p>
       ${wifi_devs.map(d=>`<div style="margin:8px 0">
         <div style="display:flex;justify-content:space-between;align-items:center">
@@ -1778,7 +1785,7 @@ async function renderWifi(target){
     }
     // --- Mesh (802.11s) ---
     html+=`<div class="card" style="margin-top:16px">
-      <h3>Mesh (802.11s / batman-adv) <span class="pill" id="mesh-badge" style="margin-left:8px;font-size:11px">detecting…</span></h3>
+      <h3>Mesh (802.11s / batman-adv) <span class="pill" id="mesh-badge" style="margin-left:8px;font-size:11px">—</span></h3>
       <p class="small muted">Turn the device into a mesh node. Requires the meshd package; owctl installs it when missing.</p>
       ${wifi_devs.map(d=>`<div class="row" style="margin:8px 0;align-items:center;justify-content:space-between">
         <span><strong>${esc(d.name)}</strong> <span class="small muted">${esc(d.host)}</span></span>
@@ -1788,6 +1795,7 @@ async function renderWifi(target){
     </div>`;
     el.innerHTML=html;
 
+    let meshOn=0;
     for(const d of wifi_devs){
       try{
         const cfg=await api(`/devices/${d.id}/mesh`);
@@ -1796,6 +1804,7 @@ async function renderWifi(target){
           if(cfg.interfaces&&cfg.interfaces.length){
             const i=cfg.interfaces[0];
             st.innerHTML=`<span style="color:var(--ok)">✓ mesh iface · mode=${esc(i.mode||'?')} · mesh=${esc(i.mesh||'?')}</span>`;
+            meshOn++;
           }else{
             st.innerHTML=`<span class="muted">not configured</span>`;
           }
@@ -1805,6 +1814,9 @@ async function renderWifi(target){
         if(st)st.innerHTML=`<span class="small bad">error</span>`;
       }
     }
+    // Summarize the mesh badge from real data (was dead UI).
+    const badge=document.getElementById('mesh-badge');
+    if(badge){badge.textContent=meshOn?`${meshOn} node${meshOn>1?'s':''} on`:'off';}
 
 
     for(const d of wifi_devs){

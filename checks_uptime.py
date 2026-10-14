@@ -79,10 +79,15 @@ def main():
     try:
         from starlette.testclient import TestClient
         client = TestClient(owctl.app)
-        r = client.get("/api/devices/1/heartbeat?limit=5")
+        # password-login is now the only auth: get a session, then use it.
+        lr = client.post("/api/auth/login", json={"username": "admin", "password": "uptime-pass-123"})
+        check("login (first boot) -> 200", lr.status_code == 200, f"got {lr.status_code}")
+        sess = (lr.json() or {}).get("session", "")
+        H = {"Authorization": f"Bearer {sess}"}
+        r = client.get("/api/devices/1/heartbeat?limit=5", headers=H)
         check("heartbeat endpoint returns 200", r.status_code == 200, str(r.status_code))
         check("heartbeat endpoint returns 3 rows", len(r.json()) == 3, str(r.json()))
-        r = client.get("/api/uptime")
+        r = client.get("/api/uptime", headers=H)
         check("uptime endpoint returns 200", r.status_code == 200, str(r.status_code))
         data = r.json()
         check("uptime endpoint lists the seeded device", any(d["id"] == 1 for d in data), str(data))
@@ -91,14 +96,14 @@ def main():
         check("uptime online_count == 2", dev0["online_count"] == 2, str(dev0))
         check("uptime_pct == 66.7", dev0["uptime_pct"] == 66.7, str(dev0["uptime_pct"]))
         check("uptime last_online set", dev0["last_online"] is not None, str(dev0))
-        r = client.get("/api/offline-events")
+        r = client.get("/api/offline-events", headers=H)
         check("offline-events endpoint returns 200", r.status_code == 200, str(r.status_code))
         check("offline-events endpoint returns 1 event", len(r.json()) == 1, str(r.json()))
     except Exception as e:
-        # TestClient needs httpx2; route-registration assertions above are the
+        # TestClient needs httpx; route-registration assertions above are the
         # hard requirement, so a missing transport backend is not a failure.
-        if "httpx2" in repr(e).lower() or "testclient" in repr(e).lower():
-            print("NOTE: TestClient skipped (no httpx2 backend); route assertions above stand")
+        if "httpx" in repr(e).lower() or "testclient" in repr(e).lower():
+            print("NOTE: TestClient skipped (no httpx backend); route assertions above stand")
         else:
             check("TestClient path exercised", False, repr(e))
 

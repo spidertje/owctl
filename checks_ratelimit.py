@@ -56,10 +56,10 @@ def main():
     check("over limit: 429", r.status_code == 429, str(r.status_code))
     check("over limit: Retry-After header", "retry-after" in {k.lower() for k in r.headers}, str(dict(r.headers)))
 
-    # a different client (different host) is NOT blocked
+    # X-Forwarded-For must NOT grant a fresh budget (it is client-forgable).
+    # Before the _client_key hardening this returned 200 (the bypass); now 429.
     r2 = client.get("/api/settings", headers={"X-Forwarded-For": "10.0.0.99"})
-    check("different IP: still 200", r2.status_code == 200, str(r2.status_code))
-
+    check("XFF spoof: still 429 (no bypass)", r2.status_code == 429, str(r2.status_code))
     print(f"\n=== SUMMARY ===\n{sum(1 for _, ok, _ in CHECKS if ok)}/{len(CHECKS)} checks passed")
     failed = [n for n, ok, _ in CHECKS if not ok]
     if failed:

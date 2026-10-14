@@ -45,31 +45,34 @@ def main():
     open(cert, "w").write("CERT")
     open(key, "w").write("KEY")
 
-    # neither -> no TLS
+    # neither -> TLS-mandatory: a self-signed pair is generated under DATA_DIR
+    # (HTTPS is never optional; a plain-HTTP fallback would leak credentials).
     os.environ.pop("OWCTL_SSL_CERT", None)
     os.environ.pop("OWCTL_SSL_KEY", None)
     kw = owctl.tls_kwargs()
-    check("no certs: plain (no ssl kwargs)", kw == {}, str(kw))
+    check("no certs: TLS-mandatory (ssl kwargs present)",
+          bool(kw.get("ssl_certfile")) and bool(kw.get("ssl_keyfile")), str(kw))
+    check("no certs: self-signed cert exists",
+          os.path.exists(kw["ssl_certfile"]), kw.get("ssl_certfile", ""))
+    check("no certs: self-signed key exists",
+          os.path.exists(kw["ssl_keyfile"]), kw.get("ssl_keyfile", ""))
 
-    # both -> TLS kwargs
+    # both -> TLS kwargs passed through to the provided files
     os.environ["OWCTL_SSL_CERT"] = cert
     os.environ["OWCTL_SSL_KEY"] = key
     kw = owctl.tls_kwargs()
     check("both set: ssl_certfile", kw.get("ssl_certfile") == cert, str(kw))
     check("both set: ssl_keyfile", kw.get("ssl_keyfile") == key, str(kw))
 
-    # cert but no key -> raises
+    # cert but no key -> under TLS-mandatory this does NOT raise; it falls back
+    # to the self-signed pair in DATA_DIR (never serves plain HTTP). The returned
+    # cert is the generated one, not the provided (keyless) file.
     os.environ.pop("OWCTL_SSL_KEY", None)
-    raised = False
-    msg = ""
-    try:
-        owctl.tls_kwargs()
-    except Exception as e:
-        raised = True
-        msg = str(e)
-    check("cert without key: raises", raised, "")
-    if raised:
-        check("cert without key: message mentions key", "key" in msg.lower(), msg)
+    kw3 = owctl.tls_kwargs()
+    check("cert without key: no raise (TLS-mandatory fallback)",
+          bool(kw3.get("ssl_certfile")) and bool(kw3.get("ssl_keyfile")), str(kw3))
+    check("cert without key: returns existing files",
+          os.path.exists(kw3["ssl_certfile"]) and os.path.exists(kw3["ssl_keyfile"]), str(kw3))
 
     print(f"\n=== SUMMARY ===\n{sum(1 for _, ok, _ in CHECKS if ok)}/{len(CHECKS)} checks passed")
     failed = [n for n, ok, _ in CHECKS if not ok]

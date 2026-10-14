@@ -35,10 +35,9 @@ python owctl.py                 # http://<this-host>:8090
 Useful env:
 - `OWCTL_HOST` (default 0.0.0.0), `OWCTL_PORT` (default 8090)
 - `OWCTL_DATA` (data dir, default ./data)
-- `OWCTL_TOKEN` — bearer token for all /api routes. **Optional**: if unset and
-  no token is stored, a 48-hex-char token is auto-generated on first boot and
-  printed once to stdout. Send it as `Authorization: Bearer <token>` (header
-  only — the `?token=` query string is not accepted).
+- `OWCTL_TRUST_PROXY` — set `1` only when owctl sits behind a trusted reverse
+  proxy. Then the rate limiter keys on the rightmost `X-Forwarded-For` hop
+  instead of the (proxy's) TCP address. Leave unset to rate-limit by real IP.
 - `OWCTL_SSL_CERT` / `OWCTL_SSL_KEY` — serve over HTTPS (both must be set).
 - `OWCTL_RATELIMIT_MAX` / `OWCTL_RATELIMIT_WINDOW` — API rate limit
   (default 120 req / 60 s per client IP).
@@ -46,9 +45,12 @@ Useful env:
 
 ## Security model
 
-- **Auth is always enforced** on `/api/*`. A token always exists: your
-  `OWCTL_TOKEN` env var, the stored `ui_token` (change it in Settings), or an
-  auto-generated one shown once at first startup.
+- **Auth is always enforced** on `/api/*` via **password login only**
+  (`POST /api/auth/login`) → a 24h session token sent as
+  `Authorization: Bearer *** On first boot an `admin` account is
+  seeded with no password; its password is set at the first login. Two roles:
+  `admin` (everything) and `observer` (read-only). There is no bearer-token
+  back-door.
 - **Device credentials are redacted**: `GET /api/devices` returns
   `has_ssh_password` / `has_luci_pass` booleans, never the raw passwords.
 - **Rate limiting** (429 + `Retry-After`) protects the token endpoint from brute force.
@@ -147,5 +149,6 @@ Agent workflow after boot:
 3. `POST /api/devices/{id}/push-key` so subsequent access is key-only.
 4. `POST /api/devices/{id}/check` to run the threat audit; review `GET /api/findings`.
 5. `PUT /api/alerts/config` to enable Email / Telegram / Webhook channels.
-6. Optional bearer token: set `OWCTL_TOKEN=<secret>` before starting, then send
-   `Authorization: Bearer <secret>` on every `/api/*` call.
+6. Auth is password-login only: `POST /api/auth/login` sets the admin password
+   on first boot and returns a 24h session token; send it as
+   `Authorization: Bearer *** on subsequent `/api/*` calls.

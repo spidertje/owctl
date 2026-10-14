@@ -17,3 +17,7 @@
 fastapi
 uvicorn
 paramiko
+bcrypt
+cryptography
+# Test-only: starlette TestClient (test_e2e.py, checks_*.py) needs a real httpx.
+httpx

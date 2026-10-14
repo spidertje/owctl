@@ -221,20 +221,6 @@ def set_setting(k, v):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
 
 
-def ensure_auth_token():
-    """Return (token, generated). Precedence: OWCTL_TOKEN env > stored ui_token > none.
-
-    Password login is the primary auth (see /api/auth/login). The bearer token
-    is kept only as an opt-in back door: it must be explicitly set via the
-    OWCTL_TOKEN env var or the settings API — it is never auto-generated.
-    """
-    env_tok = os.environ.get("OWCTL_TOKEN", "").strip()
-    if env_tok:
-        return env_tok, False
-    stored = (get_setting("ui_token", "") or "").strip()
-    return stored, False
-
-
 # --------------------------------------------- password-based admin auth
 # ponytail: two roles only — admin (everything) and observer (read-only).
 # Per-device ACLs are overkill for a 2-box LAN; upgrade by adding a
@@ -1974,7 +1960,7 @@ uci commit network
 def do_mesh(dev, cfg):
     """Configure 802.11s mesh on a device.
 
-    cfg: {enabled, mesh_vap, mesh_ssid, mesh_id, mesh_ctrl, mesh_gw_mode,
+    cfg: {enabled, mesh_vap, mesh_id, mesh_ctrl, mesh_gw_mode,
           mesh_gw_bcast, mesh_htmode, mesh_channel, mesh_encryption, mesh_key}.
 
     Applies idempotently via a named `mesh` uci section on the mesh radio, then
@@ -2211,9 +2197,18 @@ _rate_limiter = _RateLimiter(_RATELIMIT_MAX, _RATELIMIT_WINDOW)
 
 
 def _client_key(request) -> str:
-    xf = request.headers.get("x-forwarded-for", "")
-    if xf:
-        return xf.split(",")[0].strip()
+    # Security: key on the real TCP address, NOT X-Forwarded-For. A client can
+    # send arbitrary XFF values, so trusting them lets them rotate keys past the
+    # rate limiter (and >4096 keys triggers the _hits.clear() self-wipe). Behind a
+    # trusted reverse proxy, request.client.host is the proxy, so opt in with
+    # OWCTL_TRUST_PROXY=1 — then we take the rightmost (last-appended) hop, which
+    # is the first one the proxy couldn't forge.
+    if os.environ.get("OWCTL_TRUST_PROXY") == "1":
+        xf = request.headers.get("x-forwarded-for", "")
+        if xf:
+            right = xf.rsplit(",", 1)[-1].strip()
+            if right:
+                return right
     return (request.client.host if request.client else "") or "unknown"
 
 
@@ -2273,19 +2268,6 @@ def tls_kwargs():
     if not os.path.exists(key):
         raise ValueError(f"owctl: TLS key not found: {key}")
     return {"ssl_certfile": cert, "ssl_keyfile": key}
-# Security: guarantee a token exists so the API is never left open.
-# On first boot this generates a fresh secret, persists it, and prints it once
-# so the operator can retrieve it. Subsequent boots reuse the stored token.
-_AUTH_TOKEN, _AUTH_GENERATED = ensure_auth_token()
-if _AUTH_GENERATED:
-    print("=" * 62, flush=True)
-    print("owctl: no token configured — generated a new one (shown ONCE):", flush=True)
-    print(f"    TOKEN = {_AUTH_TOKEN}", flush=True)
-    print("  Store it now; the API requires `Authorization: Bearer <TOKEN>`.", flush=True)
-    print("  (Set OWCTL_TOKEN env var to override, or change it in Settings.)", flush=True)
-    print("=" * 62, flush=True)
-
-
 @app.middleware("http")
 async def token_guard(request, call_next):
     # Rate limiting on the API surface (protects the token endpoint from brute force).
@@ -2301,26 +2283,22 @@ async def token_guard(request, call_next):
     path = request.url.path
     if path.startswith("/api/auth"):
         return await call_next(request)
-    # Session-token auth (password login).
-    sess = request.headers.get("authorization", "").split(" ", 1)
-    if len(sess) == 2 and sess[0].lower() == "bearer":
-        user = _session_user(sess[1].strip())
+    # Auth: password-login session token only. On first boot an `admin` account
+    # is seeded with no password; its password is set at the first
+    # /api/auth/login. Two roles: admin (everything) and observer (read-only).
+    auth = request.headers.get("authorization", "")
+    parts = auth.split(" ", 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        user = _session_user(parts[1].strip())
         if user:
             if user["role"] == "admin":
                 return await call_next(request)
             if _observer_allowed(path, request.method):
                 return await call_next(request)
             return JSONResponse({"error": "forbidden"}, status_code=403)
-        # Valid bearer header but no matching session → unauthorized.
         if path.startswith("/api/"):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-    # Legacy bearer token fallback = admin.
-    t = get_setting("ui_token", "") or os.environ.get("OWCTL_TOKEN", "")
-    if t and path.startswith("/api/"):
-        auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {t}":
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-    # No auth at all on an API path → reject.
+    # No session bearer header.
     if path.startswith("/api/"):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     return await call_next(request)
@@ -3708,7 +3686,6 @@ def settings_get():
         except (TypeError, ValueError):
             gw = None
     return {"audit_interval_min": get_setting("audit_interval_min", "30"),
-            "ui_token_set": bool(get_setting("ui_token", "")),
             "admin_password_set": bool(ensure_admin_password()),
             "network_gateway": gw}
 
@@ -3809,8 +3786,6 @@ async def settings_put(request: Request):
         set_setting("audit_interval_min", str(int(d["audit_interval_min"])))
     if "admin_password" in d and d["admin_password"]:
         set_setting("admin_password_hash", _hash_password(d["admin_password"]))
-    if "ui_token" in d:
-        set_setting("ui_token", d["ui_token"] or "")
     if "network_gateway" in d:
         v = d["network_gateway"]
         if v in (None, ""):
