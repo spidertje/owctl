@@ -1800,28 +1800,32 @@ def luci_test(dev):
 
 
 def push_ssh_key(dev):
-    """Install the owctl public key on the device, then verify key-only auth."""
+    """Install the owctl public key on the device, then verify key-only auth.
+
+    Uses a plain SSH exec command rather than SFTP: many OpenWrt builds ship
+    without the sftp subsystem (paramiko then raises 'EOF' on the first SFTP
+    call), so writing authorized_keys over the exec channel is more robust.
+    """
     pub = _key_pub_line()
     key_path = ensure_server_key()
     c = _ssh_connect(dev)
     try:
-        sftp = c.open_sftp()
-        try:
-            sftp.mkdir("/home/root/.ssh")
-        except IOError:
-            pass
-        sftp.chmod("/home/root/.ssh", 0o700)
-        existing = ""
-        try:
-            with sftp.open("/home/root/.ssh/authorized_keys", "r") as fh:
-                existing = fh.read().decode(errors="replace")
-        except IOError:
-            pass
-        if pub not in existing.splitlines():
-            with sftp.open("/home/root/.ssh/authorized_keys", "a") as fh:
-                fh.write(pub + "\n")
-        sftp.chmod("/home/root/.ssh/authorized_keys", 0o600)
-        sftp.close()
+        # base64-encode the key so the command contains no shell metacharacters
+        # (no quoting/escaping pitfalls, works on ash/dash/busybox sh). Decode
+        # remotely, de-dup, and set correct permissions.
+        import base64
+        b64 = base64.b64encode(pub.encode()).decode()
+        cmd = (
+            "set -e; "
+            "mkdir -p /home/root/.ssh && chmod 700 /home/root/.ssh; "
+            "grep -qF '" + pub + "' /home/root/.ssh/authorized_keys 2>/dev/null || "
+            "printf '%s' '" + b64 + "' | base64 -d >> /home/root/.ssh/authorized_keys; "
+            "chmod 600 /home/root/.ssh/authorized_keys"
+        )
+        out, err, status = _exec_capture(c, cmd, timeout=60)
+        if status != 0:
+            raise RuntimeError(f"key push exec failed (exit {status}): "
+                               f"{(err or out).strip()[:200]}")
     finally:
         c.close()
     execute("UPDATE devices SET key_path=? WHERE id=?", (key_path, dev["id"]))
