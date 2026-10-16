@@ -157,6 +157,7 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS dhcp(
         device_id INTEGER, vlan_id TEXT, iface TEXT, start INTEGER, "limit" INTEGER,
         lease_time TEXT, enabled INTEGER, ts TEXT,
+        options TEXT, static_leases TEXT,
         PRIMARY KEY(device_id, vlan_id))""")
     execute("""CREATE TABLE IF NOT EXISTS dns(
         device_id INTEGER PRIMARY KEY, servers TEXT, search_domains TEXT, ts TEXT)""")
@@ -174,6 +175,13 @@ def init_db():
     for _col, _typ in (("installed_pkgs", "TEXT"), ("obsolete_pkgs", "TEXT"), ("meshd", "TEXT")):
         try:
             execute(f"ALTER TABLE device_status ADD COLUMN {_col} {_typ}")
+        except sqlite3.OperationalError:
+            pass
+    # Idempotent migration for databases created before the full per-VLAN DHCP
+    # surface (options + static leases JSON) existed.
+    for _col in ("options", "static_leases"):
+        try:
+            execute(f"ALTER TABLE dhcp ADD COLUMN {_col} TEXT")
         except sqlite3.OperationalError:
             pass
     # Idempotent migration for databases created before wifi_capable existed.
@@ -1196,27 +1204,102 @@ def build_wifi_clone_cmds(iface: dict, radio: str) -> tuple:
     return slug, "\n".join(lines) + "\n"
 
 
-def build_dhcp_apply_cmds(iface: str, start, limit, lease_time: str) -> str:
-    """Uci script to create/update a DHCP pool section. Pure (no I/O).
+def build_dhcp_cmds(iface: str, cfg: dict) -> str:
+    """Uci script (pure, no I/O) to create/update the FULL DHCP pool section on
+    ``dhcp.<iface>``, covering the whole per-VLAN surface:
 
-    Uses the dnsmasq/odhcpd ``leasetime`` option (no underscore) so the value
-    actually takes effect, and sets ``dhcpv4=server`` so the pool serves on
-    both backends. All values go through :func:`_uci_quote`.
-    ``uci set`` upserts, so re-applying updates in place (no duplicate section)."""
+    * pool: ``start`` / ``limit`` / ``leasetime`` and ``dhcpv4`` mode (server|relay|none)
+    * network overrides: ``netmask``, ``broadcast``, ``local``
+    * behavior flags: ``no_resolve``, ``notransfer``, ``no_default`` (set=1 or removed)
+    * DHCP options: ``options`` — raw dnsmasq/odhcpd option strings, e.g.
+      ``'dhcp-option=6,1.1.1.1'``, ``'domain=home.lan'``, ``'ignore=6'``
+    * static leases: ``static_leases`` — list of ``{name, mac, ip}``
+    * IPv6 (odhcpd): ``ipv6`` dict — ``dhcpv6``, ``ra``, ``ra_management``,
+      ``ra_service``, ``ra_default_lifetime``, ``ra_lifetime``
+
+    List options (``dhcp_option``, ``dhcp_host``/``host``) are REPLACED
+    wholesale: the existing list is deleted, then the new values added — so
+    removing an option or lease is simply omitting it. Scalar overrides are
+    written only when provided; boolean flags are set=1 or deleted, so toggling
+    off actually clears them. Static leases are mirrored under both the dnsmasq
+    (``dhcp_host``) and odhcpd (``host``) option names so whichever daemon is
+    present picks them up; the IPv6 keys are odhcpd-specific and harmless on a
+    dnsmasq-only box.
+
+    All values go through :func:`_uci_quote` (shell-safe single-quoting) and the
+    section name is validated, so this is safe to run through the remote shell
+    via ``exec_command``. Reloads whichever DHCP daemon is present."""
     iface = str(iface).strip()
     if not re.match(r"^[A-Za-z0-9_]+$", iface):
         raise HTTPException(400, "invalid interface name")
+    cfg = cfg or {}
+    s = f"dhcp.{iface}"
+
+    def _flag(key, on):
+        if on:
+            return [f"uci set {s}.{key}=1"]
+        return [f"uci del {s}.{key} 2>/dev/null || true"]
+
+    def _replace_list(uci_keys, values):
+        lines = [f"uci del {s}.{k} 2>/dev/null || true" for k in uci_keys]
+        for v in values:
+            for k in uci_keys:
+                lines.append(f"uci add_list {s}.{k}={_uci_quote(v)}")
+        return lines
+
     lines = [
-        f"uci set dhcp.{iface}=dhcp",
-        f"uci set dhcp.{iface}.interface={_uci_quote(iface)}",
-        f"uci set dhcp.{iface}.start={_uci_quote(start)}",
-        f"uci set dhcp.{iface}.limit={_uci_quote(limit)}",
-        f"uci set dhcp.{iface}.leasetime={_uci_quote(lease_time)}",
-        f"uci set dhcp.{iface}.dhcpv4={_uci_quote('server')}",
-        "uci commit dhcp",
-        "/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true",
+        f"uci set {s}=dhcp",
+        f"uci set {s}.interface={_uci_quote(iface)}",
     ]
+    # pool
+    if cfg.get("start") not in (None, ""):
+        lines.append(f"uci set {s}.start={_uci_quote(cfg['start'])}")
+    if cfg.get("limit") not in (None, ""):
+        lines.append(f"uci set {s}.limit={_uci_quote(cfg['limit'])}")
+    lines.append(f"uci set {s}.leasetime={_uci_quote(cfg.get('lease_time') or '12h')}")
+    lines.append(f"uci set {s}.dhcpv4={_uci_quote(cfg.get('dhcpv4') or 'server')}")
+    # network overrides
+    for key in ("netmask", "broadcast"):
+        if cfg.get(key):
+            lines.append(f"uci set {s}.{key}={_uci_quote(cfg[key])}")
+    # behavior flags (set=1 or remove)
+    for key in ("local", "no_resolve", "notransfer", "no_default"):
+        lines.extend(_flag(key, bool(cfg.get(key))))
+    # DHCP options (list, replaced wholesale)
+    opts = [str(o).strip() for o in (cfg.get("options") or []) if str(o).strip()]
+    lines.extend(_replace_list(["dhcp_option"], opts))
+    # static leases (list; mirror dnsmasq `dhcp_host` + odhcpd `host`)
+    leases = []
+    for h in (cfg.get("static_leases") or []):
+        name = str(h.get("name") or "").strip()
+        mac = str(h.get("mac") or "").strip()
+        ip = str(h.get("ip") or "").strip()
+        if name and mac and ip:
+            leases.append(f"{name}, {mac}, {ip}")
+    lines.extend(_replace_list(["dhcp_host", "host"], leases))
+    # IPv6 (odhcpd)
+    ip6 = cfg.get("ipv6") or {}
+    if ip6.get("dhcpv6"):
+        lines.append(f"uci set {s}.dhcpv6={_uci_quote(ip6['dhcpv6'])}")
+    if ip6.get("ra") is not None:
+        lines.extend(_flag("ra", bool(ip6.get("ra"))))
+    if ip6.get("ra_management"):
+        lines.append(f"uci set {s}.ra_management={_uci_quote(ip6['ra_management'])}")
+    if ip6.get("ra_service") is not None:
+        lines.extend(_flag("ra_service", bool(ip6.get("ra_service"))))
+    for key in ("ra_default_lifetime", "ra_lifetime"):
+        if ip6.get(key) not in (None, ""):
+            lines.append(f"uci set {s}.{key}={_uci_quote(ip6[key])}")
+    lines.append("uci commit dhcp")
+    lines.append("/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true")
     return "\n".join(lines) + "\n"
+
+
+def build_dhcp_apply_cmds(iface: str, start=100, limit=150, lease_time: str = "12h") -> str:
+    """Backward-compatible wrapper: build a standard server-mode pool. New code
+    should call :func:`build_dhcp_cmds` with the full per-VLAN config dict."""
+    return build_dhcp_cmds(iface, {"start": start, "limit": limit,
+                                   "lease_time": lease_time, "dhcpv4": "server"})
 
 
 def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: list = None) -> str:
@@ -2641,14 +2724,17 @@ async def apply_vlan(request: Request):
 
 @app.post("/api/dhcp/apply")
 async def apply_dhcp(request: Request):
-    """Apply DHCP config to a VLAN interface on a device."""
+    """Apply a FULL per-VLAN DHCP section to a device: pool (start/limit/lease/mode),
+    network overrides (netmask/broadcast/local), behavior flags (no_resolve/
+    notransfer/no_default), DHCP options, static leases, and odhcpd IPv6 keys.
+
+    The whole section is managed per-VLAN (``dhcp.<iface>``). Omitting an
+    option/lease or unchecking a flag removes it (lists are replaced wholesale,
+    flags are deleted). ``enabled=False`` deletes the section entirely."""
     d = await request.json()
     did = d.get("did")
     vlan_id = d.get("vlan_id")
     iface = d.get("interface", f"vlan_{vlan_id}")
-    start = d.get("start", 100)
-    limit = d.get("limit", 150)
-    lease_time = d.get("lease_time", "12h")
     enabled = d.get("enabled", True)
     if not did or not vlan_id:
         raise HTTPException(400, "did and vlan_id required")
@@ -2658,15 +2744,77 @@ async def apply_dhcp(request: Request):
     dev = cur[0]
     if dev["access"] != "ssh":
         raise HTTPException(400, "DHCP config requires SSH access")
+
+    # ---- validate the values we will quote into a shell script ----
+    iface_s = str(iface).strip()
+    if not re.match(r"^[A-Za-z0-9_]+$", iface_s):
+        raise HTTPException(400, "invalid interface name")
+    start = d.get("start", 100)
+    limit = d.get("limit", 150)
+    lease_time = str(d.get("lease_time") or "12h").strip()
+    dhcpv4 = (d.get("dhcpv4") or "server").strip()
+    if dhcpv4 not in ("server", "relay", "none"):
+        raise HTTPException(400, "dhcpv4 must be one of: server, relay, none")
+    for _k in ("start", "limit"):
+        if d.get(_k) not in (None, ""):
+            try:
+                int(d[_k])
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"{_k} must be an integer")
+    netmask = (d.get("netmask") or "").strip()
+    broadcast = (d.get("broadcast") or "").strip()
+    if netmask and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", netmask):
+        raise HTTPException(400, "invalid netmask")
+    if broadcast and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", broadcast):
+        raise HTTPException(400, "invalid broadcast")
+    # options: list of strings (raw dnsmasq/odhcpd option text)
+    options = [str(o).strip() for o in (d.get("options") or []) if str(o).strip()]
+    for o in options:
+        if not re.match(r"^[A-Za-z0-9_@,.:=%-]+$", o):
+            raise HTTPException(400, f"invalid DHCP option value: {o!r}")
+    # static leases: list of {name, mac, ip}
+    leases_in = d.get("static_leases") or []
+    leases = []
+    for h in leases_in:
+        name = str(h.get("name") or "").strip()
+        mac = str(h.get("mac") or "").strip().lower()
+        ip = str(h.get("ip") or "").strip()
+        if not (name and mac and ip):
+            raise HTTPException(400, f"static lease missing name/mac/ip: {h!r}")
+        if not re.match(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$", mac):
+            raise HTTPException(400, f"invalid MAC address: {mac!r}")
+        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            raise HTTPException(400, f"invalid lease IP: {ip!r}")
+        leases.append({"name": name, "mac": mac, "ip": ip})
+    # ipv6 (odhcpd)
+    ip6 = d.get("ipv6") or {}
+    if ip6.get("dhcpv6") and str(ip6["dhcpv6"]).strip() not in ("server", "relay", "none"):
+        raise HTTPException(400, "ipv6.dhcpv6 must be one of: server, relay, none")
+    if ip6.get("ra_management") and str(ip6["ra_management"]).strip() not in ("0", "1", "2", "3"):
+        raise HTTPException(400, "ipv6.ra_management must be 0, 1, 2 or 3")
+
+    cfg = {
+        "start": d.get("start"),
+        "limit": d.get("limit"),
+        "lease_time": lease_time,
+        "dhcpv4": dhcpv4,
+        "netmask": netmask or None,
+        "broadcast": broadcast or None,
+        "local": bool(d.get("local")),
+        "no_resolve": bool(d.get("no_resolve")),
+        "notransfer": bool(d.get("notransfer")),
+        "no_default": bool(d.get("no_default")),
+        "options": options,
+        "static_leases": leases,
+        "ipv6": {k: v for k, v in ip6.items() if v not in (None, "")},
+    }
+
     c = _ssh_connect(dev)
     try:
         if enabled:
-            cmd = build_dhcp_apply_cmds(iface, start, limit, lease_time)
+            cmd = build_dhcp_cmds(iface_s, cfg)
         else:
-            _iface = str(iface).strip()
-            if not re.match(r"^[A-Za-z0-9_]+$", _iface):
-                raise HTTPException(400, "invalid interface name")
-            cmd = (f"uci -q delete dhcp.{_iface} || true\n"
+            cmd = (f"uci -q delete dhcp.{iface_s} || true\n"
                    "uci commit dhcp\n"
                    "/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true\n")
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
@@ -2675,14 +2823,22 @@ async def apply_dhcp(request: Request):
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"DHCP config failed on {dev['name']}: {(err or out)[:200]}")
-        log_action(dev, 'dhcp', f'vlan={vlan_id} enabled={enabled}', ok=True)
-        # Save to DB
-        execute("""INSERT INTO dhcp(device_id, vlan_id, iface, start, "limit", lease_time, enabled, ts)
-                   VALUES(?,?,?,?,?,?,?,?)
+        log_action(dev, 'dhcp', f'vlan={vlan_id} enabled={enabled} opts={len(options)} leases={len(leases)}', ok=True)
+        execute("""INSERT INTO dhcp(device_id, vlan_id, iface, start, "limit", lease_time, enabled,
+                   options, static_leases, ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(device_id, vlan_id) DO UPDATE SET
                      iface=excluded.iface, start=excluded.start, "limit"=excluded."limit",
-                     lease_time=excluded.lease_time, enabled=excluded.enabled, ts=excluded.ts""",
-                (dev["id"], str(vlan_id), iface, start, limit, lease_time, 1 if enabled else 0, now()))
+                     lease_time=excluded.lease_time, enabled=excluded.enabled,
+                     options=excluded.options, static_leases=excluded.static_leases,
+                     ts=excluded.ts""",
+                (dev["id"], str(vlan_id), iface_s,
+                 int(start) if str(start).isdigit() else 100,
+                 int(limit) if str(limit).isdigit() else 150,
+                 lease_time, 1 if enabled else 0,
+                 json.dumps(options) if options else None,
+                 json.dumps(leases) if leases else None,
+                 now()))
         return {"device": dev["name"], "ok": True}
     finally:
         c.close()
@@ -2697,8 +2853,19 @@ def dhcp_read(did: int):
 
 def _saved_dhcp_rows(device_id):
     rows = q("SELECT * FROM dhcp WHERE device_id=? ORDER BY vlan_id", (device_id,))
-    return [{"vlan_id": r["vlan_id"], "iface": r["iface"], "start": r["start"], "limit": r["limit"],
-             "lease_time": r["lease_time"], "enabled": bool(r["enabled"])} for r in rows]
+    out = []
+    for r in rows:
+        def _load(key):
+            try:
+                return json.loads(r[key]) if r[key] else None
+            except Exception:
+                return None
+        out.append({
+            "vlan_id": r["vlan_id"], "iface": r["iface"], "start": r["start"], "limit": r["limit"],
+            "lease_time": r["lease_time"], "enabled": bool(r["enabled"]),
+            "options": _load("options"), "static_leases": _load("static_leases"),
+        })
+    return out
 
 def _parse_uci_show(out):
     """Parse `uci show <pkg>` output into {section: {key: [values]}}. Handles list values a='x' 'y'.
@@ -2717,7 +2884,13 @@ def _parse_uci_show(out):
     return sections
 
 def _read_live_dhcp(dev):
-    """Read live DHCP pools from UCI (odhcpd or dnsmasq)."""
+    """Read live DHCP pool sections from UCI (odhcpd or dnsmasq), one dict per
+    VLAN/interface. Returns the full per-VLAN surface: pool, network overrides,
+    behavior flags, the DHCP options list (``options``), static leases
+    (``static_leases``, parsed from the dnsmasq ``dhcp_host`` or odhcpd ``host``
+    list), and the odhcpd IPv6 keys (``ipv6``). ``enabled`` is derived from
+    whether the section still looks like an active server (has a start address
+    or ``dhcpv4=server``/relay)."""
     c = _ssh_connect(dev)
     try:
         out, _err, _st = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
@@ -2727,24 +2900,86 @@ def _read_live_dhcp(dev):
             if name.startswith("@host") or name.startswith("@dnsmasq") or name.startswith("@odhcpd") or name.startswith("odhcpd"):
                 continue
             iface = (attrs.get("interface") or [None])[0]
-            if not iface or attrs.get("ignore", ["0"])[0] == "1":
+            if not iface:
                 continue
-            # a real pool has a start address or runs as a server
-            if not attrs.get("start") and (attrs.get("dhcpv4") or [""])[0] != "server":
+            # A top-level ignore=1 means "don't serve this interface" (non-standard
+            # but historically honored). Our options editor expresses ignored
+            # client option *types* as `ignore=N` INSIDE the dhcp_option list, which
+            # does not set this key, so it does not affect this check.
+            if attrs.get("ignore", ["0"])[0] == "1":
                 continue
+            has_start = bool(attrs.get("start"))
+            v4 = (attrs.get("dhcpv4") or [""])[0]
+            leases = _parse_dhcp_host_list(attrs)
+            ip6 = _parse_ipv6_section(attrs)
+            if not has_start and v4 not in ("server", "relay") and not leases and not any(ip6.values()):
+                continue  # not an active pool (e.g. a bare section)
             lease = (attrs.get("leasetime") or attrs.get("lease_time") or ["12h"])[0]
+
+            def _first(key):
+                return (attrs.get(key) or [None])[0]
+
+            def _on(key):
+                return _first(key) is not None  # a flag is "on" if the key is set
+
             _vm = re.match(r"vlan_(\d+)$", name)
             dhcp.append({
                 "vlan_id": int(_vm.group(1)) if _vm else None,
                 "iface": iface,
-                "start": int(attrs["start"][0]) if attrs.get("start") and attrs["start"][0].isdigit() else 100,
+                "enabled": bool(has_start or v4 in ("server", "relay")),
+                "start": int(attrs["start"][0]) if has_start and attrs["start"][0].isdigit() else 100,
                 "limit": int(attrs["limit"][0]) if attrs.get("limit") and attrs["limit"][0].isdigit() else 150,
                 "lease_time": lease,
-                "enabled": True,
+                "dhcpv4": v4 or "server",
+                "netmask": _first("netmask"),
+                "broadcast": _first("broadcast"),
+                "local": _on("local"),
+                "no_resolve": _on("no_resolve"),
+                "notransfer": _on("notransfer"),
+                "no_default": _on("no_default"),
+                "options": list(attrs.get("dhcp_option") or []),
+                "static_leases": leases,
+                "ipv6": ip6,
             })
         return dhcp
     finally:
         c.close()
+
+
+def _parse_dhcp_host_list(attrs):
+    """Parse dnsmasq ``dhcp_host`` / odhcpd ``host`` list entries of the form
+    ``'name, AA:BB:CC:DD:EE:FF, 192.168.10.50'`` into ``{name, mac, ip}``."""
+    raw = list(attrs.get("dhcp_host") or attrs.get("host") or [])
+    leases = []
+    for entry in raw:
+        parts = [p.strip() for p in str(entry).split(",")]
+        if len(parts) >= 3:
+            leases.append({"name": parts[0], "mac": parts[1], "ip": parts[2]})
+        elif len(parts) >= 2:
+            leases.append({"name": parts[0], "mac": parts[1], "ip": ""})
+    return leases
+
+
+def _parse_ipv6_section(attrs):
+    """Read odhcpd IPv6 keys from a section. Missing keys stay absent so the
+    dashboard can tell "not set" from "set" without guessing defaults."""
+    def _first(key):
+        return (attrs.get(key) or [None])[0]
+
+    ip6 = {}
+    if _first("dhcpv6"):
+        ip6["dhcpv6"] = _first("dhcpv6")
+    if _first("ra") is not None:
+        ip6["ra"] = _first("ra") == "1"
+    if _first("ra_management"):
+        ip6["ra_management"] = _first("ra_management")
+    if _first("ra_service") is not None:
+        ip6["ra_service"] = _first("ra_service") == "1"
+    if _first("ra_default_lifetime") is not None:
+        ip6["ra_default_lifetime"] = _first("ra_default_lifetime")
+    if _first("ra_lifetime") is not None:
+        ip6["ra_lifetime"] = _first("ra_lifetime")
+    return ip6
 
 @app.get("/api/dhcp/leases")
 async def get_dhcp_leases(request: Request):

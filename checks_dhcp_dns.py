@@ -107,5 +107,77 @@ check("dns dnsmasq empty = clear only",
 check("quote plain", owctl._uci_quote("a") == "'a'")
 check("quote apostrophe", owctl._uci_quote("O'Brien") == "'O'\\''Brien'")
 
+# --- build_dhcp_cmds: full per-VLAN surface (new) ---
+FULL = {
+    "start": 200, "limit": 50, "lease_time": "1h", "dhcpv4": "server",
+    "netmask": "255.255.255.0", "broadcast": "192.168.10.255", "local": True,
+    "no_resolve": True, "notransfer": False, "no_default": False,
+    "options": ["dhcp-option=6,1.1.1.1", "domain=home.lan", "ignore=6"],
+    "static_leases": [{"name": "printer", "mac": "AA:BB:CC:DD:EE:FF", "ip": "192.168.10.50"}],
+    "ipv6": {"dhcpv6": "server", "ra": True, "ra_management": "3",
+             "ra_service": True, "ra_default_lifetime": "720"},
+}
+fc = owctl.build_dhcp_cmds("vlan_10", FULL)
+for _name, _frag in [
+    ("full: start", "start='200'"),
+    ("full: limit", "limit='50'"),
+    ("full: leasetime", "leasetime='1h'"),
+    ("full: netmask", "netmask='255.255.255.0'"),
+    ("full: broadcast", "broadcast='192.168.10.255'"),
+    ("full: local on", "uci set dhcp.vlan_10.local=1"),
+    ("full: no_resolve on", "uci set dhcp.vlan_10.no_resolve=1"),
+    ("full: notransfer off (del)", "uci del dhcp.vlan_10.notransfer"),
+    ("full: no_default off (del)", "uci del dhcp.vlan_10.no_default"),
+    ("full: opt dns", "add_list dhcp.vlan_10.dhcp_option='dhcp-option=6,1.1.1.1'"),
+    ("full: opt domain", "add_list dhcp.vlan_10.dhcp_option='domain=home.lan'"),
+    ("full: opt ignore=6", "add_list dhcp.vlan_10.dhcp_option='ignore=6'"),
+    ("full: options replaced first", "uci del dhcp.vlan_10.dhcp_option"),
+    ("full: lease dnsmasq", "add_list dhcp.vlan_10.dhcp_host='printer, AA:BB:CC:DD:EE:FF, 192.168.10.50'"),
+    ("full: lease odhcpd mirror", "add_list dhcp.vlan_10.host='printer, AA:BB:CC:DD:EE:FF, 192.168.10.50'"),
+    ("full: ipv6 dhcpv6", "dhcpv6='server'"),
+    ("full: ipv6 ra on", "uci set dhcp.vlan_10.ra=1"),
+    ("full: ipv6 ra_management", "ra_management='3'"),
+    ("full: ipv6 ra_service on", "uci set dhcp.vlan_10.ra_service=1"),
+    ("full: ipv6 ra_default_lifetime", "ra_default_lifetime='720'"),
+]:
+    check(_name, _frag in fc)
+check("full: leases deleted before add", "uci del dhcp.vlan_10.dhcp_host" in fc and "uci del dhcp.vlan_10.host" in fc)
+check("full: relay mode", "dhcpv4='relay'" in owctl.build_dhcp_cmds("vlan_10", {"dhcpv4": "relay"}))
+check("full: empty cfg still valid section", "uci set dhcp.vlan_10=dhcp" in owctl.build_dhcp_cmds("vlan_10", {}))
+check("full: leasetime defaults 12h", "leasetime='12h'" in owctl.build_dhcp_cmds("vlan_10", {}))
+
+# --- readers: static leases + ipv6 (new, pure) ---
+FULL_UCI = (
+    "dhcp.vlan_10=dhcp\n"
+    "dhcp.vlan_10.interface='vlan_10'\n"
+    "dhcp.vlan_10.start=200\n"
+    "dhcp.vlan_10.limit=50\n"
+    "dhcp.vlan_10.leasetime=1h\n"
+    "dhcp.vlan_10.dhcpv4=server\n"
+    "dhcp.vlan_10.no_resolve=1\n"
+    "dhcp.vlan_10.dhcp_option='dhcp-option=6,1.1.1.1' 'ignore=6'\n"
+    "dhcp.vlan_10.dhcp_host='printer, AA:BB:CC:DD:EE:FF, 192.168.10.50'\n"
+    "dhcp.vlan_10.dhcpv6=server\n"
+    "dhcp.vlan_10.ra=1\n"
+    "dhcp.vlan_10.ra_management=3\n"
+    "dhcp.vlan_10.ra_service=1\n"
+)
+_full_sec = owctl._parse_uci_show(FULL_UCI)["dhcp.vlan_10"]
+check("read: static lease parsed",
+      owctl._parse_dhcp_host_list(_full_sec) ==
+      [{"name": "printer", "mac": "AA:BB:CC:DD:EE:FF", "ip": "192.168.10.50"}])
+_full_ip6 = owctl._parse_ipv6_section(_full_sec)
+check("read: ipv6 dhcpv6", _full_ip6.get("dhcpv6") == "server")
+check("read: ipv6 ra true", _full_ip6.get("ra") is True)
+check("read: ipv6 ra_management", _full_ip6.get("ra_management") == "3")
+check("read: ipv6 ra_service true", _full_ip6.get("ra_service") is True)
+check("read: no leases on empty section", owctl._parse_dhcp_host_list({"interface": ["x"]}) == [])
+check("read: ipv6 empty on plain section", owctl._parse_ipv6_section({"interface": ["x"]}) == {})
+# odhcpd `host` fallback (no dhcp_host key present)
+_od_sec = owctl._parse_uci_show("dhcp.vlan_20=dhcp\ndhcp.vlan_20.interface='vlan_20'\ndhcp.vlan_20.start=1\n")["dhcp.vlan_20"]
+_od_sec["host"] = ["nas, 11:22:33:44:55:66, 192.168.20.9"]
+check("read: odhcpd host fallback",
+      owctl._parse_dhcp_host_list(_od_sec) == [{"name": "nas", "mac": "11:22:33:44:55:66", "ip": "192.168.20.9"}])
+
 print(f"\n=== SUMMARY ===\n{passed}/{passed+failed} checks passed")
 sys.exit(1 if failed else 0)

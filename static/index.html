@@ -1368,55 +1368,146 @@ async function renderVlans(target){
 async function renderDhcp(target){
   const el=target||document.getElementById('tab-dhcp');
   const devs=await api('/devices');
-  const router=devs.find(d=>d.role==='router')||devs.find(d=>d.access==='ssh')||devs[0];
+  const sshDevs=devs.filter(d=>d.access==='ssh');
+  const router=devs.find(d=>d.role==='router')||sshDevs[0]||devs[0];
   let html=`<h2>DHCP Server</h2>
-    <p class="muted">Configure DHCP pools for VLAN interfaces. Runs on the router device.</p>
+    <p class="muted">Manage every DHCP setting per VLAN section — pool, DHCP options, static leases, behavior flags and IPv6. Applies to the router.</p>
     ${netTemplatePills('dhcp')}`;
   if(NET_ADVANCED){
-    html+=`<div class="card">
-      <h3>Configure DHCP</h3>
-      <div class="row" style="margin-bottom:12px">
-        <div><label>Device</label><select id="dhcp-did" style="width:100%">${devs.filter(d=>d.access==='ssh').map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
-      </div>
-      <div class="row" style="margin-bottom:12px">
-        <div><label>VLAN ID</label><input id="dhcp-vlan" type="number" min="1" max="4094" value="10" style="width:80px"></div>
-        <div><label>Interface</label><input id="dhcp-iface" placeholder="vlan_10" style="width:140px"></div>
-        <div style="display:flex;align-items:flex-end">
-          <label style="margin:0 8px 0 0"><input type="checkbox" id="dhcp-enabled" checked> Enabled</label>
-        </div>
-      </div>
-      <div class="row" style="margin-bottom:12px">
-        <div><label>Start</label><input id="dhcp-start" type="number" min="1" max="253" value="100" style="width:80px"></div>
-        <div><label>Limit</label><input id="dhcp-limit" type="number" min="1" max="253" value="150" style="width:80px"></div>
-        <div><label>Lease Time</label><input id="dhcp-lease" value="12h" style="width:100px"></div>
-      </div>
-      <button class="act pri" onclick="applyDhcp()">Apply DHCP</button>
-    </div>`;
+    html+=`<div class="row" style="margin-bottom:12px;align-items:flex-end">
+      <div><label>Device</label><select id="dhcp-did">${sshDevs.map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
+      <button class="act" onclick="renderDhcp()">Refresh</button>
+    </div>
+    <div class="grid" style="margin-bottom:16px"><div class="card" style="max-width:560px">${dhcpNewCard()}</div></div>`;
   }
-  html+=`<div id="dhcp-results" style="margin-top:16px"></div>`;
+  html+=`<div id="dhcp-results" style="margin-top:8px"></div><div id="dhcp-grid" class="grid"></div>`;
   el.innerHTML=html;
-  // Fetch live DHCP config (always show)
+  // Load live DHCP sections (always show)
   if(router && router.access==='ssh'){
     try{
-      const dhcp = await api(`/dhcp?did=${router.id}`);
-      const dhcpBox = document.getElementById('dhcp-results');
+      const dhcp=await api(`/dhcp?did=${router.id}`);
+      const grid=document.getElementById('dhcp-grid');
       if(dhcp.live && dhcp.live.length){
-        const rows = dhcp.live.map(d=>`<div class="kv"><span>${esc(d.iface)}</span><span>start=${d.start} limit=${d.limit} lease=${d.lease_time} ${d.enabled?'enabled':'disabled'}</span></div>`).join('');
-        dhcpBox.innerHTML = `<div class="card"><h3>Live DHCP (${router.name})</h3>${rows}</div>`;
-        if(NET_ADVANCED){
-          const d = dhcp.live[0];
-          document.getElementById('dhcp-vlan').value = d.vlan_id || 10;
-          document.getElementById('dhcp-iface').value = d.iface || 'vlan_'+(d.vlan_id||10);
-          document.getElementById('dhcp-start').value = d.start || 100;
-          document.getElementById('dhcp-limit').value = d.limit || 150;
-          document.getElementById('dhcp-lease').value = d.lease_time || '12h';
-          document.getElementById('dhcp-enabled').checked = d.enabled !== false;
-        }
+        grid.innerHTML=dhcp.live.map((d,i)=>dhcpSectionCard(d,i)).join('');
       }else{
-        dhcpBox.innerHTML = '<p class="muted">No DHCP configured on this device.</p>';
+        grid.innerHTML=`<p class="muted">No DHCP sections configured on ${esc(router.name)} yet. Use the builder above to create one.</p>`;
       }
-    }catch(e){console.warn('DHCP live fetch failed:',e)}
+    }catch(e){
+      const grid=document.getElementById('dhcp-grid');
+      if(grid) grid.innerHTML=`<p class="muted">Could not read live DHCP: ${esc(String(e))}</p>`;
+    }
   }
+}
+// ---- DHCP per-VLAN card builders (NET_ADVANCED) ----
+function _dh(k){return 'dhpc-'+k+'-';}
+function dhcpPoolFields(k,d){
+  d=d||{};
+  return `<div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+    <div style="display:flex;align-items:flex-end"><label><input type="checkbox" id="${_dh(k)}enabled" ${d.enabled!==false?'checked':''}> Enabled</label></div>
+    <div><label>Start</label><input id="${_dh(k)}start" type="number" min="1" max="253" value="${d.start??100}" style="width:80px"></div>
+    <div><label>Limit</label><input id="${_dh(k)}limit" type="number" min="1" max="253" value="${d.limit??150}" style="width:80px"></div>
+    <div><label>Lease</label><input id="${_dh(k)}lease" value="${esc(d.lease_time||'12h')}" style="width:90px"></div>
+    <div><label>v4 mode</label><select id="${_dh(k)}v4">${['server','relay','none'].map(m=>`<option value="${m}" ${(d.dhcpv4||'server')===m?'selected':''}>${m}</option>`).join('')}</select></div>
+  </div>`;
+}
+function dhcpNetworkFields(k,d){
+  d=d||{};
+  return `<div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+    <div><label>Netmask</label><input id="${_dh(k)}netmask" placeholder="auto" value="${esc(d.netmask||'')}" style="width:140px"></div>
+    <div><label>Broadcast</label><input id="${_dh(k)}bcast" placeholder="auto" value="${esc(d.broadcast||'')}" style="width:140px"></div>
+    <div style="display:flex;align-items:flex-end"><label><input type="checkbox" id="${_dh(k)}local" ${d.local?'checked':''}> Local-only</label></div>
+  </div>`;
+}
+function dhcpBehaviorFields(k,d){
+  d=d||{};
+  return `<div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+    <div style="display:flex;align-items:flex-end"><label><input type="checkbox" id="${_dh(k)}nore" ${d.no_resolve?'checked':''}> No-resolve</label></div>
+    <div style="display:flex;align-items:flex-end"><label><input type="checkbox" id="${_dh(k)}notr" ${d.notransfer?'checked':''}> No-transfer</label></div>
+    <div style="display:flex;align-items:flex-end"><label><input type="checkbox" id="${_dh(k)}nodef" ${d.no_default?'checked':''}> No-default</label></div>
+  </div>`;
+}
+function dhcpIpv6Fields(k,d){
+  const ip6=(d&&d.ipv6)||{};
+  return `<div style="margin-bottom:8px">
+    <div class="row" style="margin-bottom:6px;flex-wrap:wrap">
+      <div><label>IPv6 mode</label><select id="${_dh(k)}v6mode">${['','server','relay','none'].map(m=>`<option value="${m}" ${(ip6.dhcpv6||'')===m?'selected':''}>${m||'off'}</option>`).join('')}</select></div>
+      <div style="display:flex;align-items:flex-end"><label><input type="checkbox" id="${_dh(k)}ra" ${ip6.ra?'checked':''}> RA</label></div>
+      <div><label>RA mgmt (M/O)</label><select id="${_dh(k)}ram">${['','0','1','2','3'].map(m=>`<option value="${m}" ${(ip6.ra_management||'')===m?'selected':''}>${m||'auto'}</option>`).join('')}</select></div>
+      <div style="display:flex;align-items:flex-end"><label><input type="checkbox" id="${_dh(k)}ras" ${ip6.ra_service?'checked':''}> RA service</label></div>
+    </div>
+    <div class="row" style="flex-wrap:wrap">
+      <div><label>RA default life</label><input id="${_dh(k)}radl" value="${esc(ip6.ra_default_lifetime||'')}" placeholder="auto" style="width:110px"></div>
+      <div><label>RA lifetime</label><input id="${_dh(k)}ral" value="${esc(ip6.ra_lifetime||'')}" placeholder="auto" style="width:110px"></div>
+    </div>
+  </div>`;
+}
+function dhcpLeaseEditor(k,leases){
+  leases=leases||[];
+  const rows=leases.map(l=>dhcpLeaseRow(k,l)).join('');
+  return `<div style="margin-bottom:8px">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px"><label>Static leases</label><button class="act" onclick="dhcpAddLease('${k}')">+ Add</button></div>
+    <div id="${_dh(k)}leases">${rows}</div>
+  </div>`;
+}
+function dhcpLeaseRow(k,l){
+  l=l||{};
+  return `<div class="row lease-row" data-k="${k}" style="margin-bottom:4px;flex-wrap:wrap">
+    <input class="lh-name" placeholder="name" value="${esc(l.name||'')}" style="width:120px">
+    <input class="lh-mac" placeholder="aa:bb:cc:dd:ee:ff" value="${esc(l.mac||'')}" style="width:170px">
+    <input class="lh-ip" placeholder="192.168.x.x" value="${esc(l.ip||'')}" style="width:130px">
+    <button class="act" title="Remove" onclick="this.closest('.lease-row').remove()">\u00d7</button>
+  </div>`;
+}
+function dhcpAddLease(k){
+  const box=document.getElementById(_dh(k)+'leases');
+  if(box) box.insertAdjacentHTML('beforeend', dhcpLeaseRow(k,{}));
+}
+function dhcpReadLeases(k){
+  const box=document.getElementById(_dh(k)+'leases');
+  const out=[];
+  if(box) box.querySelectorAll('.lease-row').forEach(r=>{
+    const name=r.querySelector('.lh-name').value.trim();
+    const mac=r.querySelector('.lh-mac').value.trim();
+    const ip=r.querySelector('.lh-ip').value.trim();
+    if(name&&mac&&ip) out.push({name,mac,ip});
+  });
+  return out;
+}
+function dhcpNewCard(){
+  return `<h3>New / edit VLAN section</h3>
+  <div class="row" style="margin-bottom:8px">
+    <div><label>VLAN ID</label><input id="dhpc-new-vlan" type="number" min="1" max="4094" value="10" style="width:90px"></div>
+    <div><label>Interface</label><input id="dhpc-new-iface" placeholder="vlan_10" value="vlan_10" style="width:140px"></div>
+  </div>
+  ${dhcpPoolFields('new',{})}
+  ${dhcpNetworkFields('new',{})}
+  ${dhcpBehaviorFields('new',{})}
+  <div style="margin-bottom:8px"><label>DHCP options (one per line, e.g. <code>dhcp-option=6,1.1.1.1</code>, <code>domain=home.lan</code>, <code>ignore=6</code>)</label><textarea id="dhpc-new-opts" rows="2" style="width:100%;box-sizing:border-box"></textarea></div>
+  ${dhcpLeaseEditor('new',[])}
+  ${dhcpIpv6Fields('new',{})}
+  <button class="act pri" onclick="dhpcApply('new')">Apply section</button>
+  <div id="dhpc-new-result"></div>`;
+}
+function dhcpSectionCard(d,i){
+  const k='s'+i;
+  const opts=(d.options||[]).join('\n');
+  return `<div class="card">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">VLAN ${d.vlan_id!=null?d.vlan_id:'\u2014'} <span class="muted small">${esc(d.iface)}</span></h3>
+      <span class="badge ${d.enabled?'b-online':'b-offline'}">${d.enabled?'enabled':'disabled'}</span>
+    </div>
+    ${dhcpPoolFields(k,d)}
+    ${dhcpNetworkFields(k,d)}
+    ${dhcpBehaviorFields(k,d)}
+    <div style="margin-bottom:8px"><label>DHCP options (one per line)</label><textarea id="dhpc-s${i}-opts" rows="2" style="width:100%;box-sizing:border-box">${esc(opts)}</textarea></div>
+    ${dhcpLeaseEditor(k,d.static_leases||[])}
+    ${dhcpIpv6Fields(k,d)}
+    <div class="row">
+      <button class="act pri" onclick="dhpcApply('${k}',${d.vlan_id!=null?d.vlan_id:0},'${esc(d.iface)}')">Apply</button>
+      <button class="act" onclick="dhpcDelete('${k}',${d.vlan_id!=null?d.vlan_id:0},'${esc(d.iface)}')">Disable</button>
+    </div>
+    <div id="dhpc-s${i}-result"></div>
+  </div>`;
 }
 async function renderDns(target){
   const el=target||document.getElementById('tab-dns');
@@ -1481,22 +1572,61 @@ async function applyVlan(){
   }
 }
 
-async function applyDhcp(){
-  const did=document.getElementById('dhcp-did')?.value || document.querySelector('#qos-did')?.value || document.querySelector('#fw-did')?.value;
+async function dhpcApply(k, vlan_id, iface){
+  const didEl=document.getElementById('dhcp-did');
+  const did=didEl?parseInt(didEl.value):null;
   if(!did){toast('No SSH device available',true);return}
-  const vlan_id=parseInt(document.getElementById('dhcp-vlan').value);
-  const iface=document.getElementById('dhcp-iface').value||'vlan_'+vlan_id;
-  const start=parseInt(document.getElementById('dhcp-start').value);
-  const limit=parseInt(document.getElementById('dhcp-limit').value);
-  const lease_time=document.getElementById('dhcp-lease').value;
-  const enabled=document.getElementById('dhcp-enabled').checked;
-  try{
-    toast('Applying DHCP...');
-    const r=await api('/dhcp/apply',{method:'POST',body:JSON.stringify({did:parseInt(did),vlan_id,iface,start,limit,lease_time,enabled})});
-    document.getElementById('dhcp-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>DHCP applied</strong> on ${r.device}</div>`;
-  }catch(e){
-    document.getElementById('dhcp-results').innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(e.message||e)}</div>`;
+  // resolve vlan/iface for the "new" card from its own inputs
+  let v=vlan_id, f=iface;
+  if(k==='new'){
+    v=parseInt(document.getElementById('dhpc-new-vlan').value)||1;
+    f=(document.getElementById('dhpc-new-iface').value||'').trim()||('vlan_'+v);
   }
+  const g=id=>document.getElementById(id);
+  const val=id=>g(id)?g(id).value.trim():'';
+  const chk=id=>g(id)?g(id).checked:false;
+  const start=val(_dh(k)+'start'), limit=val(_dh(k)+'limit');
+  const ipv6={};
+  const v6=val(_dh(k)+'v6mode'); if(v6)ipv6.dhcpv6=v6;
+  if(chk(_dh(k)+'ra'))ipv6.ra=true;
+  const ram=val(_dh(k)+'ram'); if(ram)ipv6.ra_management=ram;
+  if(chk(_dh(k)+'ras'))ipv6.ra_service=true;
+  const radl=val(_dh(k)+'radl'); if(radl)ipv6.ra_default_lifetime=radl;
+  const ral=val(_dh(k)+'ral'); if(ral)ipv6.ra_lifetime=ral;
+  const body={
+    did, vlan_id:(v||1), interface:f,
+    start:start?parseInt(start):100, limit:limit?parseInt(limit):150,
+    lease_time:val(_dh(k)+'lease')||'12h',
+    dhcpv4:val(_dh(k)+'v4')||'server',
+    netmask:val(_dh(k)+'netmask'), broadcast:val(_dh(k)+'bcast'),
+    local:chk(_dh(k)+'local'), no_resolve:chk(_dh(k)+'nore'),
+    notransfer:chk(_dh(k)+'notr'), no_default:chk(_dh(k)+'nodef'),
+    options:val(_dh(k)+'opts').split('\n').map(s=>s.trim()).filter(Boolean),
+    static_leases:dhcpReadLeases(k),
+    ipv6:Object.keys(ipv6).length?ipv6:{},
+    enabled:chk(_dh(k)+'enabled'),
+  };
+  const resId=_dh(k)+'result';
+  const res=el=>{const e=document.getElementById(resId);if(e)e.innerHTML=el;};
+  try{
+    toast('Applying DHCP section '+f+'...');
+    const r=await api('/dhcp/apply',{method:'POST',body:JSON.stringify(body)});
+    res(`<div class="muted" style="margin-top:6px;color:var(--ok)">Applied ${esc(f)} on ${esc(r.device)}</div>`);
+    setTimeout(renderDhcp,600);
+  }catch(e){
+    res(`<div class="muted" style="margin-top:6px;color:var(--bad)">${esc(String(e))}</div>`);
+  }
+}
+async function dhpcDelete(k, vlan_id, iface){
+  const didEl=document.getElementById('dhcp-did');
+  const did=didEl?parseInt(didEl.value):null;
+  if(!did){toast('No SSH device available',true);return}
+  if(!confirm('Disable (delete) the DHCP section for '+iface+'?'))return;
+  try{
+    await api('/dhcp/apply',{method:'POST',body:JSON.stringify({did,vlan_id:(vlan_id||1),interface:iface,enabled:false})});
+    toast('DHCP section '+iface+' disabled');
+    setTimeout(renderDhcp,400);
+  }catch(e){toast(String(e),true);}
 }
 
 async function applyDns(){
