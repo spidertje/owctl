@@ -179,5 +179,36 @@ _od_sec["host"] = ["nas, 11:22:33:44:55:66, 192.168.20.9"]
 check("read: odhcpd host fallback",
       owctl._parse_dhcp_host_list(_od_sec) == [{"name": "nas", "mac": "11:22:33:44:55:66", "ip": "192.168.20.9"}])
 
+# ---------------- subnet (network package) ----------------
+# _parse_subnet: a.b.c.d/prefix -> (first-usable-host, dotted mask); bare -> /24
+check("subnet: /24 -> .1 host + dotted mask",
+      owctl._parse_subnet("192.168.10.0/24") == ("192.168.10.1", "255.255.255.0"))
+check("subnet: /16 prefix",
+      owctl._parse_subnet("10.20.0.0/16") == ("10.20.0.1", "255.255.0.0"))
+check("subnet: bare network defaults to /24",
+      owctl._parse_subnet("192.168.55.0") == ("192.168.55.1", "255.255.255.0"))
+check("subnet: /31 rejected (no usable host)", owctl._parse_subnet("10.0.0.0/31") is None)
+check("subnet: /32 rejected", owctl._parse_subnet("10.0.0.1/32") is None)
+check("subnet: empty -> None", owctl._parse_subnet("") is None)
+check("subnet: garbage -> None", owctl._parse_subnet("notanet/24") is None)
+# builder emits the network package block when a subnet is provided
+_c = owctl.build_dhcp_cmds("vlan_10", {"start": 100, "limit": 50, "lease_time": "1h",
+                                       "subnet": "192.168.10.0/24"})
+check("builder: subnet sets network.iface section", "uci set network.vlan_10=interface" in _c)
+check("builder: subnet ipaddr", "uci set network.vlan_10.ipaddr='192.168.10.1'" in _c)
+check("builder: subnet netmask (dotted)", "uci set network.vlan_10.netmask='255.255.255.0'" in _c)
+check("builder: subnet proto static", "uci set network.vlan_10.proto='static'" in _c)
+check("builder: subnet commits network pkg", "uci commit network" in _c)
+check("builder: subnet ifname when given",
+      "uci set network.vlan_10.ifname='br-vlan10'" in
+      owctl.build_dhcp_cmds("vlan_10", {"start": 100, "limit": 50, "subnet": "192.168.10.0/24",
+                                        "ifname": "br-vlan10"}))
+check("builder: no network pkg when no subnet",
+      "uci set network." not in owctl.build_dhcp_cmds("vlan_10", {"start": 100, "limit": 50}))
+# live read-back: prefix derived from a dotted netmask in the network package
+import ipaddress as _ipa
+_dot = "255.255.255.0"
+check("read: dotted netmask -> prefix 24", _ipa.IPv4Network(f"0.0.0.0/{_dot}").prefixlen == 24)
+
 print(f"\n=== SUMMARY ===\n{passed}/{passed+failed} checks passed")
 sys.exit(1 if failed else 0)

@@ -1413,6 +1413,8 @@ function dhcpPoolFields(k,d){
 function dhcpNetworkFields(k,d){
   d=d||{};
   return `<div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+    <div><label>Subnet (CIDR)</label><input id="${_dh(k)}subnet" placeholder="192.168.10.0/24" value="${esc(d.subnet||'')}" style="width:160px"></div>
+    <div><label>Ifname</label><input id="${_dh(k)}ifname" placeholder="auto" value="${esc(d.ifname||'')}" style="width:120px"></div>
     <div><label>Netmask</label><input id="${_dh(k)}netmask" placeholder="auto" value="${esc(d.netmask||'')}" style="width:140px"></div>
     <div><label>Broadcast</label><input id="${_dh(k)}bcast" placeholder="auto" value="${esc(d.broadcast||'')}" style="width:140px"></div>
     <div style="display:flex;align-items:flex-end"><label><input type="checkbox" id="${_dh(k)}local" ${d.local?'checked':''}> Local-only</label></div>
@@ -1599,6 +1601,7 @@ async function dhpcApply(k, vlan_id, iface){
     lease_time:val(_dh(k)+'lease')||'12h',
     dhcpv4:val(_dh(k)+'v4')||'server',
     netmask:val(_dh(k)+'netmask'), broadcast:val(_dh(k)+'bcast'),
+    subnet:val(_dh(k)+'subnet'), ifname:val(_dh(k)+'ifname'),
     local:chk(_dh(k)+'local'), no_resolve:chk(_dh(k)+'nore'),
     notransfer:chk(_dh(k)+'notr'), no_default:chk(_dh(k)+'nodef'),
     options:val(_dh(k)+'opts').split('\n').map(s=>s.trim()).filter(Boolean),

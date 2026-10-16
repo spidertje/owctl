@@ -23,6 +23,7 @@ Run:  python owctl.py   (serves API + dashboard, default 0.0.0.0:8090)
 """
 import base64
 import bcrypt
+import ipaddress
 import json
 import os
 import re
@@ -157,7 +158,7 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS dhcp(
         device_id INTEGER, vlan_id TEXT, iface TEXT, start INTEGER, "limit" INTEGER,
         lease_time TEXT, enabled INTEGER, ts TEXT,
-        options TEXT, static_leases TEXT,
+        options TEXT, static_leases TEXT, subnet TEXT, ifname TEXT,
         PRIMARY KEY(device_id, vlan_id))""")
     execute("""CREATE TABLE IF NOT EXISTS dns(
         device_id INTEGER PRIMARY KEY, servers TEXT, search_domains TEXT, ts TEXT)""")
@@ -178,8 +179,8 @@ def init_db():
         except sqlite3.OperationalError:
             pass
     # Idempotent migration for databases created before the full per-VLAN DHCP
-    # surface (options + static leases JSON) existed.
-    for _col in ("options", "static_leases"):
+    # surface (options + static leases JSON + subnet/ifname) existed.
+    for _col in ("options", "static_leases", "subnet", "ifname"):
         try:
             execute(f"ALTER TABLE dhcp ADD COLUMN {_col} TEXT")
         except sqlite3.OperationalError:
@@ -1204,6 +1205,28 @@ def build_wifi_clone_cmds(iface: dict, radio: str) -> tuple:
     return slug, "\n".join(lines) + "\n"
 
 
+def _parse_subnet(subnet: str):
+    """Parse ``a.b.c.d/prefix`` (or a bare network) into ``(ipaddr, netmask)``
+    for the ``network`` package: the interface's L3 address is the first usable
+    host (``network + 1``, e.g. ``192.168.10.1`` for ``192.168.10.0/24``) and
+    ``netmask`` is the dotted full mask. Returns ``(ipaddr, netmask)`` or
+    ``None`` when the subnet is empty/invalid. Pure (no I/O)."""
+    subnet = (subnet or "").strip()
+    if not subnet:
+        return None
+    if "/" in subnet:
+        base, _, pref = subnet.partition("/")
+    else:
+        base, pref = subnet, "24"
+    try:
+        net = ipaddress.ip_network(f"{base.strip()}/{pref.strip()}", strict=False)
+    except ValueError:
+        return None
+    if net.prefixlen >= 31:  # no usable host on /31, /32
+        return None
+    return (str(net.network_address + 1), str(net.netmask))
+
+
 def build_dhcp_cmds(iface: str, cfg: dict) -> str:
     """Uci script (pure, no I/O) to create/update the FULL DHCP pool section on
     ``dhcp.<iface>``, covering the whole per-VLAN surface:
@@ -1228,12 +1251,18 @@ def build_dhcp_cmds(iface: str, cfg: dict) -> str:
 
     All values go through :func:`_uci_quote` (shell-safe single-quoting) and the
     section name is validated, so this is safe to run through the remote shell
-    via ``exec_command``. Reloads whichever DHCP daemon is present."""
+    via ``exec_command``. Reloads whichever DHCP daemon is present.
+
+    If ``subnet`` (``a.b.c.d/prefix``) is provided, the interface's L3 address is
+    set in the ``network`` package (``network.<iface>.ipaddr``/``netmask``), plus
+    ``ifname`` when given — this is how the VLAN subnet is managed here.
+    """
     iface = str(iface).strip()
     if not re.match(r"^[A-Za-z0-9_]+$", iface):
         raise HTTPException(400, "invalid interface name")
     cfg = cfg or {}
     s = f"dhcp.{iface}"
+    n = f"network.{iface}"
 
     def _flag(key, on):
         if on:
@@ -1247,7 +1276,21 @@ def build_dhcp_cmds(iface: str, cfg: dict) -> str:
                 lines.append(f"uci add_list {s}.{k}={_uci_quote(v)}")
         return lines
 
-    lines = [
+    lines = []
+    # subnet / L3 address (network package) — managed alongside the DHCP section
+    subnet = (cfg.get("subnet") or "").strip()
+    _sub = _parse_subnet(subnet) if subnet else None
+    if _sub:
+        ipaddr, mask_full = _sub
+        lines.append(f"uci set {n}=interface")
+        lines.append(f"uci set {n}.proto={_uci_quote('static')}")
+        lines.append(f"uci set {n}.ipaddr={_uci_quote(ipaddr)}")
+        lines.append(f"uci set {n}.netmask={_uci_quote(mask_full)}")
+        ifname = (cfg.get("ifname") or "").strip()
+        if ifname:
+            lines.append(f"uci set {n}.ifname={_uci_quote(ifname)}")
+        lines.append("uci commit network")
+    lines += [
         f"uci set {s}=dhcp",
         f"uci set {s}.interface={_uci_quote(iface)}",
     ]
@@ -2749,6 +2792,13 @@ async def apply_dhcp(request: Request):
     iface_s = str(iface).strip()
     if not re.match(r"^[A-Za-z0-9_]+$", iface_s):
         raise HTTPException(400, "invalid interface name")
+    # subnet + ifname (network package) — the interface's L3 address
+    subnet = (d.get("subnet") or "").strip()
+    ifname = (d.get("ifname") or "").strip()
+    if ifname and not re.match(r"^[A-Za-z0-9_.\-]+$", ifname):
+        raise HTTPException(400, "invalid ifname")
+    if subnet and not _parse_subnet(subnet):
+        raise HTTPException(400, "invalid subnet (expected a.b.c.d/prefix)")
     start = d.get("start", 100)
     limit = d.get("limit", 150)
     lease_time = str(d.get("lease_time") or "12h").strip()
@@ -2801,6 +2851,8 @@ async def apply_dhcp(request: Request):
         "netmask": netmask or None,
         "broadcast": broadcast or None,
         "local": bool(d.get("local")),
+        "subnet": subnet or None,
+        "ifname": ifname or None,
         "no_resolve": bool(d.get("no_resolve")),
         "notransfer": bool(d.get("notransfer")),
         "no_default": bool(d.get("no_default")),
@@ -2825,12 +2877,13 @@ async def apply_dhcp(request: Request):
             raise RuntimeError(f"DHCP config failed on {dev['name']}: {(err or out)[:200]}")
         log_action(dev, 'dhcp', f'vlan={vlan_id} enabled={enabled} opts={len(options)} leases={len(leases)}', ok=True)
         execute("""INSERT INTO dhcp(device_id, vlan_id, iface, start, "limit", lease_time, enabled,
-                   options, static_leases, ts)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)
+                   options, static_leases, subnet, ifname, ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(device_id, vlan_id) DO UPDATE SET
                      iface=excluded.iface, start=excluded.start, "limit"=excluded."limit",
                      lease_time=excluded.lease_time, enabled=excluded.enabled,
                      options=excluded.options, static_leases=excluded.static_leases,
+                     subnet=excluded.subnet, ifname=excluded.ifname,
                      ts=excluded.ts""",
                 (dev["id"], str(vlan_id), iface_s,
                  int(start) if str(start).isdigit() else 100,
@@ -2838,6 +2891,8 @@ async def apply_dhcp(request: Request):
                  lease_time, 1 if enabled else 0,
                  json.dumps(options) if options else None,
                  json.dumps(leases) if leases else None,
+                 subnet or None,
+                 ifname or None,
                  now()))
         return {"device": dev["name"], "ok": True}
     finally:
@@ -2864,6 +2919,8 @@ def _saved_dhcp_rows(device_id):
             "vlan_id": r["vlan_id"], "iface": r["iface"], "start": r["start"], "limit": r["limit"],
             "lease_time": r["lease_time"], "enabled": bool(r["enabled"]),
             "options": _load("options"), "static_leases": _load("static_leases"),
+            "subnet": (r.get("subnet") or "").strip() or None,
+            "ifname": (r.get("ifname") or "").strip() or None,
         })
     return out
 
@@ -2888,16 +2945,40 @@ def _read_live_dhcp(dev):
     VLAN/interface. Returns the full per-VLAN surface: pool, network overrides,
     behavior flags, the DHCP options list (``options``), static leases
     (``static_leases``, parsed from the dnsmasq ``dhcp_host`` or odhcpd ``host``
-    list), and the odhcpd IPv6 keys (``ipv6``). ``enabled`` is derived from
-    whether the section still looks like an active server (has a start address
-    or ``dhcpv4=server``/relay)."""
+    list), the odhcpd IPv6 keys (``ipv6``), and the subnet (``subnet`` as
+    ``ipaddr/prefix`` + ``ifname``) resolved from the ``network`` package.
+    ``enabled`` is derived from whether the section still looks like an active
+    server (has a start address or ``dhcpv4=server``/relay)."""
     c = _ssh_connect(dev)
     try:
-        out, _err, _st = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
+        out, _err, _st = _exec_capture(
+            c, "uci show dhcp 2>/dev/null; echo; uci show network 2>/dev/null; true", timeout=30)
         sections = _parse_uci_show(out)
+        # Resolve each interface's subnet from the network package. The builder
+        # writes it to network.<iface>, so read it back from there; if that
+        # section only carries an ifname, follow it to network.<ifname>.
+        def _subnet_for(iface):
+            attrs = sections.get("network." + iface) or {}
+            ip = (attrs.get("ipaddr") or [None])[0]
+            nm = (attrs.get("netmask") or [None])[0]
+            ifname = (attrs.get("ifname") or [None])[0]
+            if not (ip and nm) and ifname:
+                a2 = sections.get("network." + ifname) or {}
+                ip = ip or (a2.get("ipaddr") or [None])[0]
+                nm = nm or (a2.get("netmask") or [None])[0]
+            if ip and nm:
+                try:
+                    prefix = ipaddress.IPv4Network(f"0.0.0.0/{nm}").prefixlen if "." in str(nm) else int(nm)
+                except (ValueError, TypeError):
+                    prefix = nm
+                return {"subnet": f"{ip}/{prefix}", "ifname": (ifname or "").strip() or None}
+            return {"subnet": None, "ifname": (ifname or "").strip() or None}
+
         dhcp = []
         for name, attrs in sections.items():
-            if name.startswith("@host") or name.startswith("@dnsmasq") or name.startswith("@odhcpd") or name.startswith("odhcpd"):
+            if not name.startswith("dhcp."):
+                continue
+            if name.startswith("dhcp.@host") or name.startswith("dhcp.@dnsmasq") or name.startswith("dhcp.@odhcpd"):
                 continue
             iface = (attrs.get("interface") or [None])[0]
             if not iface:
@@ -2922,6 +3003,7 @@ def _read_live_dhcp(dev):
             def _on(key):
                 return _first(key) is not None  # a flag is "on" if the key is set
 
+            sub = _subnet_for(iface)
             _vm = re.match(r"vlan_(\d+)$", name)
             dhcp.append({
                 "vlan_id": int(_vm.group(1)) if _vm else None,
@@ -2940,6 +3022,8 @@ def _read_live_dhcp(dev):
                 "options": list(attrs.get("dhcp_option") or []),
                 "static_leases": leases,
                 "ipv6": ip6,
+                "subnet": sub["subnet"],
+                "ifname": sub["ifname"],
             })
         return dhcp
     finally:
