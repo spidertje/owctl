@@ -54,6 +54,9 @@ header h1 span{color:var(--acc)}
 nav{display:flex;gap:4px;margin-left:20px}
 nav button{background:none;border:0;color:var(--mut);padding:8px 12px;cursor:pointer;border-radius:8px;font-size:14px}
 nav button.on{background:var(--panel2);color:var(--tx)}
+.subtabs{display:inline-flex;gap:2px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:3px}
+.subtabs button{background:none;border:0;color:var(--mut);padding:6px 14px;cursor:pointer;border-radius:7px;font-size:13px}
+.subtabs button.on{background:var(--panel2);color:var(--tx);font-weight:600}
 main{padding:18px 20px;max-width:1200px;margin:0 auto}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
@@ -142,7 +145,6 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
     <button data-tab="network" class="on">Home</button>
      <button data-tab="devices">Devices</button>
      <button data-tab="threats">Threats</button>
-     <button data-tab="sweep">Sweep</button>
      <button data-tab="alerts">Alerting</button>
      <button data-tab="map">Network Map</button>
      <button data-tab="net">Network</button>
@@ -399,9 +401,15 @@ async function loadNetSection(name){
 async function renderDevices(){
   const devs=await api('/devices');
   const host=document.getElementById('tab-devices');
-  let html=`<div class="row" style="justify-content:space-between;margin-bottom:12px">
-    <strong>Devices (${devs.length})</strong>
-    <div class="row">
+  let html=`
+  <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div class="subtabs" id="dev-subtabs">
+      <button data-sub="devices" class="on" onclick="switchDevSub('devices')">Devices (${devs.length})</button>
+      <button data-sub="sweep" onclick="switchDevSub('sweep')">Sweep</button>
+    </div>
+  </div>
+  <div id="dev-sub-devices">
+    <div class="row" style="justify-content:flex-end;margin-bottom:12px">
       <input type="text" id="dev-search" placeholder="Search…" style="width:160px" oninput="filterDevices(this.value)">
       <input type="checkbox" id="bulk-all" onchange="toggleAll(this.checked)">
       <label for="bulk-all" class="small muted">Select all</label>
@@ -445,7 +453,27 @@ async function renderDevices(){
     </div>`;
   }
   html+=`</div>`;
+  html+=`</div>`;
+  html+=`
+  <div id="dev-sub-sweep" style="display:none">
+    <div id="sweep-body"></div>
+  </div>`;
   host.innerHTML=html;
+  _sweepRendered=false;
+  switchDevSub(_devSub||'devices');
+}
+// Sub-tabs within the Devices tab: Devices | Sweep
+let _devSub='devices';
+let _sweepRendered=false;
+function switchDevSub(sub){
+  _devSub=sub;
+  document.querySelectorAll('#dev-subtabs button').forEach(b=>b.classList.toggle('on',b.dataset.sub===sub));
+  const dv=document.getElementById('dev-sub-devices');
+  const sw=document.getElementById('dev-sub-sweep');
+  if(!dv||!sw)return;
+  dv.style.display=(sub==='devices')?'':'none';
+  sw.style.display=(sub==='sweep')?'':'none';
+  if(sub==='sweep'&&!_sweepRendered){_sweepRendered=true;renderSweep();}
 }
 function filterDevices(q){
   q=q.toLowerCase();
@@ -644,7 +672,11 @@ function startPolling(ms=60000){
   _pollTm=setInterval(renderDevices,ms);
 }
 function stopPolling(){if(_pollTm){clearInterval(_pollTm);_pollTm=null;}}
-function goSweep(){document.querySelector('nav button[data-tab=sweep]').click()}
+function goSweep(){
+  const devBtn=document.querySelector('nav button[data-tab=devices]');
+  if(devBtn)devBtn.click();
+  switchDevSub('sweep');
+}
 async function chk(id){
   toast('Checking…');
   try{
@@ -1128,7 +1160,7 @@ async function renderThreats(){
 async function ack(did,rule){await api('/findings/ack',{method:'POST',body:JSON.stringify({device_id:did,rule_id:rule})});renderThreats()}
 
 async function renderSweep(){
-  const el=document.getElementById('tab-sweep');
+  const el=document.getElementById('sweep-body')||document.getElementById('tab-sweep');
   el.innerHTML=`<h2>LAN sweep</h2>
   <p class="muted">Scans a user-defined IPv4 range (CIDR, a-b list, or comma list) for live hosts and hints at OpenWrt devices. Max 4096 addresses per run.</p>
   <div class="row"><input id="sweep-spec" placeholder="192.168.1.0/24  or  192.168.1.1-192.168.1.250" style="min-width:320px">
