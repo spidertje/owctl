@@ -210,5 +210,74 @@ import ipaddress as _ipa
 _dot = "255.255.255.0"
 check("read: dotted netmask -> prefix 24", _ipa.IPv4Network(f"0.0.0.0/{_dot}").prefixlen == 24)
 
+# --- build_dns_cmds: scope (router / dhcp / both) ---
+# router scope writes system.@dns[0] and does NOT touch DHCP options
+SYS_DETECT = "system.@dns[0].server='8.8.8.8' '8.8.4.4'\nsystem.@dns[0].search='home.lan'\n"
+cmd_r = owctl.build_dns_cmds("odhcpd", SYS_DETECT, ["1.1.1.1"], ["corp.lan"], scope="router")
+check("dns router scope writes system.@dns[0].server",
+      "add_list system.@dns[0].server='1.1.1.1'" in cmd_r)
+check("dns router scope writes search",
+      "add_list system.@dns[0].search='corp.lan'" in cmd_r)
+check("dns router scope commits system pkg", "uci commit system" in cmd_r)
+check("dns router scope does NOT touch dhcp.lan", "dhcp.lan" not in cmd_r)
+check("dns router scope drops old 8.8.8.8",
+      "del_list system.@dns[0].server='8.8.8.8'" in cmd_r)
+check("dns router scope drops old search",
+      "del_list system.@dns[0].search='home.lan'" in cmd_r)
+check("dns router scope restarts a resolver",
+      "dnsmasq restart" in cmd_r or "system restart" in cmd_r)
+
+# dhcp scope (default) must NOT write system.@dns
+cmd_d = owctl.build_dns_cmds("odhcpd", SYS_DETECT, ["1.1.1.1"], [], scope="dhcp")
+check("dns dhcp scope ignores system.@dns", "system.@dns" not in cmd_d)
+check("dns dhcp scope still writes option 6", "dhcp-option=6,1.1.1.1" in cmd_d)
+
+# both scope writes both places
+cmd_b = owctl.build_dns_cmds("odhcpd", SYS_DETECT, ["1.1.1.1"], [], scope="both")
+check("dns both scope writes system", "add_list system.@dns[0].server='1.1.1.1'" in cmd_b)
+check("dns both scope writes dhcp option 6", "dhcp-option=6,1.1.1.1" in cmd_b)
+
+# --- _read_live_dns: split by scope ---
+LIVE_DNS = (
+    "dhcp.lan.dhcp_option='dhcp-option=6,1.1.1.1' '6,2001:db8::1'\n"
+    "dhcp.lan.search='home.lan'\n"
+    "system.@dns[0].server='8.8.8.8'\n"
+    "system.@dns[0].search='corp.lan'\n"
+)
+# _read_live_dns needs a dev dict; drive it through the parser directly by
+# monkeypatching _ssh_connect to return a fake client whose _exec_capture
+# yields LIVE_DNS.
+class _FakeClient:
+    def close(self): pass
+def _fake_connect(dev):
+    return _FakeClient()
+owctl._ssh_connect = _fake_connect
+owctl._exec_capture = lambda c, cmd, timeout=300: (LIVE_DNS, "", 0)
+live = owctl._read_live_dns({"host": "192.0.2.1", "name": "r1", "access": "ssh"})
+check("read live: dhcp servers", live["dhcp"]["servers"] == ["1.1.1.1"])
+check("read live: dhcp search", live["dhcp"]["search_domains"] == ["home.lan"])
+check("read live: router servers", live["router"]["servers"] == ["8.8.8.8"])
+check("read live: router search", live["router"]["search_domains"] == ["corp.lan"])
+check("read live: resolver is odhcpd", live["resolver"] == "odhcpd")
+# RA-DNS (6,addr) must NOT leak into the IPv4 dhcp server list
+check("read live: RA-DNS not in dhcp servers", "2001:db8::1" not in live["dhcp"]["servers"])
+
+# --- build_dns_cmds: dnsmasq backend with scope=both ---
+DNSSMASQ_DETECT = (
+    "dhcp.@dnsmasq[0].server='9.9.9.9' '149.112.112.112'\n"
+    "system.@dns[0].server='8.8.8.8'\n"
+)
+cmd_dn = owctl.build_dns_cmds("dnsmasq", DNSSMASQ_DETECT, ["1.1.1.1"], ["corp.lan"], scope="both")
+check("dns dnsmasq both: del old dnsmasq server",
+      "del_list dhcp.@dnsmasq[0].server='9.9.9.9'" in cmd_dn)
+check("dns dnsmasq both: add new dnsmasq server",
+      "add_list dhcp.@dnsmasq[0].server='1.1.1.1'" in cmd_dn)
+check("dns dnsmasq both: writes system resolver",
+      "add_list system.@dns[0].server='1.1.1.1'" in cmd_dn)
+check("dns dnsmasq both: writes system search",
+      "add_list system.@dns[0].search='corp.lan'" in cmd_dn)
+check("dns dnsmasq both: drops old system server",
+      "del_list system.@dns[0].server='8.8.8.8'" in cmd_dn)
+
 print(f"\n=== SUMMARY ===\n{passed}/{passed+failed} checks passed")
 sys.exit(1 if failed else 0)

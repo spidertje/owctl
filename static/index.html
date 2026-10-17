@@ -1559,6 +1559,13 @@ async function renderDns(target){
 8.8.8.8</textarea></div>
       <div style="margin-bottom:12px"><label>Search Domains (optional, comma-separated)</label>
         <input id="dns-search" placeholder="home.lan" style="width:100%"></div>
+      <div style="margin-bottom:12px"><label>Apply to</label>
+        <select id="dns-scope" style="width:100%">
+          <option value="dhcp">DHCP clients only (option 6 / dnsmasq server list)</option>
+          <option value="router">Router's own resolver only (clients keep their DNS)</option>
+          <option value="both">Both — router + DHCP clients</option>
+        </select>
+      </div>
       <button class="act pri" onclick="applyDns()">Apply DNS</button>
     </div>`;
   }
@@ -1570,11 +1577,20 @@ async function renderDns(target){
       const dns = await api(`/dns?did=${router.id}`);
       const dnsBox = document.getElementById('dns-results');
       if(dns.live && (dns.live.servers?.length || dns.live.resolver)){
+        const live=dns.live;
         dnsBox.innerHTML = `<div class="card"><h3>Live DNS (${router.name})</h3>
-          <div class="kv"><span>Resolver</span><span><b>${esc(dns.live.resolver||'none detected')}</b></span></div>
-          <div class="kv"><span>Servers</span><span>${esc(dns.live.servers?.join(', ')||'none')}</span></div>
-          ${dns.live.search_domains?.length?`<div class="kv"><span>Search</span><span>${esc(dns.live.search_domains.join(', '))}</span></div>`:''}
+          <div class="kv"><span>Resolver</span><span><b>${esc(live.resolver||'none detected')}</b></span></div>
+          ${live.dhcp?`<div class="kv"><span>DHCP → clients</span><span><b>${esc(live.dhcp.servers?.join(', ')||'none')}</b></span></div>`:''}
+          ${live.dhcp?.search_domains?.length?`<div class="kv"><span>DHCP search</span><span>${esc(live.dhcp.search_domains.join(', '))}</span></div>`:''}
+          ${live.router?`<div class="kv"><span>Router /etc/resolv.conf</span><span><b>${esc(live.router.servers?.join(', ')||'none')}</b></span></div>`:''}
+          ${live.router?.search_domains?.length?`<div class="kv"><span>Router search</span><span>${esc(live.router.search_domains.join(', '))}</span></div>`:''}
         </div>`;
+        if(NET_ADVANCED){
+          document.getElementById('dns-servers').value = (live.router?.servers||live.dhcp?.servers||[]).join('\n');
+          document.getElementById('dns-search').value = (live.router?.search_domains||live.dhcp?.search_domains||[]).join(', ');
+          const sc=document.getElementById('dns-scope');
+          if(sc && dns.saved?.scope) sc.value = dns.saved.scope;
+        }
         if(NET_ADVANCED){
           document.getElementById('dns-servers').value = dns.live.servers.join('\n');
           document.getElementById('dns-search').value = (dns.live.search_domains||[]).join(', ');
@@ -1670,9 +1686,10 @@ async function applyDns(){
   const servers=document.getElementById('dns-servers').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if(!servers.length){toast('Enter at least one DNS server',true);return}
   const search_domains=document.getElementById('dns-search').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const scope=document.getElementById('dns-scope')?.value || 'dhcp';
   try{
-    toast('Applying DNS...');
-    const r=await api('/dns/apply',{method:'POST',body:JSON.stringify({did:parseInt(did),servers,search_domains})});
+    toast('Applying DNS ('+scope+')...');
+    const r=await api('/dns/apply',{method:'POST',body:JSON.stringify({did:parseInt(did),servers,search_domains,scope})});
     document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>DNS applied</strong> on ${r.device}: ${r.servers.join(', ')}</div>`;
   }catch(e){
     document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(e.message||e)}</div>`;

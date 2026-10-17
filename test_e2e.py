@@ -42,6 +42,7 @@ from paramiko.sftp_si import SFTPServerInterface
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import owctl  # noqa: E402
+from starlette.testclient import TestClient
 
 RESULTS = []
 SERVER_KEY = None
@@ -359,7 +360,9 @@ def main():
     owctl.DATA_DIR = scratch
     owctl.BACKUP_DIR = scratch
     owctl.DB_PATH = os.path.join(scratch, "test.db")
+    os.environ["OWCTL_ALLOW_OPEN"] = "1"
     owctl.init_db()
+    client = TestClient(owctl.app)
 
     ssh_port, luci_port = 22222, 8091
     start_ssh_server(ssh_port)
@@ -462,6 +465,108 @@ def main():
         check("backup: recorded in DB", len(rows) >= 1)
     except Exception as e:
         check("backup", False, repr(e))
+
+    # ---------------- DNS scope (router / dhcp / both) ----------------
+    try:
+        # Pure builder: router scope writes system.@dns, never dhcp.lan
+        # NOTE: this block monkeypatches _ssh_connect / _exec_capture for the
+        # live-read test below. The originals are saved at the top of the
+        # block and restored before the REST endpoint test so the mock SSH
+        # server is used for the apply path.
+        _orig_connect = owctl._ssh_connect
+        _orig_exec = owctl._exec_capture
+        sys_detect = "system.@dns[0].server='8.8.8.8'\nsystem.@dns[0].search='home.lan'\n"
+        cmd_r = owctl.build_dns_cmds("odhcpd", sys_detect, ["1.1.1.1"], ["corp.lan"], scope="router")
+        check("dns router scope writes system server",
+              "add_list system.@dns[0].server='1.1.1.1'" in cmd_r, cmd_r[:200])
+        check("dns router scope writes search",
+              "add_list system.@dns[0].search='corp.lan'" in cmd_r)
+        check("dns router scope commits system", "uci commit system" in cmd_r)
+        check("dns router scope never touches dhcp.lan", "dhcp.lan" not in cmd_r)
+        check("dns router scope drops old server",
+              "del_list system.@dns[0].server='8.8.8.8'" in cmd_r)
+
+        # dhcp scope (default) must NOT write system.@dns
+        cmd_d = owctl.build_dns_cmds("odhcpd", sys_detect, ["1.1.1.1"], [], scope="dhcp")
+        check("dns dhcp scope ignores system.@dns", "system.@dns" not in cmd_d)
+        check("dns dhcp scope writes option 6", "dhcp-option=6,1.1.1.1" in cmd_d)
+
+        # both scope writes both places
+        cmd_b = owctl.build_dns_cmds("odhcpd", sys_detect, ["1.1.1.1"], [], scope="both")
+        check("dns both scope writes system", "add_list system.@dns[0].server='1.1.1.1'" in cmd_b)
+        check("dns both scope writes dhcp option 6", "dhcp-option=6,1.1.1.1" in cmd_b)
+
+        # dnsmasq backend with scope=both
+        d2 = ("dhcp.@dnsmasq[0].server='9.9.9.9' '149.112.112.112'\n"
+              "system.@dns[0].server='8.8.8.8'\n")
+        cmd_dn = owctl.build_dns_cmds("dnsmasq", d2, ["1.1.1.1"], ["corp.lan"], scope="both")
+        check("dns dnsmasq both: del old dnsmasq server",
+              "del_list dhcp.@dnsmasq[0].server='9.9.9.9'" in cmd_dn)
+        check("dns dnsmasq both: add new dnsmasq server",
+              "add_list dhcp.@dnsmasq[0].server='1.1.1.1'" in cmd_dn)
+        check("dns dnsmasq both: writes system resolver",
+              "add_list system.@dns[0].server='1.1.1.1'" in cmd_dn)
+        check("dns dnsmasq both: writes system search",
+              "add_list system.@dns[0].search='corp.lan'" in cmd_dn)
+        check("dns dnsmasq both: drops old system server",
+              "del_list system.@dns[0].server='8.8.8.8'" in cmd_dn)
+
+        # _read_live_dns returns the two scopes separately
+        live_detect = (
+            "dhcp.lan.dhcp_option='dhcp-option=6,1.1.1.1' '6,2001:db8::1'\n"
+            "dhcp.lan.search='home.lan'\n"
+            "system.@dns[0].server='8.8.8.8'\n"
+            "system.@dns[0].search='corp.lan'\n"
+        )
+        class _FakeClient:
+            def close(self): pass
+            def exec_command(self, cmd, timeout=300):
+                # apply_dns calls c.exec_command directly after _exec_capture,
+                # so the fake must mimic paramiko's exec_command shape:
+                # (stdin, stdout, stderr) where stdout.read() returns bytes
+                # and stdout.channel.recv_exit_status() returns 0.
+                class _Out:
+                    def __init__(self, data):
+                        self._data = data
+                        self.channel = _Chan()
+                    def read(self, *a, **k):
+                        return self._data
+                class _Chan:
+                    def recv_exit_status(self):
+                        return 0
+                return (None, _Out(live_detect.encode()), _Out(b""))
+        owctl._ssh_connect = lambda dev: _FakeClient()
+        owctl._exec_capture = lambda c, cmd, timeout=300: (live_detect, "", 0)
+        live = owctl._read_live_dns({"host": "127.0.0.1", "name": "dnsbox", "access": "ssh"})
+        check("dns live: dhcp servers", live["dhcp"]["servers"] == ["1.1.1.1"],
+              str(live.get("dhcp")))
+        check("dns live: dhcp search", live["dhcp"]["search_domains"] == ["home.lan"])
+        check("dns live: router servers", live["router"]["servers"] == ["8.8.8.8"])
+        check("dns live: router search", live["router"]["search_domains"] == ["corp.lan"])
+        check("dns live: resolver is odhcpd", live["resolver"] == "odhcpd")
+        check("dns live: RA-DNS not in dhcp servers",
+              "2001:db8::1" not in live["dhcp"]["servers"])
+
+        # REST endpoint: scope is accepted and echoed.
+        # Drive the apply path with SSH primitives stubbed out — the mock SSH
+        # server in this harness uses an RSA key that the client's freshly
+        # generated OpenSSH key won't authenticate against, so we test the
+        # endpoint's validation/echo logic here and let checks_dhcp_dns.py
+        # cover the real builder + live-read paths.
+        owctl._ssh_connect = lambda dev: _FakeClient()
+        owctl._exec_capture = lambda c, cmd, timeout=300: (live_detect, "", 0)
+        owctl._run_ssh = lambda *a, **k: {"device": "dnsbox", "ok": True}
+        r = client.post("/api/dns/apply", json={"did": 999, "servers": ["1.1.1.1"],
+                                                "search_domains": ["corp.lan"], "scope": "both"})
+        check("dns apply both: 200", r.status_code == 200, r.text)
+        check("dns apply both: scope echoed", r.json().get("scope") == "both")
+        r = client.post("/api/dns/apply", json={"did": 999, "servers": ["1.1.1.1"], "scope": "bogus"})
+        check("dns apply bogus scope: 400", r.status_code == 400)
+        # Restore the real SSH primitives so the rest of the harness is clean.
+        owctl._ssh_connect = _orig_connect
+        owctl._exec_capture = _orig_exec
+    except Exception as e:
+        check("dns scope", False, repr(e))
 
     # ---------------- _exec_capture no deadlock ----------------
     try:

@@ -161,7 +161,11 @@ def init_db():
         options TEXT, static_leases TEXT, subnet TEXT, ifname TEXT,
         PRIMARY KEY(device_id, vlan_id))""")
     execute("""CREATE TABLE IF NOT EXISTS dns(
-        device_id INTEGER PRIMARY KEY, servers TEXT, search_domains TEXT, ts TEXT)""")
+        device_id INTEGER PRIMARY KEY, servers TEXT, search_domains TEXT, scope TEXT, ts TEXT)""")
+    try:
+        execute("ALTER TABLE dns ADD COLUMN scope TEXT")
+    except sqlite3.OperationalError:
+        pass
     execute("""CREATE TABLE IF NOT EXISTS qos(
         device_id INTEGER PRIMARY KEY, enabled INTEGER, interface TEXT,
         download_kbps INTEGER, upload_kbps INTEGER, qdisc TEXT, ecn INTEGER, ts TEXT)""")
@@ -1345,13 +1349,23 @@ def build_dhcp_apply_cmds(iface: str, start=100, limit=150, lease_time: str = "1
                                    "lease_time": lease_time, "dhcpv4": "server"})
 
 
-def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: list = None) -> str:
+def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: list = None,
+                  scope: str = "dhcp") -> str:
     """Uci script to set DNS for the active DHCP/DNS backend. Pure (no I/O).
 
-    odhcpd: DNS is delivered via DHCP option 6. Replaces the ``dhcp-option=6,``
-    entries and the bare ``dhcp-option=6`` marker, but PRESERVES every other
-    ``dhcp_option`` entry (notably IPv6 RA-DNS ``6,<addr>``) so existing IPv6
-    DNS is not silently dropped on re-apply.
+    ``scope`` selects where the servers land:
+
+    * ``"dhcp"`` (default) — DNS is delivered to DHCP clients via option 6
+      (odhcpd) or the dnsmasq ``server`` list. Same as before this change.
+    * ``"router"`` — the box's own resolver: ``system.@dns[0].server`` /
+      ``system.@dns[0].search``, which is what ``/etc/resolv.conf`` is built
+      from. Does NOT touch the DHCP options, so clients keep their own DNS.
+    * ``"both"`` — applies to both places in one script.
+
+    odhcpd: DHCP DNS is delivered via option 6. Replaces the
+    ``dhcp-option=6,`` entries and the bare ``dhcp-option=6`` marker, but
+    PRESERVES every other ``dhcp_option`` entry (notably IPv6 RA-DNS
+    ``6,<addr>``) so existing IPv6 DNS is not silently dropped on re-apply.
 
     dnsmasq: clears the ``@dnsmasq[0].server`` list by removing each existing
     value individually (``del_list`` requires a value), then adds the new ones.
@@ -1359,8 +1373,31 @@ def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: lis
     An empty ``servers`` list is valid: it clears all upstream servers ("local
     only" / router-resolved). Callers validate the empty case before calling."""
     servers = [str(s).strip() for s in (servers or []) if str(s).strip()]
+    search_domains = [str(s).strip() for s in (search_domains or []) if str(s).strip()]
+    lines = []
+
+    # Router's own resolver: system.@dns[0] is the source for /etc/resolv.conf.
+    # Independent of the DHCP backend — the box needs to resolve regardless.
+    if scope in ("router", "both"):
+        existing_servers = _uci_list_values(detect, "system.@dns[0]", "server")
+        for v in existing_servers:
+            lines.append(f"uci -q del_list system.@dns[0].server={_uci_quote(v)} || true")
+        for s in servers:
+            lines.append(f"uci add_list system.@dns[0].server={_uci_quote(s)}")
+        existing_search = _uci_list_values(detect, "system.@dns[0]", "search")
+        for v in existing_search:
+            lines.append(f"uci -q del_list system.@dns[0].search={_uci_quote(v)} || true")
+        for d in search_domains:
+            lines.append(f"uci add_list system.@dns[0].search={_uci_quote(d)}")
+        lines.append("uci commit system")
+        # dnsmasq reads system.@dns, so restart it; odhcpd does not, but the
+        # restart is harmless and keeps one code path for both backends.
+        lines.append("/etc/init.d/dnsmasq restart 2>/dev/null || /etc/init.d/system restart 2>/dev/null || true")
+
+    if scope == "router":
+        return "\n".join(lines) + "\n"
+
     if backend == "odhcpd":
-        lines = []
         # Preserve every dhcp_option entry that is not an IPv4 option-6 DNS
         # entry. Option-6 servers are `dhcp-option=6,<ip>` (or the bare marker
         # `dhcp-option=6`); IPv6 RA-DNS entries look like `6,<addr>` and MUST
@@ -1376,7 +1413,6 @@ def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: lis
         return "\n".join(lines) + "\n"
     # dnsmasq backend: keep the @dnsmasq[0] block in-place.
     existing = _uci_list_values(detect, "dhcp.@dnsmasq[0]", "server")
-    lines = []
     for v in existing:
         lines.append(f"uci -q del_list dhcp.@dnsmasq[0].server={_uci_quote(v)} || true")
     for s in servers:
@@ -3096,6 +3132,11 @@ async def apply_dns(request: Request):
     did = d.get("did")
     servers = d.get("servers", [])
     search_domains = d.get("search_domains", [])
+    # scope: "dhcp" (default — clients get these via option 6 / dnsmasq server),
+    # "router" (box's own /etc/resolv.conf, clients untouched), or "both".
+    scope = (d.get("scope") or "dhcp").strip().lower()
+    if scope not in ("dhcp", "router", "both"):
+        raise HTTPException(400, "scope must be one of: dhcp, router, both")
     if not did:
         raise HTTPException(400, "did required")
     cur = q("SELECT * FROM devices WHERE id=?", (did,))
@@ -3116,20 +3157,22 @@ async def apply_dns(request: Request):
         detect, _e, _s = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
         # odhcpd (OpenWrt 22.03+) runs DHCP when a section has dhcpv4='server'
         backend = "odhcpd" if re.search(r"^dhcp\.\w+\.dhcpv4='?server'?$", detect, re.M) else "dnsmasq"
-        cmd = build_dns_cmds(backend, detect, servers, search_domains)
+        cmd = build_dns_cmds(backend, detect, servers, search_domains, scope=scope)
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"DNS config failed on {dev['name']}: {(err or out)[:200]}")
-        log_action(dev, 'dns', f'servers={",".join(servers)} backend={backend}', ok=True)
-        execute("""INSERT INTO dns(device_id, servers, search_domains, ts)
-                   VALUES(?,?,?,?)
+        log_action(dev, 'dns', f'servers={",".join(servers)} backend={backend} scope={scope}', ok=True)
+        execute("""INSERT INTO dns(device_id, servers, search_domains, scope, ts)
+                   VALUES(?,?,?,?,?)
                    ON CONFLICT(device_id) DO UPDATE SET
-                     servers=excluded.servers, search_domains=excluded.search_domains, ts=excluded.ts""",
-                (dev["id"], ",".join(servers), ",".join(search_domains), now()))
-        return {"device": dev["name"], "ok": True, "servers": servers, "resolver": backend}
+                     servers=excluded.servers, search_domains=excluded.search_domains,
+                     scope=excluded.scope, ts=excluded.ts""",
+                (dev["id"], ",".join(servers), ",".join(search_domains), scope, now()))
+        return {"device": dev["name"], "ok": True, "servers": servers,
+                "resolver": backend, "scope": scope}
     finally:
         c.close()
 
@@ -3145,41 +3188,78 @@ def dns_read(did: int):
 def _saved_dns_rows(device_id):
     rows = q("SELECT * FROM dns WHERE device_id=?", (device_id,))
     if rows:
-        return {"servers": rows[0]["servers"].split(","), "search_domains": rows[0]["search_domains"].split(",")}
-    return {"servers": [], "search_domains": []}
+        r = rows[0]
+        return {
+            "servers": (r["servers"] or "").split(",") if r["servers"] else [],
+            "search_domains": (r["search_domains"] or "").split(",") if r["search_domains"] else [],
+            "scope": r.get("scope") or "dhcp",
+        }
+    return {"servers": [], "search_domains": [], "scope": "dhcp"}
 
 def _read_live_dns(dev):
-    """Read live DNS config from UCI (odhcpd option-6 or dnsmasq block)."""
+    """Read live DNS config from UCI, split by scope.
+
+    Returns ``{"dhcp": {...}, "router": {...}, "resolver": <backend>}`` so the
+    dashboard can show the two independently. ``dhcp`` is the DNS delivered to
+    clients (odhcpd option-6 or dnsmasq server list); ``router`` is the box's
+    own resolver (``system.@dns[0]``), which is what ``/etc/resolv.conf`` is
+    built from. Either side may be empty/absent — that is a valid state.
+    """
     c = _ssh_connect(dev)
     try:
-        out, _err, _st = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
+        out, _err, _st = _exec_capture(
+            c, "uci show dhcp 2>/dev/null; echo; uci show system 2>/dev/null; true", timeout=30)
         sections = _parse_uci_show(out)
-        servers = []
+        dhcp_servers = []
+        dhcp_search = []
         resolver = None
+
         # odhcpd: DNS is delivered via DHCP option 6 (`dhcp-option=6,<ip>`).
         # Bare `6,<addr>` values are IPv6 RA-DNS and must NOT be read as IPv4 servers.
         for sec, attrs in sections.items():
             if sec == "dhcp.lan" or sec.startswith("dhcp.lan.") or re.match(r"^dhcp\.vlan_", sec):
                 for v in attrs.get("dhcp_option", []):
                     if v.startswith("dhcp-option=6,"):
-                        servers.extend(x for x in v.split(",")[1:] if x)
+                        dhcp_servers.extend(x for x in v.split(",")[1:] if x)
                         resolver = "odhcpd"
-        
-        # backend detection for return value
+                for d in attrs.get("search", []):
+                    dhcp_search.append(d)
+
+        # backend detection for the return value
         backend = "odhcpd" if re.search(r"^dhcp\.\w+\.dhcpv4='?server'?$", out, re.M) else "dnsmasq"
-        # dnsmasq block (only inspect if no odhcpd resolver found, so stale blocks don't leak through)
+        # dnsmasq block (only inspect if no odhcpd resolver found, so stale
+        # blocks don't leak through as the live resolver)
         if not resolver:
             for sec, attrs in sections.items():
                 if sec.startswith("dhcp.@dnsmasq") and "server" in attrs:
-                    servers.extend(attrs["server"])
+                    dhcp_servers.extend(attrs["server"])
                     resolver = "dnsmasq"
-        # dedupe, keep order
-        seen, uniq = set(), []
-        for s in servers:
-            if s not in seen:
-                seen.add(s)
-                uniq.append(s)
-        return {"servers": uniq, "search_domains": [], "resolver": resolver}
+                if sec.startswith("dhcp.@dnsmasq") and "search" in attrs:
+                    dhcp_search.extend(attrs["search"])
+
+        # Router's own resolver: system.@dns[0] is the source for
+        # /etc/resolv.conf. Independent of the DHCP backend.
+        router_servers = []
+        router_search = []
+        dns_sec = sections.get("system.@dns[0]")
+        if isinstance(dns_sec, dict):
+            router_servers = list(dns_sec.get("server") or [])
+            router_search = list(dns_sec.get("search") or [])
+
+        def _dedupe(items):
+            seen, out = set(), []
+            for s in items:
+                s = str(s).strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            return out
+
+        return {
+            "dhcp": {"servers": _dedupe(dhcp_servers), "search_domains": _dedupe(dhcp_search)},
+            "router": {"servers": _dedupe(router_servers), "search_domains": _dedupe(router_search)},
+            "resolver": resolver or backend,
+        }
     finally:
         c.close()
 
