@@ -362,6 +362,10 @@ async function renderNet(activeSection){
         <h3>WiFi <span class="pill">→</span></h3>
         <p class="small muted">SSIDs, encryption and configuration clone.</p>
       </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='dyndns'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('dyndns')">
+        <h3>Dynamic DNS <span class="pill">→</span></h3>
+        <p class="small muted">Push WAN IP to a provider on change.</p>
+      </div>
     </div>
     <div id="net-detail"></div>`;
   el.innerHTML=html;
@@ -395,6 +399,8 @@ async function loadNetSection(name){
     await renderFirewall(box);
   }else if(name==='wifi'){
     await renderWifi(box);
+  }else if(name==='dyndns'){
+    await renderDyndns(box);
   }
 }
 
@@ -2294,6 +2300,96 @@ async function toggleUser(uid,on){
 async function deleteUser(uid){
   if(!confirm('Delete this user?'))return;
   try{await api('/users/'+uid,{method:'DELETE'});toast('Deleted');loadUsers();}
+  catch(e){toast(e.message,true);}
+}
+
+/* ─────────────────────────── Dynamic DNS ──────────────────────────────
+   ponytail: one table + a provider <select> populated from /api/dyndns.
+   Pure-HTTP providers need no box-side package; cloudflare/ovh install one
+   on config and remove it when the last entry for that provider is gone. */
+async function renderDyndns(target){
+  const el=target||document.getElementById('net-detail');
+  el.innerHTML='<p class="muted">Loading…</p>';
+  try{
+    const data=await api('/dyndns');
+    const devs=await api('/devices');
+    const devOpts=devs.map(d=>`<option value="${d.id}">${esc(d.name)} (${d.host})</option>`).join('');
+    const provOpts=data.providers.map(p=>`<option value="${p}">${p}</option>`).join('');
+    let rows='';
+    for(const e of data.entries){
+      const ok = (e.last_result||'').startsWith('ok');
+      rows+=`<tr>
+        <td>${e.device_name}</td>
+        <td><span class="pill">${esc(e.provider)}</span></td>
+        <td>${esc(e.hostname)}</td>
+        <td>${e.last_ip||'—'}</td>
+        <td>${e.last_update||'—'}</td>
+        <td><span style="color:${ok?'var(--ok)':'var(--bad)'}">${esc((e.last_result||'never').slice(0,40))}</span></td>
+        <td>${e.enabled?'<span style="color:var(--ok)">on</span>':'<span style="color:var(--mut)">off</span>'}</td>
+        <td>
+          <button class="act" onclick="dyndnsForce(${e.id})">Force</button>
+          <button class="act" onclick="dyndnsToggle(${e.id},${e.enabled?0:1})">${e.enabled?'Disable':'Enable'}</button>
+          <button class="act" style="border-color:var(--bad);color:var(--bad)" onclick="dyndnsDelete(${e.id})">Delete</button>
+        </td>
+      </tr>`;
+    }
+    el.innerHTML=`
+      <h2>Dynamic DNS</h2>
+      <p class="muted">Push the device's WAN IP to a provider whenever it changes. Runs inside the audit scheduler; use <b>Force</b> to run now.</p>
+      <div class="row" style="margin-bottom:16px;flex-wrap:wrap;gap:8px">
+        <select id="dyndns-dev">${devOpts}</select>
+        <select id="dyndns-prov">${provOpts}</select>
+        <input id="dyndns-host" placeholder="hostname (e.g. myhome.duckdns.org)" style="flex:1;min-width:200px">
+        <input id="dyndns-token" placeholder="token / password (optional)" type="password" style="flex:1;min-width:160px">
+        <input id="dyndns-zone" placeholder="extra: zone id (Cloudflare)" style="flex:1;min-width:160px">
+        <input id="dyndns-rec" placeholder="extra: record id (CF/GD)" style="flex:1;min-width:160px">
+        <label style="display:flex;align-items:center;gap:4px"><input id="dyndns-enabled" type="checkbox" checked> Enabled</label>
+        <button class="act pri" onclick="dyndnsAdd()">+ Add</button>
+      </div>
+      <table class="ut">
+        <thead><tr><th>Device</th><th>Provider</th><th>Hostname</th><th>Last IP</th><th>Last update</th><th>Result</th><th>Status</th><th></th></tr></thead>
+        <tbody>${rows||'<tr><td colspan="8" class="muted">No DDNS entries yet.</td></tr>'}</tbody>
+      </table>`;
+  }catch(e){el.textContent='Error loading dyndns: '+e.message;}
+}
+
+async function dyndnsAdd(){
+  const dev=document.getElementById('dyndns-dev').value;
+  const prov=document.getElementById('dyndns-prov').value;
+  const host=document.getElementById('dyndns-host').value.trim();
+  const tok=document.getElementById('dyndns-token').value;
+  const zone=document.getElementById('dyndns-zone').value.trim();
+  const rec=document.getElementById('dyndns-rec').value.trim();
+  const enabled=document.getElementById('dyndns-enabled').checked;
+  if(!dev||!host){toast('Device and hostname required',true);return;}
+  const extra={};
+  if(zone)extra.zone=zone;
+  if(rec)extra.rec=rec;
+  try{
+    const r=await api('/dyndns',{method:'POST',body:JSON.stringify({
+      device_id:parseInt(dev), provider:prov, hostname:host,
+      token:tok, extra, enabled})});
+    toast(r.installed?`Added (${r.installed})`:'Added');
+    renderDyndns();
+  }catch(e){toast(e.message,true);}
+}
+
+async function dyndnsForce(id){
+  try{
+    const r=await api('/dyndns/'+id+'/force',{method:'POST'});
+    toast(`WAN IP ${r.wan_ip||'—'} → ${r.last_result||''}`);
+    renderDyndns();
+  }catch(e){toast(e.message,true);}
+}
+
+async function dyndnsToggle(id,on){
+  try{await api('/dyndns',{method:'POST',body:JSON.stringify({id,enabled:on})});renderDyndns();}
+  catch(e){toast(e.message,true);}
+}
+
+async function dyndnsDelete(id){
+  if(!confirm('Delete this DDNS entry?'))return;
+  try{await api('/dyndns/'+id,{method:'DELETE'});toast('Deleted');renderDyndns();}
   catch(e){toast(e.message,true);}
 }
 </script>

@@ -166,6 +166,15 @@ def init_db():
         execute("ALTER TABLE dns ADD COLUMN scope TEXT")
     except sqlite3.OperationalError:
         pass
+    # ponytail: one row per (device, provider, hostname). Credentials live next to
+    # device creds in the same DB; the API never returns them (see dyndns_read).
+    execute("""CREATE TABLE IF NOT EXISTS dyndns(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL, hostname TEXT NOT NULL,
+        token TEXT, extra TEXT, enabled INTEGER DEFAULT 1,
+        last_ip TEXT, last_update TEXT, last_result TEXT,
+        UNIQUE(device_id, provider, hostname))""")
     execute("""CREATE TABLE IF NOT EXISTS qos(
         device_id INTEGER PRIMARY KEY, enabled INTEGER, interface TEXT,
         download_kbps INTEGER, upload_kbps INTEGER, qdisc TEXT, ecn INTEGER, ts TEXT)""")
@@ -821,6 +830,87 @@ def gather(dev):
     if dev["access"] == "luci":
         return luci_gather(dev)
     raise RuntimeError("device has no management access configured")
+
+
+# --------------------------------------------------- dynamic DNS
+# ponytail: one dict per provider, no class hierarchy. The update loop is
+# generic; per-provider quirks (auth param name, ok-string, JSON parsing)
+# live in the dict so adding a 21st provider is one entry.
+DDNS_PROVIDERS = {
+    "duckdns":     dict(url="https://duckdns.org/update?domains={host}&token={token}&ip={ip}", ok="OK"),
+    "noip":        dict(url="https://api.noip.com/nic/update?hostname={host}&myip={ip}", ok="good"),
+    "dynu":        dict(url="https://api.dynu.com/nic/update?hostname={host}&myip={ip}&token={token}", ok="good"),
+    "freedns":     dict(url="https://freedns.afraid.org/dynamic/update.php?hostname={host}&auth_token={token}&myip={ip}", ok="good"),
+    "noip_duck":   dict(url="https://duckdns.org/update?token={token}&domain={host}&ip={ip}", ok="OK"),
+    "cloudflare":  dict(url="https://api.cloudflare.com/client/v4/zones/{zone}/dns_records/{rec}",
+                         ok="success", json_body=True),
+    "ovh":         dict(url="https://eu.api.ovh.com/1.0/ddns/record?hostname={host}&ip={ip}",
+                         ok="ok", json_body=True),
+    "godaddy":     dict(url="https://api.godaddy.com/v1/domains/{host}/records/A/{rec}",
+                         ok="recordSet", json_body=True),
+    "namecheap":   dict(url="https://dynamic.namecheap.com/getip?host={host}&domain={dom}&password={token}",
+                         ok="good"),
+    "hurricane":   dict(url="https://dns.he.net/dns?hostname={host}&myip={ip}&password={token}", ok="good"),
+    "ddns_oray":   dict(url="https://ddns.oray.com/checkip?hostname={host}&token={token}&myip={ip}", ok="good"),
+}
+
+
+def _ddns_apply(dev, st):
+    """Update every enabled DDNS entry for a device after a gather.
+
+    Runs inside the scheduler and the manual /dyndns/force endpoint. Never
+    raises: a failed update records its error in last_result and retries next
+    interval. Skips when the WAN IP is empty or unchanged since last update.
+    """
+    ip = st.get("wan_ip") or ""
+    if not ip:
+        return
+    rows = q("SELECT * FROM dyndns WHERE device_id=? AND enabled=1", (dev["id"],))
+    for r in rows:
+        prov = DDNS_PROVIDERS.get(r["provider"])
+        if not prov:
+            execute("UPDATE dyndns SET last_result=? WHERE id=?",
+                    (f"unknown provider {r['provider']}", r["id"]))
+            continue
+        if r["last_ip"] == ip and r["last_result"] and r["last_result"].startswith("ok"):
+            continue  # no change, no request
+        try:
+            host = r["hostname"]
+            extra = {}
+            if r.get("extra"):
+                try:
+                    extra = json.loads(r["extra"])
+                except Exception:
+                    extra = {}
+            url = prov["url"].format(host=host, ip=ip,
+                                     token=r.get("token") or "",
+                                     zone=extra.get("zone") or "",
+                                     rec=extra.get("rec") or "",
+                                     dom=extra.get("dom") or "")
+            req = urllib.request.Request(url, method="POST" if prov.get("json_body") else "GET",
+                                         headers={"User-Agent": "owctl-dyndns/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode(errors="replace").strip().lower()
+            ok = prov["ok"].lower() in body
+            result = "ok" if ok else f"bad response: {body[:80]}"
+        except Exception as e:
+            ok = False
+            result = f"error: {e}"
+            host = r["hostname"]
+        execute("""UPDATE dyndns SET last_ip=?, last_update=?, last_result=?
+                   WHERE id=?""", (ip, now(), result, r["id"]))
+        if ok and r["last_ip"] != ip:
+            log_action(dev, "dyndns", f"{r['provider']} {host} -> {ip}", ok=True)
+
+
+def dyndns_update_device(dev):
+    """Gather + update DDNS for one device (manual force / scheduler)."""
+    st = gather(dev)
+    record_heartbeat(dev, True)
+    execute("UPDATE devices SET status='online', last_checked=? WHERE id=?",
+            (now(), dev["id"]))
+    _ddns_apply(dev, st)
+    return st
 
 
 # ------------------------------------------------------------------ audit
@@ -2319,6 +2409,7 @@ def _scheduler():
                 record_heartbeat(dev, True)
                 execute("UPDATE devices SET status='online', last_checked=? WHERE id=?", (now(), dev["id"]))
                 apply_findings(dev, st)
+                _ddns_apply(dev, st)
             except Exception:
                 record_heartbeat(dev, False)
                 execute("UPDATE devices SET status='offline' WHERE id=?", (dev["id"],))
@@ -4254,6 +4345,141 @@ def get_offline_events(limit: int = 100):
     rows = q("SELECT * FROM offline_events ORDER BY went_offline DESC, id DESC LIMIT ?",
              (max(1, min(500, limit)),))
     return [dict(r) for r in rows]
+
+
+# ------------------------------------------------------------- dyndns api
+@app.get("/api/dyndns")
+def dyndns_read():
+    """All DDNS entries (tokens never returned) + the selectable provider list."""
+    rows = q("""SELECT dyndns.id, dyndns.device_id, d.name AS device_name, dyndns.provider,
+                       dyndns.hostname, dyndns.enabled, dyndns.last_ip,
+                       dyndns.last_update, dyndns.last_result
+                FROM dyndns JOIN devices d ON d.id = dyndns.device_id
+                ORDER BY d.name, dyndns.provider, dyndns.hostname""")
+    return {"providers": sorted(DDNS_PROVIDERS),
+            "entries": [dict(r) for r in rows]}
+
+
+@app.post("/api/dyndns")
+async def dyndns_create(request: Request):
+    """Create/update one DDNS entry.
+
+    payload: {device_id, provider, hostname, token?, extra? (JSON for
+    zone/rec/dom), enabled?}. If the device is SSH-accessible, the provider's
+    opkg package is installed when missing (idempotent)."""
+    d = await request.json()
+    # Toggle path: {id, enabled} — no provider/hostname needed.
+    if d.get("id") and "enabled" in d and not d.get("provider"):
+        row = q("SELECT * FROM dyndns WHERE id=?", (int(d["id"]),))
+        if not row:
+            raise HTTPException(404, "entry not found")
+        execute("UPDATE dyndns SET enabled=? WHERE id=?",
+                (1 if d["enabled"] else 0, int(d["id"])))
+        return {"ok": True, "enabled": bool(d["enabled"])}
+    did = int(d.get("device_id") or 0)
+    provider = (d.get("provider") or "").strip()
+    hostname = (d.get("hostname") or "").strip()
+    if not did or provider not in DDNS_PROVIDERS:
+        raise HTTPException(400, "device_id and a known provider required")
+    if not hostname:
+        raise HTTPException(400, "hostname required")
+    cur = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not cur:
+        raise HTTPException(404, "device not found")
+    dev = cur[0]
+    execute("""INSERT INTO dyndns(device_id, provider, hostname, token, extra, enabled)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(device_id, provider, hostname) DO UPDATE SET
+                 token=excluded.token, extra=excluded.extra, enabled=excluded.enabled""",
+            (did, provider, hostname, d.get("token") or "",
+             json.dumps(d.get("extra") or {}),
+             1 if d.get("enabled", True) else 0))
+    installed = _dyndns_ensure_pkg(dev, provider)
+    log_action(dev, "dyndns", f"config {provider} {hostname}", ok=True,
+               error=f"pkg install failed: {installed}" if isinstance(installed, str) and installed.startswith("FAIL") else "")
+    return {"ok": True, "installed": installed}
+
+
+@app.delete("/api/dyndns/{eid}")
+def dyndns_delete(eid: int):
+    row = q("SELECT * FROM dyndns WHERE id=?", (eid,))
+    if not row:
+        raise HTTPException(404, "entry not found")
+    r = row[0]
+    dev = q("SELECT * FROM devices WHERE id=?", (r["device_id"],))
+    execute("DELETE FROM dyndns WHERE id=?", (eid,))
+    removed = _dyndns_maybe_remove_pkg(dev, r["provider"]) if dev else None
+    log_action(dev[0] if dev else {"id": None, "name": "?"}, "dyndns",
+               f"delete {r['provider']} {r['hostname']}", ok=True)
+    return {"ok": True, "removed": removed}
+
+
+@app.post("/api/dyndns/{eid}/force")
+def dyndns_force(eid: int):
+    """Gather the device now and push this entry's update immediately."""
+    row = q("SELECT * FROM dyndns WHERE id=?", (eid,))
+    if not row:
+        raise HTTPException(404, "entry not found")
+    dev = q("SELECT * FROM devices WHERE id=?", (row[0]["device_id"],))
+    if not dev:
+        raise HTTPException(404, "device not found")
+    try:
+        st = dyndns_update_device(dev[0])
+    except Exception as e:
+        raise HTTPException(502, f"device check failed: {e}")
+    after = q("SELECT last_ip, last_update, last_result FROM dyndns WHERE id=?", (eid,))
+    return {"ok": True, "wan_ip": st.get("wan_ip"), **after[0]}
+
+
+def _dyndns_pkg_for(provider: str):
+    """opkg package that carries a provider's client, or None for pure-HTTP
+    providers (duckdns/dynu/noip/freedns all work from a one-liner curl).
+    ponytail: keep the map in sync with DDNS_PROVIDERS; the only providers that
+    actually need a package on the box today are cloudflare (its API wants
+    signed JSON, so we lean on the cloudflare-ddns client) and ovh."""
+    return {"cloudflare": "luci-app-cloudflare-ddns", "ovh": "luci-app-ovhddns"}.get(provider)
+
+
+def _dyndns_ensure_pkg(dev, provider):
+    """Install the provider's opkg package when missing. Returns '' (present /
+    not needed) or a FAIL-prefixed string on error. Never raises."""
+    pkg = _dyndns_pkg_for(provider)
+    if not pkg:
+        return ""
+    if dev.get("access") != "ssh":
+        return f"FAIL(pkg install skipped: no SSH on {dev.get('name')})"
+    cmd = (f"opkg list-installed {pkg} >/dev/null 2>&1 && echo present || "
+           f"(opkg update && opkg install -y {pkg}) >/dev/null 2>&1 && echo installed")
+    try:
+        c = _ssh_connect(dev)
+        try:
+            out, err, status = _exec_capture(c, cmd, timeout=600)
+            if status != 0:
+                return f"FAIL({(err or out).strip()[:120]})"
+            return (out.strip() or "")
+        finally:
+            c.close()
+    except Exception as e:
+        return f"FAIL({e})"
+
+
+def _dyndns_maybe_remove_pkg(dev, provider):
+    """Remove the provider's package if this device has no other dyndns rows
+    for it. Returns the removed package name, '' when nothing to do, or a
+    FAIL string. Never raises."""
+    pkg = _dyndns_pkg_for(provider)
+    if not pkg or dev[0].get("access") != "ssh":
+        return ""
+    left = q("SELECT 1 FROM dyndns WHERE device_id=? AND provider=? LIMIT 1",
+             (dev[0]["id"], provider))
+    if left:
+        return ""
+    try:
+        _run_ssh(dev[0], f"opkg remove -y {pkg} 2>/dev/null || true", "package_remove",
+                 f"dyndns-uninstall {pkg}", "dyndns package removal")
+        return pkg
+    except Exception as e:
+        return f"FAIL({e})"
 
 
 app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="static")
