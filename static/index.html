@@ -122,7 +122,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   <div class="lg-box">
     <div class="lg-logo">🛰️</div>
     <h1>ow<span>ctl</span></h1>
-    <p class="lg-sub">OpenWrt control + threat watch — sign in with your account.</p>
+    <p id="login-sub" class="lg-sub">OpenWrt control + threat watch — sign in with your account.</p>
     <div class="lg-body">
       <input id="login-user" type="text" placeholder="Username"
              autocomplete="username" autocapitalize="none" spellcheck="false"
@@ -132,11 +132,15 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
              autocapitalize="off" spellcheck="false" autocomplete="current-password"
              aria-label="password"
              onkeydown="if(event.key==='Enter'){event.preventDefault();tryLogin()}"/>
+      <input id="login-confirm" type="password" placeholder="Confirm password"
+             autocapitalize="off" spellcheck="false" autocomplete="new-password"
+             aria-label="confirm password" style="display:none"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();tryLogin()}"/>
       <div id="login-err" class="lg-err" role="alert"></div>
-      <button type="button" class="lg-btn" onclick="tryLogin()">Sign in</button>
+      <button type="button" class="lg-btn" id="login-btn" onclick="tryLogin()">Sign in</button>
     </div>
-    <p class="lg-hint">On first boot, pick your admin password. Sessions last 24h and
-    are stored only in this browser; the server forgets them on restart.</p>
+    <p class="lg-hint">Sessions last 24h and are stored only in this browser; the
+    server forgets them on restart.</p>
   </div>
 </div>
 <header>
@@ -175,7 +179,7 @@ async function api(path,opts={}){
   opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
   if(TOKEN)opts.headers['Authorization']='Bearer '+TOKEN;
   const r=await fetch('/api'+path,opts);
-  if(r.status===401){showLogin('Session token rejected — sign in again');throw new Error('unauthorized')}
+  if(r.status===401){_freshGate();throw new Error('unauthorized')}
   const j=await r.json().catch(()=>({}));
   if(!r.ok)throw new Error(j.detail||j.error||r.status);
   return j;
@@ -1268,14 +1272,56 @@ function hideLogin(){
   if(gate)gate.hidden=true;
   if(main)main.style.display='';
 }
+function _loginFields(){
+  const user=document.getElementById('login-user');
+  const pass=document.getElementById('login-pass');
+  const confirm=document.getElementById('login-confirm');
+  const btn=document.getElementById('login-btn');
+  const sub=document.getElementById('login-sub');
+  if(user)user.style.display='';
+  if(pass){pass.placeholder='Password';pass.autocomplete='current-password';}
+  if(confirm)confirm.style.display='none';
+  if(btn)btn.textContent='Sign in';
+  if(sub)sub.textContent='OpenWrt control + threat watch — sign in with your account.';
+}
+function _setupFields(){
+  const user=document.getElementById('login-user');
+  const pass=document.getElementById('login-pass');
+  const confirm=document.getElementById('login-confirm');
+  const btn=document.getElementById('login-btn');
+  const sub=document.getElementById('login-sub');
+  if(user)user.style.display='none';
+  if(pass){pass.placeholder='Choose an admin password';pass.autocomplete='new-password';}
+  if(confirm)confirm.style.display='';
+  if(btn)btn.textContent='Set password';
+  if(sub)sub.textContent='First boot — set your admin password to unlock owctl.';
+}
+let _needs_setup=false;
 async function verifySession(t){
   try{const r=await fetch('/api/network',{headers:{'Authorization':'Bearer '+t}});return r.status===200;}
   catch(e){return false;}
 }
 async function tryLogin(){
-  const u=(document.getElementById('login-user')||{}).value||'';
-  const p=(document.getElementById('login-pass')||{}).value||'';
   const err=document.getElementById('login-err');
+  const p=(document.getElementById('login-pass')||{}).value||'';
+  if(_needs_setup){
+    const c=(document.getElementById('login-confirm')||{}).value||'';
+    if(!p){if(err)err.textContent='Choose a password';return;}
+    if(err)err.textContent='Setting…';
+    try{
+      const r=await fetch('/api/auth/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p,confirm:c})});
+      const j=await r.json().catch(()=>({}));
+      if(r.ok && j.session){
+        TOKEN=j.session;localStorage.setItem('owctl_session',j.session);
+        ROLE=(j.role||'').toLowerCase();localStorage.setItem('owctl_role',ROLE);
+        hideLogin();render('network');startPolling(60000);showAdminUI();
+        return;
+      }
+      if(err)err.textContent=j.detail||'Setup failed';
+    }catch(e){if(err)err.textContent='Network error';}
+    return;
+  }
+  const u=(document.getElementById('login-user')||{}).value||'';
   if(!u||!p){if(err)err.textContent='Enter your username and password';return;}
   if(err)err.textContent='Checking…';
   try{
@@ -1295,9 +1341,26 @@ function bootApp(){
   if(TOKEN){
     verifySession(TOKEN).then(ok=>{
       if(ok){hideLogin();render('network');startPolling(60000);showAdminUI();}
-      else{localStorage.removeItem('owctl_session');localStorage.removeItem('owctl_role');ROLE='';showLogin();}
+      else{localStorage.removeItem('owctl_session');localStorage.removeItem('owctl_role');ROLE='';_freshGate();}
     });
-  }else{showLogin();}
+    return;
+  }
+  _freshGate();
+}
+async function _freshGate(){
+  showLogin();
+  try{
+    const r=await fetch('/api/auth/status');
+    const j=await r.json().catch(()=>({}));
+    _needs_setup=!!j.needs_setup;
+  }catch(e){_needs_setup=false;}
+  if(_needs_setup){
+    _setupFields();
+    const p=document.getElementById('login-pass');
+    if(p)setTimeout(()=>p.focus(),0);
+  }else{
+    _loginFields();
+  }
 }
 function toggleTheme(){document.body.classList.toggle('light')}
 bootApp();

@@ -47,10 +47,13 @@ Useful env:
 
 - **Auth is always enforced** on `/api/*` via **password login only**
   (`POST /api/auth/login`) → a 24h session token sent as
-  `Authorization: Bearer *** On first boot an `admin` account is
-  seeded with no password; its password is set at the first login. Two roles:
-  `admin` (everything) and `observer` (read-only). There is no bearer-token
-  back-door.
+  `Authorization: Bearer *** On first boot the dashboard shows a
+  **setup screen** (no username): choose an admin password and confirm it —
+  submitted to `POST /api/auth/setup`, which seeds the `admin` account and
+  returns a session. `GET /api/auth/status` reports `needs_setup` so the UI
+  picks the right screen. After setup, the normal username/password sign-in
+  applies. Two roles: `admin` (everything) and `observer` (read-only). There is
+  no bearer-token back-door.
 - **Device credentials are redacted**: `GET /api/devices` returns
   `has_ssh_password` / `has_luci_pass` booleans, never the raw passwords.
 - **Rate limiting** (429 + `Retry-After`) protects the token endpoint from brute force.

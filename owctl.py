@@ -4184,6 +4184,43 @@ def settings_get():
             "network_gateway": gw}
 
 
+@app.get("/api/auth/status")
+def auth_status():
+    """Public: tells the client whether first-boot setup is still required.
+
+    Setup is needed until some user has a real password set. Once any account
+    has a password, the normal sign-in flow takes over.
+    """
+    has_pw = q("SELECT 1 FROM users WHERE password_hash != '' AND enabled=1 LIMIT 1")
+    return {"needs_setup": len(has_pw) == 0}
+
+
+@app.post("/api/auth/setup")
+async def auth_setup(request: Request):
+    """Public: first-boot admin setup. Only works when no user has a password set yet."""
+    # Reject if any user already has a password (i.e. setup already done).
+    existing = q("SELECT 1 FROM users u WHERE u.password_hash != '' LIMIT 1")
+    if existing:
+        raise HTTPException(status_code=409, detail="admin password is already set; sign in instead")
+    d = await request.json()
+    password = (d.get("password") or "").strip()
+    confirm = (d.get("confirm") or "").strip()
+    if len(password) < 4:
+        raise HTTPException(status_code=400, detail="password must be at least 4 characters")
+    if password != confirm:
+        raise HTTPException(status_code=400, detail="passwords do not match")
+    # Seed the default admin if not present, then set the password.
+    _ensure_default_admin()
+    user = _user_by_username("admin")
+    if not user:
+        raise HTTPException(status_code=500, detail="could not seed admin account")
+    pw_hash = _hash_password(password)
+    execute("UPDATE users SET password_hash=?, role='admin' WHERE id=?", (pw_hash, user["id"]))
+    # Issue a session so the client is logged in immediately.
+    tok = _create_session(user["id"])
+    return {"session": tok, "expires_in": _SESSION_TTL, "role": user["role"]}
+
+
 @app.post("/api/auth/login")
 async def auth_login(request: Request):
     """User login. On first boot (no users) the caller must register as admin."""
