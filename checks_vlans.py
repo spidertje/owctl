@@ -36,7 +36,7 @@ check("empty state returns []", r.status_code == 200 and r.json() == [])
 # 2. successful apply records the vlan
 did = owctl.execute("INSERT INTO devices(name, host, access, added_at) VALUES(?,?,?,?)",
                     ("r1", "192.0.2.1", "ssh", owctl.now()))
-owctl.do_vlan = lambda dev, vid, name, subnet, dhcp, devices, rid: {
+owctl.do_vlan = lambda dev, vid, name, subnet, dhcp, devices, rid, apply=True: {
     "device": dev["name"], "role": "router", "ok": True}
 r = client.post("/api/vlans/apply", json={"vlan_id": 10, "name": "vlan_10",
                                           "subnet": "192.168.10.0/24", "dhcp": True,

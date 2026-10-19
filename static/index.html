@@ -156,6 +156,10 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
      <button data-tab="users" class="adm-only" style="display:none">Users</button>
   </nav>
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
+  <span id="pending-apply" style="display:none;align-items:center;gap:6px;margin-left:8px">
+    <span class="badge b-MEDIUM" id="pending-badge" style="font-size:11px;padding:2px 8px"></span>
+    <button class="act pri" id="pending-apply-btn" onclick="applyAllPending()" style="padding:4px 10px;font-size:12px">Apply pending changes</button>
+  </span>
 </header>
 <main style="display:none">
   <section id="tab-network"></section>
@@ -185,6 +189,39 @@ async function api(path,opts={}){
   return j;
 }
 function toast(m,bad){const t=$('#toast');t.textContent=m;t.style.display='block';t.style.borderColor=bad?'var(--bad)':'var(--line)';setTimeout(()=>t.style.display='none',4000)}
+// ---- Save vs Save & Apply (pending-apply) ----
+// After any config save (apply=false) the backend records a pending entry; a
+// "Save & Apply" (apply=true) applies immediately and clears it. These helpers
+// keep the header badge in sync and apply the union of pending features.
+async function refreshPendingBadge(){
+  try{
+    const devs=await api('/devices');
+    let n=0,feat=new Set();
+    for(const d of devs){
+      try{const p=await api(`/devices/${d.id}/pending-applies`);
+        if(p.features&&p.features.length){n+=p.features.length;p.features.forEach(f=>feat.add(f.feature||f));}}catch(e){}
+    }
+    const wrap=document.getElementById('pending-apply');
+    const badge=document.getElementById('pending-badge');
+    if(wrap&&badge){
+      if(n>0){wrap.style.display='inline-flex';badge.textContent=n+' pending · '+[...feat].join(', ');
+        document.getElementById('pending-apply-btn').textContent='Apply pending changes';}
+      else{wrap.style.display='none';}
+    }
+  }catch(e){}
+}
+async function applyAllPending(){
+  try{
+    const devs=await api('/devices');
+    const results=[];
+    for(const d of devs){
+      try{const r=await api(`/devices/${d.id}/pending-apply`,{method:'POST'});
+        if(r.applied&&r.applied.length)results.push(d.name+': '+r.applied.join(', '));}catch(e){}
+    }
+    if(results.length){toast('Applied: '+results.join(' · '));refreshPendingBadge();renderNet&&renderNet();}
+    else{toast('No pending changes to apply');refreshPendingBadge();}
+  }catch(e){toast(String(e),true);}
+}
 const navBtns=[...document.querySelectorAll('nav button')];
 navBtns.forEach(b=>b.onclick=()=>{
   navBtns.forEach(x=>x.classList.toggle('on',x===b));
@@ -1451,7 +1488,8 @@ async function renderVlans(target){
           ${devs.map(d=>`<label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="vlan-dev-cb" value="${d.id}"> ${esc(d.name)} (${esc(d.host)})</label>`).join('')}
         </div>
       </div>
-      <button class="act pri" onclick="applyVlan()">Apply VLAN</button>
+      <button class="act" onclick="applyVlan(false)">Save</button>
+      <button class="act pri" onclick="applyVlan(true)">Save &amp; Apply</button>
     </div>`;
   }
   html+=`<div id="vlan-results" style="margin-top:16px"></div>`;
@@ -1588,7 +1626,8 @@ function dhcpNewCard(){
   <div style="margin-bottom:8px"><label>DHCP options (one per line, e.g. <code>dhcp-option=6,1.1.1.1</code>, <code>domain=home.lan</code>, <code>ignore=6</code>)</label><textarea id="dhpc-new-opts" rows="2" style="width:100%;box-sizing:border-box"></textarea></div>
   ${dhcpLeaseEditor('new',[])}
   ${dhcpIpv6Fields('new',{})}
-  <button class="act pri" onclick="dhpcApply('new')">Apply section</button>
+  <button class="act" onclick="dhpcApply('new',0,'lan',false)">Save</button>
+  <button class="act pri" onclick="dhpcApply('new',0,'lan',true)">Save &amp; Apply</button>
   <div id="dhpc-new-result"></div>`;
 }
 function dhcpSectionCard(d,i){
@@ -1606,7 +1645,8 @@ function dhcpSectionCard(d,i){
     ${dhcpLeaseEditor(k,d.static_leases||[])}
     ${dhcpIpv6Fields(k,d)}
     <div class="row">
-      <button class="act pri" onclick="dhpcApply('${k}',${d.vlan_id!=null?d.vlan_id:0},'${esc(d.iface)}')">Apply</button>
+      <button class="act" onclick="dhpcApply('${k}',${d.vlan_id!=null?d.vlan_id:0},'${esc(d.iface)}',false)">Save</button>
+      <button class="act pri" onclick="dhpcApply('${k}',${d.vlan_id!=null?d.vlan_id:0},'${esc(d.iface)}',true)">Save &amp; Apply</button>
       <button class="act" onclick="dhpcDelete('${k}',${d.vlan_id!=null?d.vlan_id:0},'${esc(d.iface)}')">Disable</button>
     </div>
     <div id="dhpc-s${i}-result"></div>
@@ -1635,7 +1675,8 @@ async function renderDns(target){
           <option value="both">Both — router + DHCP clients</option>
         </select>
       </div>
-      <button class="act pri" onclick="applyDns()">Apply DNS</button>
+      <button class="act" onclick="applyDns(false)">Save</button>
+      <button class="act pri" onclick="applyDns(true)">Save &amp; Apply</button>
     </div>`;
   }
   html+=`<div id="dns-results" style="margin-top:16px"></div>`;
@@ -1670,7 +1711,7 @@ async function renderDns(target){
     }catch(e){console.warn('DNS live fetch failed:',e)}
   }
 }
-async function applyVlan(){
+async function applyVlan(apply=true){
   const dids=[...document.querySelectorAll('.vlan-dev-cb:checked')].map(cb=>parseInt(cb.value));
   if(!dids.length){toast('Select at least one device',true);return}
   const vlan_id=parseInt(document.getElementById('vlan-id').value);
@@ -1679,19 +1720,21 @@ async function applyVlan(){
   const dhcp=document.getElementById('vlan-dhcp').checked;
   const router_id=parseInt(document.getElementById('vlan-router').value);
   try{
-    toast('Applying VLAN '+vlan_id+'...');
-    const r=await api('/vlans/apply',{method:'POST',body:JSON.stringify({vlan_id,name,subnet,dhcp,devices:dids,router_id})});
+    toast((apply?'Applying':'Saving')+' VLAN '+vlan_id+'...');
+    const r=await api('/vlans/apply',{method:'POST',body:JSON.stringify({vlan_id,name,subnet,dhcp,devices:dids,router_id,apply})});
     const ok=r.results.filter(x=>x.ok).length;
     const fail=r.results.filter(x=>!x.ok).length;
-    document.getElementById('vlan-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>VLAN applied</strong><br>${ok} devices configured successfully${fail?', '+fail+' failed':''}</div>`;
-    toast('VLAN '+vlan_id+' applied');
+    const label=apply?'VLAN applied':'VLAN saved (not applied)';
+    document.getElementById('vlan-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>${label}</strong><br>${ok} devices configured successfully${fail?', '+fail+' failed':''}</div>`;
+    toast(label);
+    refreshPendingBadge();
   }catch(e){
     document.getElementById('vlan-results').innerHTML=`<div class="card" style="border-color:var(--bad)"><strong>Failed</strong><br>${esc(String(e))}</div>`;
     toast(String(e),true);
   }
 }
 
-async function dhpcApply(k, vlan_id, iface){
+async function dhpcApply(k, vlan_id, iface, apply=true){
   const didEl=document.getElementById('dhcp-did');
   const did=didEl?parseInt(didEl.value):null;
   if(!did){toast('No SSH device available',true);return}
@@ -1730,8 +1773,9 @@ async function dhpcApply(k, vlan_id, iface){
   const res=el=>{const e=document.getElementById(resId);if(e)e.innerHTML=el;};
   try{
     toast('Applying DHCP section '+f+'...');
-    const r=await api('/dhcp/apply',{method:'POST',body:JSON.stringify(body)});
-    res(`<div class="muted" style="margin-top:6px;color:var(--ok)">Applied ${esc(f)} on ${esc(r.device)}</div>`);
+    const r=await api('/dhcp/apply',{method:'POST',body:JSON.stringify({...body, apply})});
+    refreshPendingBadge();
+    res(`<div class="muted" style="margin-top:6px;color:var(--ok)">${apply?'Applied':'Saved (not applied)'} ${esc(f)} on ${esc(r.device)}</div>`);
     setTimeout(renderDhcp,600);
   }catch(e){
     res(`<div class="muted" style="margin-top:6px;color:var(--bad)">${esc(String(e))}</div>`);
@@ -1749,7 +1793,7 @@ async function dhpcDelete(k, vlan_id, iface){
   }catch(e){toast(String(e),true);}
 }
 
-async function applyDns(){
+async function applyDns(apply=true){
   const did=document.getElementById('dns-did')?.value || document.querySelector('#qos-did')?.value || document.querySelector('#fw-did')?.value;
   if(!did){toast('No SSH device available',true);return}
   const servers=document.getElementById('dns-servers').value.split('\n').map(s=>s.trim()).filter(Boolean);
@@ -1758,8 +1802,9 @@ async function applyDns(){
   const scope=document.getElementById('dns-scope')?.value || 'dhcp';
   try{
     toast('Applying DNS ('+scope+')...');
-    const r=await api('/dns/apply',{method:'POST',body:JSON.stringify({did:parseInt(did),servers,search_domains,scope})});
-    document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>DNS applied</strong> on ${r.device}: ${r.servers.join(', ')}</div>`;
+    const r=await api('/dns/apply',{method:'POST',body:JSON.stringify({did:parseInt(did),servers,search_domains,scope,apply})});
+    document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>${apply?'DNS applied':'DNS saved (not applied)'}</strong> on ${r.device}: ${r.servers.join(', ')}</div>`;
+    refreshPendingBadge();
   }catch(e){
     document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(e.message||e)}</div>`;
   }
@@ -1818,8 +1863,9 @@ async function renderQos(target){
         <div><label>ECN</label><select id="qos-ecn" style="width:90px"><option value="0" ${src.ecn!==true?'selected':''}>off</option><option value="1" ${src.ecn===true?'selected':''}>on</option></select></div>
         <div style="align-self:flex-end"><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="qos-install"> install if missing</label></div>
       </div>
-      <button class="act pri" onclick="applyQos()">Apply QoS</button>
-      <span class="muted" style="margin-left:8px">commits + restarts SQM</span>
+      <button class="act" onclick="applyQos(false)">Save</button>
+      <button class="act pri" onclick="applyQos(true)">Save &amp; Apply</button>
+      <span class="muted" style="margin-left:8px">Save commits · Save &amp; Apply commits + restarts SQM</span>
     </div>
   </div>`;
   }
@@ -1827,7 +1873,7 @@ async function renderQos(target){
   el.innerHTML=html;
 }
 async function qosReload(){ renderQos(); }
-async function applyQos(){
+async function applyQos(apply=true){
   const did=parseInt(document.getElementById('qos-did').value);
   const body={ did, enabled:document.getElementById('qos-enabled').value==='1',
     interface:document.getElementById('qos-iface').value||'wan',
@@ -1835,13 +1881,14 @@ async function applyQos(){
     upload_kbps:parseInt(document.getElementById('qos-ul').value||0),
     qdisc:document.getElementById('qos-qdisc').value,
     ecn:document.getElementById('qos-ecn').value==='1',
-    install_if_missing:document.getElementById('qos-install').checked };
+    install_if_missing:document.getElementById('qos-install').checked, apply };
   const box=document.getElementById('qos-result');
   try{
     box.innerHTML='<p class="muted">Applying…</p>';
     await api('/qos/apply',{method:'POST',body:JSON.stringify(body)});
-    box.innerHTML='<div class="card" style="border-color:var(--ok)">QoS applied and restarted.</div>';
-    toast('QoS applied');
+    box.innerHTML=`<div class="card" style="border-color:var(--ok)">${apply?'QoS applied and restarted.':'QoS saved (not applied). Restart SQM via Apply pending changes.'}</div>`;
+    toast(apply?'QoS applied':'QoS saved (not applied)');
+    refreshPendingBadge();
     renderQos();
   }catch(e){
     box.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`;
@@ -1884,7 +1931,7 @@ async function renderFirewall(target){
       <div><label>Src port</label><input id="fwf-sport" type="number" min="1" max="65535" placeholder="8080" style="width:90px"></div>
       <div><label>Dest IP</label><input id="fwf-dip" placeholder="192.168.1.50" style="width:140px"></div>
       <div><label>Dest port</label><input id="fwf-dport" type="number" min="0" max="65535" placeholder="=src" style="width:90px"></div>
-      <div style="align-self:flex-end"><button class="act pri" onclick="fwApplyForward()">Apply forward</button></div>
+      <div style="align-self:flex-end"><button class="act" onclick="fwApplyForward(false)">Save</button> <button class="act pri" onclick="fwApplyForward(true)">Save &amp; Apply</button></div>
     </div>
     <table><tr><th>Name</th><th>Proto</th><th>Src</th><th>Dest</th><th></th></tr>
       ${fwd.length?fwd.map(f=>`<tr><td>${esc(f.name||'')}</td><td>${esc(f.proto||'')}</td><td>${esc(f.src_dport||'')}</td><td>${esc(f.dest_ip||'')}:${esc(f.dest_port||'')}</td>
@@ -1899,7 +1946,7 @@ async function renderFirewall(target){
       <div><label>From zone</label><select id="fwr-src">${zones.map(z=>`<option>${esc(z.name)}</option>`).join('')}</select></div>
       <div><label>To zone</label><select id="fwr-dest">${zones.map(z=>`<option>${esc(z.name)}</option>`).join('')}</select></div>
       <div><label>Target</label><select id="fwr-target"><option>ACCEPT</option><option>REJECT</option><option>DROP</option></select></div>
-      <div style="align-self:flex-end"><button class="act pri" onclick="fwApplyRule()">Apply rule</button></div>
+      <div style="align-self:flex-end"><button class="act" onclick="fwApplyRule(false)">Save</button> <button class="act pri" onclick="fwApplyRule(true)">Save &amp; Apply</button></div>
     </div>
     <table><tr><th>Name</th><th>From</th><th>To</th><th>Target</th><th></th></tr>
       ${rules.length?rules.map(r=>`<tr><td>${esc(r.name||'')}</td><td>${esc(r.src||'')}</td><td>${esc(r.dest||'')}</td><td>${esc(r.target||'')}</td>
@@ -1916,7 +1963,8 @@ async function renderFirewall(target){
           <div style="display:flex;gap:6px;margin-top:6px">
             <select data-zone="${esc(z.name)}" data-pol="input">${['ACCEPT','REJECT','DROP'].map(v=>`<option ${z.input===v?'selected':''}>${v}</option>`).join('')}</select>
             <select data-zone="${esc(z.name)}" data-pol="forward">${['ACCEPT','REJECT','DROP'].map(v=>`<option ${z.forward===v?'selected':''}>${v}</option>`).join('')}</select>
-            <button class="act" onclick="fwApplyZone(this)">apply</button>
+            <button class="act" onclick="fwApplyZone(this,false)">Save</button>
+            <button class="act pri" onclick="fwApplyZone(this,true)">Save &amp; Apply</button>
           </div>
           <span class="muted" style="font-size:11px">input · forward</span>
         </div>`).join('')||'<span class="muted">no zones</span>'}
@@ -1928,7 +1976,7 @@ async function renderFirewall(target){
 }
 async function fwReload(){ renderFirewall(); }
 function fwResult(msg,bad){const b=document.getElementById('fw-result');b.innerHTML=`<div class="card" style="border-color:var(--${bad?'bad':'ok'})">${esc(msg)}</div>`;}
-async function fwApplyForward(){
+async function fwApplyForward(apply=true){
   const did=parseInt(document.getElementById('fw-did').value);
   const rule={ name:document.getElementById('fwf-name').value,
     proto:document.getElementById('fwf-proto').value,
@@ -1936,26 +1984,26 @@ async function fwApplyForward(){
     dest_ip:document.getElementById('fwf-dip').value,
     dest_port:parseInt(document.getElementById('fwf-dport').value||0)||null };
   if(!rule.name||!rule.dest_ip){ fwResult('name and dest IP required',true); return; }
-  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'forward',rule})}); fwResult('Port forward applied + fw4 reloaded.'); renderFirewall(); }
+  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'forward',rule,apply})}); fwResult(apply?'Port forward applied + fw4 reloaded.':'Port forward saved (not applied).'); renderFirewall(); refreshPendingBadge(); }
   catch(e){ fwResult(String(e),true); toast(String(e),true); }
 }
-async function fwApplyRule(){
+async function fwApplyRule(apply=true){
   const did=parseInt(document.getElementById('fw-did').value);
   const rule={ name:document.getElementById('fwr-name').value,
     src:document.getElementById('fwr-src').value,
     dest:document.getElementById('fwr-dest').value,
     target:document.getElementById('fwr-target').value };
   if(!rule.name){ fwResult('rule name required',true); return; }
-  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'rule',rule})}); fwResult('Rule applied + fw4 reloaded.'); renderFirewall(); }
+  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'rule',rule,apply})}); fwResult(apply?'Rule applied + fw4 reloaded.':'Rule saved (not applied).'); renderFirewall(); refreshPendingBadge(); }
   catch(e){ fwResult(String(e),true); toast(String(e),true); }
 }
-async function fwApplyZone(btn){
+async function fwApplyZone(btn,apply=true){
   const did=parseInt(document.getElementById('fw-did').value);
   const wrap=btn.closest('.zone-card')||btn.parentElement;
   const zone=wrap.querySelector('select[data-zone]').dataset.zone;
   const policies={};
   wrap.querySelectorAll('select[data-pol]').forEach(s=>policies[s.dataset.pol]=s.value);
-  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'zone',zone,policies})}); fwResult(`Zone ${zone} policies applied + fw4 reloaded.`); renderFirewall(); }
+  try{ await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'zone',zone,policies,apply})}); fwResult(apply?`Zone ${zone} policies applied + fw4 reloaded.`:`Zone ${zone} policies saved (not applied).`); renderFirewall(); refreshPendingBadge(); }
   catch(e){ fwResult(String(e),true); toast(String(e),true); }
 }
 async function fwDelForward(name){
@@ -2178,7 +2226,8 @@ async function meshModal(did){
     <div id="mesh-results"></div>
     <div class="row" style="justify-content:flex-end;gap:8px;margin-top:14px">
       <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
-      <button class="act pri" id="mesh-save">Apply mesh</button>
+      <button class="act" id="mesh-save-save">Save</button>
+      <button class="act pri" id="mesh-save">Save &amp; Apply</button>
     </div>
   </div>`;
   document.body.appendChild(modal);
@@ -2192,7 +2241,7 @@ async function meshModal(did){
   modal.querySelector('#mesh-enc').onchange=()=>{
     modal.querySelector('#mesh-key-row').style.display = modal.querySelector('#mesh-enc').value==='none' ? 'none' : '';
   };
-  modal.querySelector('#mesh-save').onclick=async()=>{
+  const doMeshSave=async(apply)=>{
     const enc=modal.querySelector('#mesh-enc').value;
     const body={
       enabled:true,
@@ -2205,21 +2254,25 @@ async function meshModal(did){
       mesh_key:enc==='none'?'':modal.querySelector('#mesh-key').value,
       mesh_gw_mode:modal.querySelector('#mesh-gw').checked?'gwb':'no',
       install_if_missing:true,
+      apply,
     };
     const btn=modal.querySelector('#mesh-save');
-    btn.disabled=true; btn.textContent='Applying…';
+    btn.disabled=true; btn.textContent=apply?'Applying…':'Saving…';
     try{
       await api(`/devices/${did}/mesh`,{method:'POST',body:JSON.stringify(body)});
-      modal.querySelector('#mesh-results').innerHTML='<div style="color:var(--ok);margin-top:10px">Mesh applied · wifi reload issued</div>';
-      toast('Mesh configured on '+d.name);
+      modal.querySelector('#mesh-results').innerHTML=apply?'<div style="color:var(--ok);margin-top:10px">Mesh applied · wifi reload issued</div>':'<div style="color:var(--ok);margin-top:10px">Mesh saved (committed) · not applied</div>';
+      toast(apply?'Mesh configured on '+d.name:'Mesh saved on '+d.name+' (not applied)');
       renderWifi();
+      refreshPendingBadge();
       setTimeout(()=>modal.remove(),1200);
     }catch(e){
       modal.querySelector('#mesh-results').innerHTML='<div style="color:var(--bad);margin-top:10px">'+esc(String(e))+'</div>';
       toast(String(e),true);
     }
-    btn.disabled=false; btn.textContent='Apply mesh';
+    btn.disabled=false; btn.textContent='Save & Apply';
   };
+  modal.querySelector('#mesh-save').onclick=()=>doMeshSave(true);
+  modal.querySelector('#mesh-save-save').onclick=()=>doMeshSave(false);
   modal.onclick=e=>{if(e.target===modal)modal.remove()};
 }
 async function packagesModal(did){
@@ -2289,23 +2342,27 @@ async function editWifi(did){
       <select id="wifi-vlan" style="width:100%"><option value="">— no VLAN (LAN) —</option>${vlans.map(vlanOpt).join('')}</select></div>
     <div class="row" style="justify-content:flex-end;gap:8px">
       <button class="act" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
-      <button class="act pri" id="wifi-save">Save</button>
+      <button class="act" id="wifi-save-save">Save</button>
+      <button class="act pri" id="wifi-save">Save &amp; Apply</button>
       <button class="act" id="wifi-delete" style="color:var(--bad)">Delete</button>
     </div></div>`;
   document.body.appendChild(modal);
-  modal.querySelector('#wifi-save').onclick=async()=>{
+  const doWifiSave=async(apply)=>{
     const ssid=modal.querySelector('#wifi-ssid').value.trim();
     const pwd=modal.querySelector('#wifi-pwd').value.trim();
     const vlan_id=modal.querySelector('#wifi-vlan').value||null;
     if(!ssid||!pwd){toast('SSID and password required',true);return}
     try{
-      toast('Applying WiFi config…');
-      const r=await api(`/devices/${did}/guest-wifi`,{method:'POST',body:JSON.stringify({ssid,password:pwd,vlan_id})});
-      toast('WiFi config saved');
+      toast(apply?'Applying WiFi config…':'Saving WiFi config…');
+      const r=await api(`/devices/${did}/guest-wifi`,{method:'POST',body:JSON.stringify({ssid,password:pwd,vlan_id,apply})});
+      toast(apply?'WiFi config saved':'WiFi saved (not applied)');
       modal.remove();
       renderWifi();
+      refreshPendingBadge();
     }catch(e){toast(String(e),true)}
   };
+  modal.querySelector('#wifi-save').onclick=()=>doWifiSave(true);
+  modal.querySelector('#wifi-save-save').onclick=()=>doWifiSave(false);
   modal.querySelector('#wifi-delete').onclick=async()=>{
     if(!confirm(`Delete guest WiFi on ${d.name}?`))return;
     try{

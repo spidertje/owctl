@@ -186,6 +186,9 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS device_status(
         id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER UNIQUE, ts TEXT,
         clients INTEGER, uptime_s INTEGER, firmware TEXT, rx_bytes INTEGER, tx_bytes INTEGER)""")
+    execute("""CREATE TABLE IF NOT EXISTS pending_applies(
+        device_id INTEGER, feature TEXT, restart_cmd TEXT, saved_at TEXT,
+        PRIMARY KEY(device_id, feature))""")
     for _col, _typ in (("installed_pkgs", "TEXT"), ("obsolete_pkgs", "TEXT"), ("meshd", "TEXT")):
         try:
             execute(f"ALTER TABLE device_status ADD COLUMN {_col} {_typ}")
@@ -264,6 +267,7 @@ _ADMIN_ONLY_PATHS = {
     "/api/devices/{did}/guest-wifi", "/api/devices/{did}/wifi-clone",
     "/api/dhcp/apply", "/api/dns/apply", "/api/firewall/apply",
     "/api/qos/apply", "/api/vlans/apply", "/api/vlans/discover",
+    "/api/devices/{did}/pending-apply",
     "/api/alerts/config", "/api/bulk", "/api/digest",
     "/api/findings/ack", "/api/settings",
 }
@@ -1321,7 +1325,7 @@ def _parse_subnet(subnet: str):
     return (str(net.network_address + 1), str(net.netmask))
 
 
-def build_dhcp_cmds(iface: str, cfg: dict) -> str:
+def build_dhcp_cmds(iface: str, cfg: dict, apply: bool = True) -> str:
     """Uci script (pure, no I/O) to create/update the FULL DHCP pool section on
     ``dhcp.<iface>``, covering the whole per-VLAN surface:
 
@@ -1428,7 +1432,8 @@ def build_dhcp_cmds(iface: str, cfg: dict) -> str:
         if ip6.get(key) not in (None, ""):
             lines.append(f"uci set {s}.{key}={_uci_quote(ip6[key])}")
     lines.append("uci commit dhcp")
-    lines.append("/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true")
+    if apply:
+        lines.append("/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true")
     return "\n".join(lines) + "\n"
 
 
@@ -1440,7 +1445,7 @@ def build_dhcp_apply_cmds(iface: str, start=100, limit=150, lease_time: str = "1
 
 
 def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: list = None,
-                  scope: str = "dhcp") -> str:
+                  scope: str = "dhcp", apply: bool = True) -> str:
     """Uci script to set DNS for the active DHCP/DNS backend. Pure (no I/O).
 
     ``scope`` selects where the servers land:
@@ -1482,7 +1487,8 @@ def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: lis
         lines.append("uci commit system")
         # dnsmasq reads system.@dns, so restart it; odhcpd does not, but the
         # restart is harmless and keeps one code path for both backends.
-        lines.append("/etc/init.d/dnsmasq restart 2>/dev/null || /etc/init.d/system restart 2>/dev/null || true")
+        if apply:
+            lines.append("/etc/init.d/dnsmasq restart 2>/dev/null || /etc/init.d/system restart 2>/dev/null || true")
 
     if scope == "router":
         return "\n".join(lines) + "\n"
@@ -1499,7 +1505,8 @@ def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: lis
         for s in servers:
             lines.append(f"uci add_list dhcp.lan.dhcp_option={_uci_quote('dhcp-option=6,' + s)}")
         lines.append("uci commit dhcp")
-        lines.append("/etc/init.d/odhcpd restart 2>/dev/null || /etc/init.d/dnsmasq restart 2>/dev/null || true")
+        if apply:
+            lines.append("/etc/init.d/odhcpd restart 2>/dev/null || /etc/init.d/dnsmasq restart 2>/dev/null || true")
         return "\n".join(lines) + "\n"
     # dnsmasq backend: keep the @dnsmasq[0] block in-place.
     existing = _uci_list_values(detect, "dhcp.@dnsmasq[0]", "server")
@@ -1508,13 +1515,94 @@ def build_dns_cmds(backend: str, detect: str, servers: list, search_domains: lis
     for s in servers:
         lines.append(f"uci add_list dhcp.@dnsmasq[0].server={_uci_quote(s)}")
     lines.append("uci commit dhcp")
-    lines.append("/etc/init.d/dnsmasq restart 2>/dev/null || true")
+    if apply:
+        lines.append("/etc/init.d/dnsmasq restart 2>/dev/null || true")
     return "\n".join(lines) + "\n"
 
 
-def _fw_commit(cmd: str) -> str:
-    """Finish a firewall mutation script: commit + reload so changes go live."""
-    return cmd + "uci commit firewall && fw4 restart\n"
+def _fw_commit(cmd: str, apply: bool = True) -> str:
+    """Finish a firewall mutation script. ``apply=True`` (default) also reloads
+    fw4 so the change goes live; ``apply=False`` commits to /etc/config only."""
+    tail = "uci commit firewall"
+    if apply:
+        tail += " && fw4 restart"
+    return cmd + tail + "\n"
+
+
+# ──────────────────── Save vs Save & Apply (pending-apply) ───────────────────
+# LuCI's model: "Save" = `uci commit` (config on disk, daemons untouched);
+# "Save & Apply" = commit + restart the daemons that read the config. owctl used
+# to only have the latter. This registry maps each config feature to the exact
+# restart command that makes its committed change live. A "Save" (apply=False)
+# records a pending entry; "Apply pending changes" restarts the union for that
+# device and clears the entries. `apply` defaults to True everywhere so existing
+# callers and the e2e suite are byte-for-byte unchanged.
+_PENDING_RESTARTS = {
+    "firewall": "fw4 restart",
+    "qos": "sqm restart",
+    "dhcp": "/etc/init.d/odhcpd reload 2>/dev/null || /etc/init.d/dnsmasq reload 2>/dev/null || true",
+    "dns": "/etc/init.d/dnsmasq restart 2>/dev/null || /etc/init.d/odhcpd restart 2>/dev/null || /etc/init.d/system restart 2>/dev/null || true",
+    "vlan": "netifd restart 2>/dev/null || true; /etc/init.d/odhcpd reload 2>/dev/null || true; fw4 restart 2>/dev/null || true",
+    "wireless": "wifi reload 2>/dev/null || true",
+}
+
+
+def record_pending_apply(dev, feature):
+    """Record that ``feature`` was Saved (committed) but not applied on ``dev``.
+    Never raises — a pending-tracking failure must not break the save itself."""
+    if feature not in _PENDING_RESTARTS:
+        return
+    try:
+        execute("INSERT INTO pending_applies(device_id, feature, restart_cmd, saved_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(device_id, feature) DO UPDATE SET "
+                "restart_cmd=excluded.restart_cmd, saved_at=excluded.saved_at",
+                (dev["id"], feature, _PENDING_RESTARTS[feature], now()))
+    except Exception:
+        pass
+
+
+def clear_pending_apply(dev, feature):
+    try:
+        execute("DELETE FROM pending_applies WHERE device_id=? AND feature=?",
+                (dev["id"], feature))
+    except Exception:
+        pass
+
+
+def pending_apply_for(dev):
+    rows = q("SELECT feature, restart_cmd, saved_at FROM pending_applies "
+             "WHERE device_id=? ORDER BY feature", (dev["id"],))
+    return [{"feature": r["feature"], "saved_at": r["saved_at"]} for r in rows]
+
+
+def set_pending(dev, feature, apply):
+    """Reconcile the pending-apply ledger with a just-run save. ``apply=True``
+    (Save & Apply) clears the feature; ``apply=False`` (Save) records it as
+    awaiting a restart. Both calls swallow their own errors so bookkeeping
+    cannot break the config change it is tracking."""
+    if apply:
+        clear_pending_apply(dev, feature)
+    else:
+        record_pending_apply(dev, feature)
+
+
+def apply_pending_for(dev):
+    """Restart the union of this device's saved-but-not-applied features, in a
+    single SSH session, then clear the pending rows."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "apply requires SSH access on this device")
+    rows = q("SELECT feature, restart_cmd FROM pending_applies WHERE device_id=?",
+             (dev["id"],))
+    applied = []
+    if rows:
+        cmds = "\n".join(sorted({r["restart_cmd"] for r in rows}))
+        _run_ssh(dev, cmds + "\n", "apply",
+                 f"features={','.join(sorted({r['feature'] for r in rows}))}",
+                 "apply pending changes")
+        applied = sorted({r["feature"] for r in rows})
+        for r in rows:
+            clear_pending_apply(dev, r["feature"])
+    return {"device": dev["name"], "ok": True, "applied": applied}
 
 
 def _run_ssh(dev, cmd, action, detail, ok_msg):
@@ -1543,7 +1631,7 @@ def ensure_pkg(dev, pkg):
     return "installed"
 
 
-def do_qos(dev, cfg, install_if_missing=False):
+def do_qos(dev, cfg, install_if_missing=False, apply: bool = True):
     """Apply SQM (luci-app-sqm) settings for the first enabled interface.
 
     cfg: {enabled, interface, download_kbps, upload_kbps, qdisc, ecn}.
@@ -1572,19 +1660,22 @@ def do_qos(dev, cfg, install_if_missing=False):
         lines.append(f"uci set sqm.{sec}.{name}={'1' if name == qdisc else '0'}")
     lines.append(f"uci set sqm.{sec}.ecn={ecn}")
     lines.append("uci commit sqm")
-    lines.append("sqm restart")
+    if apply:
+        lines.append("sqm restart")
     pre = f"opkg install -y luci-app-sqm || true\n" if install_if_missing else ""
     _run_ssh(dev, pre + "\n".join(lines) + "\n", "qos",
              f"iface={iface} dl={dl} ul={ul} qdisc={qdisc} enabled={bool(cfg.get('enabled'))}",
              "QoS apply")
+    set_pending(dev, "qos", apply)
     return {"device": dev["name"], "ok": True, "backend": "sqm"}
 
 
-def do_fw_forward(dev, rule):
+def do_fw_forward(dev, rule, apply: bool = True):
     """Create or update one port forward (named uci section => idempotent).
 
     rule: {name, proto: tcp|udp|tcpudp, src_dport, dest_ip, dest_port?}.
-    dest_port defaults to src_dport when omitted."""
+    dest_port defaults to src_dport when omitted. apply=False commits without
+    reloading fw4 (LuCI 'Save'); apply=True (default) also restarts fw4."""
     name = (rule.get("name") or "").strip()
     slug = _uci_slug(name)
     proto = rule.get("proto") or "tcp"
@@ -1611,12 +1702,13 @@ def do_fw_forward(dev, rule):
         f"uci set firewall.{slug}.dest_ip='{dip}'",
         f"uci set firewall.{slug}.dest_port='{dport}'",
     ]
-    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n"), "firewall",
+    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n", apply=apply), "firewall",
              f"forward={name} {proto} {sport}->{dip}:{dport}", "port forward apply")
+    set_pending(dev, "firewall", apply)
     return {"device": dev["name"], "ok": True, "section": slug}
 
 
-def do_fw_rule(dev, rule):
+def do_fw_rule(dev, rule, apply: bool = True):
     """Create or update one inter-zone rule (named uci section => idempotent).
 
     rule: {name, src (zone name), dest (zone name), target: ACCEPT|REJECT|DROP, proto?}."""
@@ -1642,12 +1734,13 @@ def do_fw_rule(dev, rule):
         elif proto not in ("tcp", "udp"):
             raise HTTPException(400, f"invalid proto {proto!r}")
         lines.append(f"uci set firewall.{slug}.proto={_uci_quote(proto)}")
-    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n"), "firewall",
+    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n", apply=apply), "firewall",
              f"rule={name} {src}->{dst} {target}", "firewall rule apply")
+    set_pending(dev, "firewall", apply)
     return {"device": dev["name"], "ok": True, "section": slug}
 
 
-def do_zone_policy(dev, zone, policies):
+def do_zone_policy(dev, zone, policies, apply: bool = True):
     """Set default input/output/forward policies on a firewall zone.
 
     zone: zone name (valid uci id, e.g. 'guest'). policies: dict of
@@ -1665,24 +1758,27 @@ def do_zone_policy(dev, zone, policies):
         lines.append(f"uci set firewall.{zone}.{opt}='{val}'")
     if not lines:
         raise HTTPException(400, "no zone policies given (use input/output/forward)")
-    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n"), "firewall",
+    _run_ssh(dev, _fw_commit("\n".join(lines) + "\n", apply=apply), "firewall",
              f"zone={zone} policies={policies}", "zone policy apply")
+    set_pending(dev, "firewall", apply)
     return {"device": dev["name"], "ok": True, "zone": zone}
 
 
-def delete_fw_rule(dev, name):
+def delete_fw_rule(dev, name, apply: bool = True):
     """Remove an inter-zone rule by name (section id = slug of the name)."""
     slug = _uci_slug(name)
-    _run_ssh(dev, _fw_commit(f"uci delete firewall.{slug}\n"), "firewall",
+    _run_ssh(dev, _fw_commit(f"uci delete firewall.{slug}\n", apply=apply), "firewall",
              f"delete_rule={name}", "rule delete")
+    set_pending(dev, "firewall", apply)
     return {"device": dev["name"], "ok": True, "section": slug}
 
 
-def delete_fw_forward(dev, name):
+def delete_fw_forward(dev, name, apply: bool = True):
     """Remove a port forward by name (section id = slug of the name)."""
     slug = _uci_slug(name)
-    _run_ssh(dev, _fw_commit(f"uci delete firewall.{slug}\n"), "firewall",
+    _run_ssh(dev, _fw_commit(f"uci delete firewall.{slug}\n", apply=apply), "firewall",
              f"delete_forward={name}", "forward delete")
+    set_pending(dev, "firewall", apply)
     return {"device": dev["name"], "ok": True, "section": slug}
 
 
@@ -2157,8 +2253,10 @@ def do_restore(dev, backup_path):
         raise RuntimeError(f"restore failed: {e}") from e
 
 
-def do_vlan(dev, vlan_id, name, subnet, dhcp, devices, router_id):
-    """Apply VLAN config to a device. router_id is the device that will act as router."""
+def do_vlan(dev, vlan_id, name, subnet, dhcp, devices, router_id, apply: bool = True):
+    """Apply VLAN config to a device. router_id is the device that will act as router.
+    apply=False commits the network/dhcp/firewall sections without restarting the
+    daemons (LuCI 'Save'); apply=True (default) also restarts them so the VLAN is live."""
     if dev["access"] != "ssh":
         raise HTTPException(400, "VLAN config requires SSH access")
     c = _ssh_connect(dev)
@@ -2190,10 +2288,14 @@ uci set zone.vlan_{vlan_id}.network='vlan_{vlan_id}'
 uci set zone.vlan_{vlan_id}.input='ACCEPT'
 uci set zone.vlan_{vlan_id}.output='ACCEPT'
 uci set zone.vlan_{vlan_id}.forward='REJECT'
-uci commit network
-uci commit dhcp
-uci commit firewall
 """
+            cmd += "uci commit network\n"
+            if dhcp:
+                cmd += "uci commit dhcp\n"
+            cmd += "uci commit firewall\n"
+            if apply:
+                # Make the committed VLAN live (fixes the old no-restart gap).
+                cmd += (_PENDING_RESTARTS["vlan"] + "\n")
         else:
             # Switch: tag ports with VLAN
             cmd = f"""uci set network.vlan_{vlan_id}=switch
@@ -2201,19 +2303,22 @@ uci set network.vlan_{vlan_id}.vlan='{vlan_id}'
 uci set network.vlan_{vlan_id}.device='switch0'
 uci commit network
 """
+            if apply:
+                cmd += (_PENDING_RESTARTS["vlan"] + "\n")
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"VLAN config failed on {dev['name']}: {(err or out)[:200]}")
+        set_pending(dev, "vlan", apply)
         log_action(dev, 'vlan', f'vlan_id={vlan_id} role={"router" if is_router else "switch"}', ok=True)
         return {"device": dev["name"], "role": "router" if is_router else "switch", "ok": True}
     finally:
         c.close()
 
 
-def do_mesh(dev, cfg):
+def do_mesh(dev, cfg, apply: bool = True):
     """Configure 802.11s mesh on a device.
 
     cfg: {enabled, mesh_vap, mesh_id, mesh_ctrl, mesh_gw_mode,
@@ -2231,6 +2336,7 @@ def do_mesh(dev, cfg):
         lines.append(f"uci set wireless.{sec}.enabled=0")
         lines.append("uci commit wireless")
         _run_ssh(dev, "\n".join(lines) + "\n", "mesh", "disabled", "mesh disabled")
+        set_pending(dev, "wireless", apply)
         return {"device": dev["name"], "ok": True, "enabled": False}
     radio = (cfg.get("mesh_vap") or "radio0").strip()
     if not re.fullmatch(r"[A-Za-z0-9_.\-]+", radio):
@@ -2254,15 +2360,18 @@ def do_mesh(dev, cfg):
     if enc != "none" and cfg.get("mesh_key"):
         lines.append(f"uci set wireless.{sec}.key={_uci_quote(str(cfg['mesh_key']))}")
     lines.append("uci commit wireless")
-    lines.append("wifi reload")
+    if apply:
+        lines.append("wifi reload")
     pre = "opkg install -y meshd || true\n" if cfg.get("install_if_missing") else ""
     _run_ssh(dev, pre + "\n".join(lines) + "\n", "mesh",
              f"radio={radio} mesh={cfg.get('mesh_id')} enc={enc}", "mesh apply")
+    set_pending(dev, "wireless", apply)
     return {"device": dev["name"], "ok": True, "enabled": True, "backend": "meshd"}
 
 
-def do_guest_wifi(dev, ssid, password, vlan_id=None):
-    """Create a guest WiFi interface on a device. Requires wireless-capable device."""
+def do_guest_wifi(dev, ssid, password, vlan_id=None, apply: bool = True):
+    """Create a guest WiFi interface on a device. Requires wireless-capable device.
+    apply=False commits the wireless config without bringing up the radio (LuCI 'Save')."""
     if dev["access"] != "ssh":
         raise HTTPException(400, "guest WiFi requires SSH access")
     c = _ssh_connect(dev)
@@ -2293,8 +2402,10 @@ uci commit firewall"""
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"guest WiFi config failed: {(err or out)[:200]}")
-        # Try to bring up wireless (may fail if radio not available)
-        c.exec_command("wifi up 2>/dev/null || true")
+        if apply:
+            # Try to bring up wireless (may fail if radio not available)
+            c.exec_command("wifi up 2>/dev/null || true")
+        set_pending(dev, "wireless", apply)
         log_action(dev, 'guest_wifi', f'ssid={ssid}', ok=True)
         return {"ssid": ssid, "ok": True, "output": out[:300]}
     finally:
@@ -2418,6 +2529,22 @@ def _scheduler():
 # --------------------------------------------------------------------- app
 app = FastAPI(title="owctl")
 init_db()
+
+
+@app.post("/api/devices/{did}/pending-apply")
+async def pending_apply(request: Request, did: int):
+    """Apply (restart the daemons for) this device's saved-but-not-applied
+    config changes — the LuCI 'Save & Apply' half, run on demand."""
+    dev = _require_device(did)
+    return apply_pending_for(dev)
+
+
+@app.get("/api/devices/{did}/pending-applies")
+def pending_applies_list(did: int):
+    """List the config features Saved (committed) but not yet applied on a device."""
+    dev = _require_device(did)
+    features = pending_apply_for(dev)
+    return {"device": dev["name"], "features": features, "count": len(features)}
 
 
 # --------------------------------------------------------------------- security
@@ -2865,7 +2992,8 @@ async def device_restore(request: Request, did: int):
 
 @app.post("/api/vlans/apply")
 async def apply_vlan(request: Request):
-    """Apply VLAN config across multiple devices."""
+    """Apply VLAN config across multiple devices. ``apply=false`` (LuCI 'Save')
+    commits without restarting daemons; ``apply=true``/omitted (default) also applies."""
     d = await request.json()
     vlan_id = d.get("vlan_id")
     name = d.get("name", f"vlan_{vlan_id}")
@@ -2873,6 +3001,7 @@ async def apply_vlan(request: Request):
     dhcp = d.get("dhcp", True)
     devices = d.get("devices", [])
     router_id = d.get("router_id")
+    apply = d.get("apply") is not False  # True unless explicitly false
     if not vlan_id or not devices:
         raise HTTPException(400, "vlan_id and devices required")
     results = []
@@ -2881,7 +3010,7 @@ async def apply_vlan(request: Request):
         if not cur:
             continue
         try:
-            r = do_vlan(cur[0], vlan_id, name, subnet, dhcp, devices, router_id)
+            r = do_vlan(cur[0], vlan_id, name, subnet, dhcp, devices, router_id, apply=apply)
             results.append(r)
         except Exception as e:
             results.append({"device": cur[0]["name"], "ok": False, "error": str(e)})
@@ -2990,18 +3119,21 @@ async def apply_dhcp(request: Request):
 
     c = _ssh_connect(dev)
     try:
+        apply = d.get("apply") is not False
         if enabled:
-            cmd = build_dhcp_cmds(iface_s, cfg)
+            cmd = build_dhcp_cmds(iface_s, cfg, apply=apply)
         else:
             cmd = (f"uci -q delete dhcp.{iface_s} || true\n"
-                   "uci commit dhcp\n"
-                   "/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true\n")
+                   "uci commit dhcp\n")
+            if apply:
+                cmd += ("/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true\n")
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"DHCP config failed on {dev['name']}: {(err or out)[:200]}")
+        set_pending(dev, "dhcp", apply)
         log_action(dev, 'dhcp', f'vlan={vlan_id} enabled={enabled} opts={len(options)} leases={len(leases)}', ok=True)
         execute("""INSERT INTO dhcp(device_id, vlan_id, iface, start, "limit", lease_time, enabled,
                    options, static_leases, subnet, ifname, ts)
@@ -3248,13 +3380,15 @@ async def apply_dns(request: Request):
         detect, _e, _s = _exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
         # odhcpd (OpenWrt 22.03+) runs DHCP when a section has dhcpv4='server'
         backend = "odhcpd" if re.search(r"^dhcp\.\w+\.dhcpv4='?server'?$", detect, re.M) else "dnsmasq"
-        cmd = build_dns_cmds(backend, detect, servers, search_domains, scope=scope)
+        apply = d.get("apply") is not False
+        cmd = build_dns_cmds(backend, detect, servers, search_domains, scope=scope, apply=apply)
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise RuntimeError(f"DNS config failed on {dev['name']}: {(err or out)[:200]}")
+        set_pending(dev, "dns", apply)
         log_action(dev, 'dns', f'servers={",".join(servers)} backend={backend} scope={scope}', ok=True)
         execute("""INSERT INTO dns(device_id, servers, search_domains, scope, ts)
                    VALUES(?,?,?,?,?)
@@ -3433,7 +3567,8 @@ async def qos_apply(request: Request):
         "qdisc": d.get("qdisc") or "fq_codel",
         "ecn": bool(d.get("ecn", False)),
     }
-    do_qos(dev, cfg, install_if_missing=bool(d.get("install_if_missing", False)))
+    do_qos(dev, cfg, install_if_missing=bool(d.get("install_if_missing", False)),
+           apply=d.get("apply") is not False)
     execute("""INSERT INTO qos(device_id, enabled, interface, download_kbps, upload_kbps, qdisc, ecn, ts)
                VALUES(?,?,?,?,?,?,?,?)
                ON CONFLICT(device_id) DO UPDATE SET enabled=excluded.enabled,
@@ -3458,10 +3593,11 @@ async def firewall_apply(request: Request):
     """Apply one firewall change: kind = forward | rule | zone. Record saved state."""
     d = await request.json()
     dev = _require_device(int(d.get("did") or 0))
+    apply = d.get("apply") is not False
     kind = (d.get("kind") or "").strip()
     if kind == "forward":
         rule = d.get("rule") or {}
-        do_fw_forward(dev, rule)
+        do_fw_forward(dev, rule, apply=apply)
         execute("""INSERT INTO fw_rules(device_id, kind, name, proto, src_dport, dest_ip, dest_port, ts)
                    VALUES(?,?,?,?,?,?,?,?)
                    ON CONFLICT(device_id, kind, name) DO UPDATE SET proto=excluded.proto,
@@ -3472,7 +3608,7 @@ async def firewall_apply(request: Request):
                  rule.get("dest_port"), now()))
     elif kind == "rule":
         rule = d.get("rule") or {}
-        do_fw_rule(dev, rule)
+        do_fw_rule(dev, rule, apply=apply)
         execute("""INSERT INTO fw_rules(device_id, kind, name, src_zone, dst_zone, target, ts)
                    VALUES(?,?,?,?,?,?,?)
                    ON CONFLICT(device_id, kind, name) DO UPDATE SET src_zone=excluded.src_zone,
@@ -3482,7 +3618,7 @@ async def firewall_apply(request: Request):
     elif kind == "zone":
         zone = (d.get("zone") or "").strip()
         policies = d.get("policies") or {}
-        do_zone_policy(dev, zone, policies)
+        do_zone_policy(dev, zone, policies, apply=apply)
     else:
         raise HTTPException(400, "kind must be one of: forward, rule, zone")
     return {"ok": True, "device": dev["name"], "kind": kind}
@@ -3711,6 +3847,7 @@ async def device_guest_wifi(request: Request, did: int):
     password = d.get("password", "")
     vlan_id = d.get("vlan_id")
     method = d.get("method", "create")
+    apply = d.get("apply") is not False
     if method == "delete":
         # Delete guest WiFi config
         c = _ssh_connect(cur[0])
@@ -3732,7 +3869,7 @@ async def device_guest_wifi(request: Request, did: int):
     if not ssid or not password:
         raise HTTPException(400, "ssid and password required")
     try:
-        return do_guest_wifi(cur[0], ssid, password, vlan_id)
+        return do_guest_wifi(cur[0], ssid, password, vlan_id, apply=apply)
     except HTTPException:
         raise
     except Exception as e:
@@ -3849,6 +3986,7 @@ async def wifi_clone(request: Request, did: int):
     src = cur[0]
     body = await request.json()
     targets = body.get("target_ids") or []
+    apply = body.get("apply") is not False
     if not targets:
         raise HTTPException(400, "target_ids required")
     c = _ssh_connect(src)
@@ -3919,7 +4057,8 @@ async def wifi_clone(request: Request, did: int):
                         else:
                             safe.append((ssid, radio, slug, cmd))
                     if safe:
-                        script = "".join(p[3] for p in safe) + "uci commit wireless\nwifi reload\n"
+                        tail = "uci commit wireless\n" + ("wifi reload\n" if apply else "")
+                        script = "".join(p[3] for p in safe) + tail
                         o, e, st = _exec_capture(cc, script, timeout=60)
                         if st != 0:
                             for ssid, radio, slug, _cmd in safe:
@@ -3927,6 +4066,7 @@ async def wifi_clone(request: Request, did: int):
                         else:
                             for ssid, radio, slug, _cmd in safe:
                                 applied.append(f"{ssid} → {radio}")
+                            set_pending(t, "wireless", apply)
             finally:
                 cc.close()
             results.append({"target_id": tid, "name": t["name"], "ok": True,
@@ -3967,8 +4107,9 @@ async def device_mesh(request: Request, did: int):
         raise HTTPException(400, f"invalid mesh radio {cfg['mesh_vap']!r}")
     if not re.fullmatch(r"[A-Za-z0-9_.\-]+", cfg["mesh_id"]):
         raise HTTPException(400, f"invalid mesh id {cfg['mesh_id']!r}")
+    apply = d.get("apply") is not False
     try:
-        return do_mesh(cur[0], cfg)
+        return do_mesh(cur[0], cfg, apply=apply)
     except HTTPException:
         raise
     except Exception as e:

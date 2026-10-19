@@ -81,7 +81,7 @@ check("mesh disable does NOT reload", "wifi reload" not in captured["cmd"])
 owctl.execute("INSERT INTO devices(name, host, access, added_at) VALUES(?,?,?,?)",
               ("meshbox", "192.0.2.9", "ssh", owctl.now()))
 did = owctl.q("SELECT id FROM devices WHERE host='192.0.2.9'")[0]["id"]
-owctl.do_mesh = lambda d, cfg: {"device": d["name"], "ok": True, "enabled": True, "backend": "meshd"}
+owctl.do_mesh = lambda d, cfg, apply=True: {"device": d["name"], "ok": True, "enabled": True, "backend": "meshd"}
 r = client.post(f"/api/devices/{did}/mesh", json={"enabled": True, "mesh_id": "backbone"})
 check("POST /api/devices/{did}/mesh 200", r.status_code == 200 and r.json().get("ok"))
 owctl.do_mesh = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
