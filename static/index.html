@@ -448,6 +448,10 @@ async function renderNet(activeSection){
         <h3>Packages <span class="pill">→</span></h3>
         <p class="small muted">Fleet inventory &amp; pending updates.</p>
       </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='switchmap'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('switchmap')">
+        <h3>Switch Map <span class="pill">→</span></h3>
+        <p class="small muted">Physical ports, VLANs and link state.</p>
+      </div>
     </div>
     <div id="net-detail"></div>`;
   el.innerHTML=html;
@@ -487,6 +491,8 @@ async function loadNetSection(name){
     await renderConsistency(box);
   }else if(name==='packages'){
     await renderFleetPkgs(box);
+  }else if(name==='switchmap'){
+    await renderSwitchMap(box);
   }
 }
 
@@ -547,6 +553,43 @@ async function renderFleetPkgs(box){
     <thead><tr><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Device</th><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Pending updates</th><th style="padding:6px 10px;border-bottom:1px solid var(--line)"></th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
 }
+async function renderSwitchMap(box){
+  box.innerHTML='<p class="muted">Reading live switch port state… (queries each box)</p>';
+  let d;
+  try{ d=await api('/switch-map'); }catch(e){ box.innerHTML=`<p class="muted">Could not read the switch map: ${esc(String(e))}</p>`;return; }
+  if(!d.device_count){ box.innerHTML=`<p class="muted">No devices yet.</p>`;return; }
+  if(!d.switch_devices){ box.innerHTML=`<p class="muted">No switch-capable (SSH) devices with a switch package found. WiFi-only APs have no physical ports to map.</p>`;return; }
+  let cards='';
+  for(const dv of d.devices){
+    if(!dv.has_switch){ continue; }
+    let cells='';
+    const idxs=Object.keys(dv.ports).sort((a,b)=>a-b);
+    for(const i of idxs){
+      const p=dv.ports[i];
+      const up=p.up?`<span class="badge b-online" style="font-size:10px">UP</span>`:
+                (p.up===false?`<span class="badge b-CRITICAL" style="font-size:10px">DOWN</span>`:'');
+      const vlans=p.vlans.length
+        ? p.vlans.map(v=>`<span class="pill" style="font-size:10px;margin:1px 2px 0 0" title="VLAN ${v.id} ${v.tagged?'tagged':'untagged'}">${v.id}${v.tagged?'·':''}</span>`).join('')
+        : '<span class="muted small">—</span>';
+      cells+=`<div style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:120px">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <strong>${esc(p.name||('port '+i))}</strong>${up}
+        </div>
+        <div style="margin-top:4px">${vlans}</div>
+      </div>`;
+    }
+    cards+=`<div class="card" style="margin-bottom:16px">
+      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px">
+        <h3 style="margin:0">${esc(dv.name)} <span class="muted small">${esc(dv.host)}</span></h3>
+        <span class="small muted">${dv.linked}/${dv.port_count} ports linked</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:10px">${cells}</div>
+    </div>`;
+  }
+  const legend=`<p class="small muted" style="margin-top:4px">Port pills show VLAN id; a trailing <strong>·</strong> marks a <strong>tagged</strong> member (no dot = untagged/native). UP/DOWN is live link state from the box.</p>`;
+  box.innerHTML=`${cards}${legend}`;
+}
+
 async function fleetUpgradeOne(did,name){
   if(!confirm(`Upgrade all packages on ${name}? This restarts services on that box.`))return;
   toast('Upgrading '+name+'… (may take a few minutes)');

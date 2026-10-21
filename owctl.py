@@ -4292,6 +4292,117 @@ def read_switch_ports(dev):
                 "switches": {}, "error": str(e)}
 
 
+def parse_switch_port_map(output):
+    """Pure parser: {port_index: {'name':str,'up':bool}} from a normalized
+    listing where each port is one line: `port <index> <name> <0|1>`.
+
+    `index` is the switch port number (matches the numeric tokens in the UCI
+    `switch.*.vlan*.ports` field, e.g. '1' or '1t'), `name` is the human
+    label from sysfs (e.g. 'lan1', 'wan'), the last field is link state
+    (1 = up). Returns {} when no `port` lines are present.
+    """
+    ports = {}
+    order = []
+    for line in (output or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) < 4 or parts[0] != "port":
+            continue
+        try:
+            idx = int(parts[1])
+        except ValueError:
+            continue
+        name = parts[2]
+        up = parts[3] == "1"
+        ports[idx] = {"name": name, "up": up}
+        order.append(idx)
+    return {i: ports[i] for i in sorted(set(order))}
+
+
+def read_switch_port_map(dev):
+    """Live per-port link state keyed by switch port index. Reads the port
+    name + phys_port_id from sysfs for every port on the device's first
+    switch. Returns {index:{name,up}} — possibly empty (wifi-only box or
+    LuCI-only access); never raises."""
+    if dev["access"] != "ssh":
+        return {}
+    try:
+        c = _ssh_connect(dev)
+        try:
+            out, _e, _s = _exec_capture(
+                c,
+                "for d in /sys/class/switch/switch0/ports/*/; do "
+                "i=$(basename $d); [ -n \"$i\" ] || continue; "
+                "n=$(cat $d/name 2>/dev/null); [ -n \"$n\" ] || n=$i; "
+                "v=$(cat $d/phys_port_id 2>/dev/null); [ -n \"$v\" ] || v=0; "
+                "echo \"port $i $n $v\"; "
+                "done 2>/dev/null; true",
+                timeout=30)
+        finally:
+            c.close()
+        return parse_switch_port_map(out)
+    except Exception:
+        return {}
+
+
+def build_switch_map(assignments, status):
+    """Pure: join live port->VLAN assignments with live link state into a
+    per-port map.
+
+    assignments: {vid(str): {'ports':[token,...], 'tag':int|None}} (from
+        parse_switch_vlans for one switch) — tokens are '1', '2', '1t'.
+    status: {idx(int): {'name':str,'up':bool}} (from parse_switch_port_map).
+    Returns {idx(int): {'name':str|None,'up':bool|None,
+                         'vlans':[{'id':int,'tagged':bool},...]}} covering the
+        union of port indices seen in either input, sorted by index. The join
+        is by numeric port index (UCI token base), which is what makes it
+        correct across name/index conventions.
+    """
+    ports = {}
+    def _port(idx):
+        return ports.setdefault(idx, {
+            "name": (status.get(idx) or {}).get("name"),
+            "up": (status.get(idx) or {}).get("up"),
+            "vlans": []})
+    # Map a human port name (e.g. 'lan1','wan') to its numeric index via the
+    # status lookup, so named UCI tokens and numeric ones join correctly.
+    name_to_idx = {}
+    for idx, s in (status or {}).items():
+        nm = (s or {}).get("name")
+        if nm and nm not in name_to_idx:
+            name_to_idx[nm] = idx
+    for vid, info in (assignments or {}).items():
+        try:
+            vid_i = int(vid)
+        except (TypeError, ValueError):
+            continue
+        for tok in (info or {}).get("ports", []):
+            tok = str(tok).strip()
+            if not tok:
+                continue
+            raw = tok[:-1] if tok.endswith("t") else tok
+            if raw.isdigit():
+                idx = int(raw)
+            else:
+                idx = name_to_idx.get(raw)
+                if idx is None:
+                    continue  # name not found in this box's ports — skip
+            # OpenWrt switch convention: a port token with the 't' suffix is a
+            # TAGGED member of the VLAN; a bare token is the untagged/native
+            # member. The per-token suffix is the authoritative signal.
+            tagged = tok.endswith("t")
+            p = _port(idx)
+            if not any(v["id"] == vid_i for v in p["vlans"]):
+                p["vlans"].append({"id": vid_i, "tagged": tagged})
+    for idx in (status or {}):
+        _port(idx)
+    out = {}
+    for idx in sorted(ports):
+        p = ports[idx]
+        p["vlans"].sort(key=lambda v: v["id"])
+        out[idx] = p
+    return out
+
+
 def do_vlan_port(dev, switch_dev, vlan_id, ports, tag=None, apply: bool = True):
     """Assign switch ports to a VLAN in the `switch` package (the real home of
     port tagging — `network` only carries the routed interface).
@@ -4528,6 +4639,47 @@ async def apply_switch_ports(request: Request, did: int):
     r = do_vlan_port(dev, d.get("switch", "switch0"), vlan_id,
                      d.get("ports") or [], d.get("tag"), apply=apply)
     return r
+
+
+@app.get("/api/switch-map")
+def switch_map():
+    """Network-wide switch-port map: for every switch-capable device, the
+    live per-port view — which physical port carries which VLAN (untagged /
+    tagged) and whether that port is currently linked. The 'one device'
+    physical-layer overview. Live read (no caching): each box is queried for
+    its `switch` UCI assignments and its sysfs link state, then joined by
+    port index. Boxes without a switch (wifi-only APs) are reported with an
+    empty ports map, not an error."""
+    devs = q("SELECT * FROM devices ORDER BY id")
+    out = []
+    for dev in devs:
+        if dev["access"] != "ssh":
+            out.append({"device_id": dev["id"], "name": dev["name"], "host": dev["host"],
+                        "online": dev["status"] == "online", "has_switch": False,
+                        "ports": {}, "error": "luci-only"})
+            continue
+        r = read_switch_ports(dev)
+        if r.get("error") and not r["error"].startswith("luci-only"):
+            out.append({"device_id": dev["id"], "name": dev["name"], "host": dev["host"],
+                        "online": dev["status"] == "online", "has_switch": False,
+                        "ports": {}, "error": r["error"]})
+            continue
+        switches = r.get("switches") or {}
+        # One physical switch per box is the normal case; take the first.
+        first_switch = next(iter(switches.values())) if switches else {}
+        assignments = first_switch or {}
+        status = read_switch_port_map(dev)
+        ports = build_switch_map(assignments, status)
+        ports_json = {str(k): v for k, v in ports.items()}
+        linked = sum(1 for p in ports_json.values() if p.get("up"))
+        out.append({"device_id": dev["id"], "name": dev["name"], "host": dev["host"],
+                    "online": dev["status"] == "online",
+                    "has_switch": bool(ports_json),
+                    "port_count": len(ports_json), "linked": linked,
+                    "ports": ports_json, "error": None})
+    return {"device_count": len(out),
+            "switch_devices": sum(1 for d in out if d["has_switch"]),
+            "devices": out}
 
 
 @app.get("/api/devices/{did}/packages")
