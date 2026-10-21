@@ -440,6 +440,10 @@ async function renderNet(activeSection){
         <h3>Dynamic DNS <span class="pill">→</span></h3>
         <p class="small muted">Push WAN IP to a provider on change.</p>
       </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='consistency'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('consistency')">
+        <h3>Consistency <span class="pill">→</span></h3>
+        <p class="small muted">Firmware &amp; package drift across devices.</p>
+      </div>
     </div>
     <div id="net-detail"></div>`;
   el.innerHTML=html;
@@ -475,7 +479,37 @@ async function loadNetSection(name){
     await renderWifi(box);
   }else if(name==='dyndns'){
     await renderDyndns(box);
+  }else if(name==='consistency'){
+    await renderConsistency(box);
   }
+}
+
+async function renderConsistency(box){
+  let d;
+  try{ d=await api('/drift'); }catch(e){ box.innerHTML=`<p class="muted">Could not load consistency: ${esc(String(e))}</p>`;return; }
+  if(d.devices<2){ box.innerHTML=`<p class="muted">${esc(d.note||'Need at least 2 devices with status snapshots to compare.')}</p>`;return; }
+  const order=['firmware','dnsmasq','odhcpd','openwrt'];
+  const labels={firmware:'Firmware',dnsmasq:'dnsmasq',odhcpd:'odhcpd',openwrt:'openwrt'};
+  let rows='';
+  for(const f of order){
+    const info=d.drift[f];
+    if(!info)continue;
+    if(info.status==='drift'){
+      const cells=info.distinct.map(x=>`<div class="small" style="margin:3px 0"><strong>${esc(String(x.value))}</strong> <span class="muted">on</span> ${x.devices.map(esc).join(', ')}</div>`).join('');
+      rows+=`<tr><td><strong>${labels[f]||f}</strong></td><td><span class="badge b-CRITICAL">DRIFT</span></td><td>${cells}</td></tr>`;
+    }else if(info.status==='missing'){
+      rows+=`<tr><td><strong>${labels[f]||f}</strong></td><td><span class="badge b-MEDIUM">partial</span></td><td class="small">value <strong>${esc(String(info.uniform_value))}</strong> missing on: ${info.missing_on.map(esc).join(', ')}</td></tr>`;
+    }else{
+      rows+=`<tr><td><strong>${labels[f]||f}</strong></td><td><span class="badge b-online">ok</span></td><td class="small muted">uniform: ${esc(String(info.uniform_value))} on all ${d.devices}</td></tr>`;
+    }
+  }
+  const banner=d.count?`<div class="card" style="border-color:var(--err);margin-bottom:16px"><h3>⚠ ${d.count} field(s) diverge across your ${d.devices} devices</h3><p class="small muted">Boxes have drifted — consider re-baselining so the whole network stays one configurable device.</p></div>`
+    :`<div class="card" style="border-color:var(--ok);margin-bottom:16px"><h3>✓ All ${d.devices} devices are consistent</h3><p class="small muted">Firmware and key packages match across the fleet.</p></div>`;
+  box.innerHTML=`${banner}
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
+    <thead><tr><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Field</th><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Status</th><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Detail</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>
+    <p class="small muted" style="margin-top:12px">Snapped at: ${d.rows.map(r=>esc(r.name)+' '+esc(r.snapshot_at||'')).join(' · ')}</p>`;
 }
 
 async function renderDevices(){

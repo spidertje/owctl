@@ -2801,6 +2801,80 @@ async def pending_apply_all(request: Request):
     return {"applied": ok, "failed": len(results) - ok, "results": results}
 
 
+def compare_device_drift(rows, fields):
+    """Pure: which fields diverge across a set of devices.
+
+    rows: [{name, host, values:{field: value_or_None}}] (already-normalized).
+    fields: list of field names to compare. Returns {field: {status,
+    distinct:[{name,value}], uniform_value?}} where status is 'drift'
+    (>=2 distinct non-null values), 'missing' (some null, some set) or
+    'ok' (uniform). Fields that are null on every device are omitted.
+    """
+    out = {}
+    for f in fields:
+        vals = [(r.get("name"), r.get("values", {}).get(f)) for r in rows]
+        nonnull = [v for _, v in vals if v not in (None, "")]
+        if not nonnull:
+            continue
+        distinct = {}
+        for name, v in vals:
+            if v in (None, ""):
+                continue
+            distinct.setdefault(v, []).append(name)
+        if len(distinct) > 1:
+            out[f] = {"status": "drift",
+                      "distinct": [{"value": v, "devices": ns} for v, ns in distinct.items()]}
+        else:
+            the_v = next(iter(distinct.keys()))
+            missing = [n for n, v in vals if v in (None, "")]
+            out[f] = {"status": "missing" if missing else "ok",
+                      "uniform_value": the_v, "missing_on": missing}
+    return out
+
+
+@app.get("/api/drift")
+def drift_report():
+    """Cross-device consistency report: compare firmware, key package
+    versions and DHCP/QoS settings across every device (from the last
+    status snapshot). The 'one network' view of where boxes have diverged."""
+    rows = []
+    for dev in q("SELECT * FROM devices ORDER BY id"):
+        st = q("SELECT * FROM device_status WHERE device_id=? LIMIT 1", (dev["id"],))
+        if not st:
+            continue
+        st = st[0]
+        pkgs = []
+        try:
+            pkgs = json.loads(st["installed_pkgs"]) if st["installed_pkgs"] else []
+        except Exception:
+            pkgs = []
+        def _ver(name):
+            for p in pkgs:
+                if isinstance(p, dict) and p.get("pkg") == name:
+                    return p.get("version")
+            return None
+        rows.append({
+            "name": dev["name"], "host": dev["host"], "online": dev["status"] == "online",
+            "values": {
+                "firmware": st.get("firmware"),
+                "dnsmasq": _ver("dnsmasq"),
+                "odhcpd": _ver("odhcpd"),
+                "openwrt": _ver("openwrt"),
+            },
+            "snapshot_at": st.get("ts"),
+        })
+    if len(rows) < 2:
+        return {"count": 0, "devices": len(rows), "drift": {},
+                "note": "need at least 2 devices with status snapshots to compare"}
+    fields = ["firmware", "dnsmasq", "odhcpd", "openwrt"]
+    drift = compare_device_drift(rows, fields)
+    divergent = [f for f, d in drift.items() if d.get("status") == "drift"]
+    return {"count": len(divergent), "devices": len(rows), "drift": drift,
+            "fields": fields, "divergent": divergent,
+            "rows": [{k: r[k] for k in ("name", "host", "online", "snapshot_at")} |
+                     {"values": r["values"]} for r in rows]}
+
+
 # --------------------------------------------------------------------- security
 _RATELIMIT_MAX = int(os.environ.get("OWCTL_RATELIMIT_MAX", "120"))
 _RATELIMIT_WINDOW = int(os.environ.get("OWCTL_RATELIMIT_WINDOW", "60"))
