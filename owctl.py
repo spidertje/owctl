@@ -195,7 +195,7 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS vlans_devices(
         vlan_id TEXT, device_id INTEGER, role TEXT,
         PRIMARY KEY(vlan_id, device_id))""")
-    for _col, _typ in (("installed_pkgs", "TEXT"), ("obsolete_pkgs", "TEXT"), ("meshd", "TEXT")):
+    for _col, _typ in (("installed_pkgs", "TEXT"), ("obsolete_pkgs", "TEXT"), ("meshd", "TEXT"), ("upgradable_pkgs", "TEXT")):
         try:
             execute(f"ALTER TABLE device_status ADD COLUMN {_col} {_typ}")
         except sqlite3.OperationalError:
@@ -270,6 +270,7 @@ _ADMIN_ONLY_PATHS = {
     "/api/devices", "/api/devices/{did}", "/api/devices/{did}/backup",
     "/api/devices/{did}/restore", "/api/devices/{did}/reboot",
     "/api/devices/{did}/upgrade", "/api/devices/{did}/push-key",
+    "/api/fleet/upgrade",
     "/api/devices/{did}/guest-wifi", "/api/devices/{did}/wifi-clone",
     "/api/dhcp/apply", "/api/dns/apply", "/api/firewall/apply",
     "/api/qos/apply", "/api/vlans/apply", "/api/vlans/discover",
@@ -436,9 +437,11 @@ def record_status_snapshot(dev_row, st):
         installed = st.get("installed")
         obsolete = st.get("obsolete")
         meshd = st.get("meshd")
-        if installed is not None or obsolete is not None or meshd is not None:
-            cols += ["installed_pkgs", "obsolete_pkgs", "meshd"]
-            vals += [_json.dumps(installed or []), _json.dumps(obsolete or []), meshd]
+        upgradable = st.get("upgradable")
+        if installed is not None or obsolete is not None or meshd is not None or upgradable is not None:
+            cols += ["installed_pkgs", "obsolete_pkgs", "meshd", "upgradable_pkgs"]
+            vals += [_json.dumps(installed or []), _json.dumps(obsolete or []), meshd,
+                     _json.dumps(upgradable or [])]
         # Null-safe: only write a column when its source is present.
         set_clause = ", ".join(
             f"{c}=excluded.{c}" for c, v in zip(cols, vals) if v is not None
@@ -4550,6 +4553,82 @@ def get_device_packages(did: int):
             return []
     return {"installed": _parse("installed_pkgs"), "obsolete": _parse("obsolete_pkgs"),
             "meshd": row[0].get("meshd"), "stale": False}
+
+
+@app.get("/api/fleet/packages")
+def fleet_packages():
+    """Fleet-wide package view: installed + upgradable packages on every
+    device with a status snapshot, in one table. Lets the user see which
+    boxes have which package versions and how many updates are pending
+    across the whole network (the 'one device' inventory view).
+    No SSH — reads the persisted snapshots."""
+    import json as _json
+    out = []
+    for dev in q("SELECT * FROM devices ORDER BY id"):
+        row = q("SELECT installed_pkgs, upgradable_pkgs, firmware, ts FROM device_status WHERE device_id=?", (dev["id"],))
+        if not row:
+            continue
+        snap = row[0]
+        def _pkgs(col):
+            v = snap.get(col)
+            if not v:
+                return []
+            try:
+                d = _json.loads(v)
+                return d if isinstance(d, list) else []
+            except Exception:
+                return []
+        installed = _pkgs("installed_pkgs")
+        upgradable = _pkgs("upgradable_pkgs")
+        out.append({
+            "device_id": dev["id"], "name": dev["name"], "host": dev["host"],
+            "online": dev["status"] == "online",
+            "firmware": snap.get("firmware"),
+            "snapshot_at": snap.get("ts"),
+            "installed_count": len(installed),
+            "installed": [{"pkg": p.get("pkg"), "version": p.get("version")} for p in installed if isinstance(p, dict)],
+            "upgradable_count": len(upgradable),
+            "upgradable": [{"pkg": p.get("pkg"), "installed": p.get("installed"), "available": p.get("available")}
+                            for p in upgradable if isinstance(p, dict)],
+        })
+    upg_by_pkg = {}
+    for d in out:
+        for u in d["upgradable"]:
+            upg_by_pkg.setdefault(u["pkg"], []).append(d["name"])
+    return {"device_count": len(out),
+            "devices_with_updates": sum(1 for d in out if d["upgradable_count"]),
+            "total_updates": sum(d["upgradable_count"] for d in out),
+            "updates_by_package": {pkg: names for pkg, names in sorted(upg_by_pkg.items())},
+            "devices": out}
+
+
+@app.post("/api/fleet/upgrade")
+async def fleet_upgrade(request: Request):
+    """Upgrade packages on every device (or a scoped subset via
+    {devices:[id], packages:[...]}). Runs do_upgrade per device with error
+    isolation — one box failing doesn't abort the fleet. Long-running; the
+    caller should tolerate a long response."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    devices = body.get("devices") or [d["id"] for d in q("SELECT id FROM devices ORDER BY id")]
+    packages = body.get("packages") or []
+    results = []
+    for did in devices:
+        cur = q("SELECT * FROM devices WHERE id=?", (did,))
+        if not cur:
+            results.append({"device_id": did, "name": "?", "ok": False, "error": "unknown device"})
+            continue
+        dev = cur[0]
+        try:
+            out = do_upgrade(dev, packages)
+            results.append({"device_id": did, "name": dev["name"], "ok": True,
+                            "output": out[-4000:]})
+        except Exception as e:
+            results.append({"device_id": did, "name": dev["name"], "ok": False, "error": str(e)})
+    ok = sum(1 for r in results if r["ok"])
+    return {"ok": ok, "failed": len(results) - ok, "results": results}
 
 @app.post("/api/devices/{did}/packages/remove")
 async def remove_packages(request: Request, did: int):

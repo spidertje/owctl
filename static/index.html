@@ -444,6 +444,10 @@ async function renderNet(activeSection){
         <h3>Consistency <span class="pill">→</span></h3>
         <p class="small muted">Firmware &amp; package drift across devices.</p>
       </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='packages'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('packages')">
+        <h3>Packages <span class="pill">→</span></h3>
+        <p class="small muted">Fleet inventory &amp; pending updates.</p>
+      </div>
     </div>
     <div id="net-detail"></div>`;
   el.innerHTML=html;
@@ -481,6 +485,8 @@ async function loadNetSection(name){
     await renderDyndns(box);
   }else if(name==='consistency'){
     await renderConsistency(box);
+  }else if(name==='packages'){
+    await renderFleetPkgs(box);
   }
 }
 
@@ -510,6 +516,56 @@ async function renderConsistency(box){
     <thead><tr><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Field</th><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Status</th><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Detail</th></tr></thead>
     <tbody>${rows}</tbody></table></div>
     <p class="small muted" style="margin-top:12px">Snapped at: ${d.rows.map(r=>esc(r.name)+' '+esc(r.snapshot_at||'')).join(' · ')}</p>`;
+}
+
+async function renderFleetPkgs(box){
+  let d;
+  try{ d=await api('/fleet/packages'); }catch(e){ box.innerHTML=`<p class="muted">Could not load fleet packages: ${esc(String(e))}</p>`;return; }
+  if(!d.device_count){ box.innerHTML=`<p class="muted">No devices with a package snapshot yet. Run a check on each device first.</p>`;return; }
+  const banner=d.devices_with_updates
+    ?`<div class="row" style="justify-content:space-between;align-items:center;margin-bottom:14px">
+        <div><h3 style="margin:0">⚠ ${d.total_updates} pending update(s) across ${d.devices_with_updates}/${d.device_count} devices</h3>
+        <p class="small muted" style="margin:2px 0 0">Re-baseline the whole fleet in one action so every box stays aligned.</p></div>
+        <button class="act pri" onclick="fleetUpgradeAll()">Upgrade all devices</button>
+      </div>`
+    :`<div class="card" style="border-color:var(--ok);margin-bottom:16px"><h3>✓ All ${d.device_count} devices are up to date</h3></div>`;
+  let rows='';
+  for(const dv of d.devices){
+    const upg=dv.upgradable.length
+      ? dv.upgradable.map(u=>`${esc(u.pkg)} ${esc(u.installed)} → <strong>${esc(u.available)}</strong>`).join(' · ')
+      : '<span class="muted">up to date</span>';
+    rows+=`<tr>
+      <td style="padding:8px 10px;border-bottom:1px solid var(--line)"><strong>${esc(dv.name)}</strong><br><span class="small muted">${esc(dv.host)} · ${dv.installed_count} pkgs</span></td>
+      <td style="padding:8px 10px;border-bottom:1px solid var(--line)"><span class="small">${upg}</span></td>
+      <td style="padding:8px 10px;border-bottom:1px solid var(--line);text-align:right">
+        ${dv.upgradable.length?`<button class="act" onclick="fleetUpgradeOne(${dv.device_id},'${esc(dv.name)}')">Upgrade</button>`:'<span class="badge b-online">ok</span>'}
+      </td>
+    </tr>`;
+  }
+  box.innerHTML=`${banner}
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
+    <thead><tr><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Device</th><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Pending updates</th><th style="padding:6px 10px;border-bottom:1px solid var(--line)"></th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+async function fleetUpgradeOne(did,name){
+  if(!confirm(`Upgrade all packages on ${name}? This restarts services on that box.`))return;
+  toast('Upgrading '+name+'… (may take a few minutes)');
+  try{
+    const r=await api('/fleet/upgrade',{method:'POST',body:JSON.stringify({devices:[did]})});
+    if(r.failed)toast(name+': '+ (r.results[0]||{}).error ,true);
+    else toast('Upgraded '+name);
+    renderFleetPkgs(document.getElementById('net-detail'));
+  }catch(e){toast(String(e),true)}
+}
+async function fleetUpgradeAll(){
+  if(!confirm('Upgrade packages on ALL devices? This is fleet-wide and may take several minutes.'))return;
+  toast('Upgrading all devices… (may take several minutes)');
+  try{
+    const r=await api('/fleet/upgrade',{method:'POST',body:JSON.stringify({})});
+    if(r.failed)toast(`Upgraded ${r.ok}, ${r.failed} failed`,true);
+    else toast('Upgraded all '+r.ok+' device(s)');
+    renderFleetPkgs(document.getElementById('net-detail'));
+  }catch(e){toast(String(e),true)}
 }
 
 async function renderDevices(){
