@@ -2756,6 +2756,51 @@ def pending_applies_list(did: int):
     return {"device": dev["name"], "features": features, "count": len(features)}
 
 
+@app.get("/api/pending")
+def pending_all():
+    """Network-wide view: every device's saved-but-not-applied config features,
+    so 'the one device' shows what's pending across the whole network and where."""
+    out = []
+    for dev in q("SELECT * FROM devices ORDER BY id"):
+        feats = pending_apply_for(dev)
+        if feats:
+            out.append({"device_id": dev["id"], "name": dev["name"], "host": dev["host"],
+                        "access": dev["access"],
+                        "features": [f["feature"] for f in feats],
+                        "saved_at": max(f["saved_at"] for f in feats if f.get("saved_at"))})
+    total = sum(len(x["features"]) for x in out)
+    return {"count": total,
+            "devices": len(out),
+            "features": sorted({f for x in out for f in x["features"]}),
+            "items": out}
+
+
+@app.post("/api/pending/apply")
+async def pending_apply_all(request: Request):
+    """Apply (restart the daemons for) every device's pending changes. Optionally
+    scope with {devices: [id,...]}; without it, all devices. Per-device results
+    are reported; one device's SSH failure does not abort the rest."""
+    try:
+        d = await request.json()
+    except Exception:
+        d = {}
+    scope = d.get("devices")
+    devs = q("SELECT * FROM devices ORDER BY id")
+    if scope:
+        scope = {int(x) for x in scope}
+        devs = [x for x in devs if x["id"] in scope]
+    results = []
+    for dev in devs:
+        if not pending_apply_for(dev):
+            continue  # nothing pending on this device
+        try:
+            results.append(apply_pending_for(dev))
+        except Exception as e:
+            results.append({"device": dev["name"], "ok": False, "error": str(e)})
+    ok = sum(1 for r in results if r.get("ok"))
+    return {"applied": ok, "failed": len(results) - ok, "results": results}
+
+
 # --------------------------------------------------------------------- security
 _RATELIMIT_MAX = int(os.environ.get("OWCTL_RATELIMIT_MAX", "120"))
 _RATELIMIT_WINDOW = int(os.environ.get("OWCTL_RATELIMIT_WINDOW", "60"))

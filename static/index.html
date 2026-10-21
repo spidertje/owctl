@@ -157,7 +157,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   </nav>
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
   <span id="pending-apply" style="display:none;align-items:center;gap:6px;margin-left:8px">
-    <span class="badge b-MEDIUM" id="pending-badge" style="font-size:11px;padding:2px 8px"></span>
+    <span class="badge b-MEDIUM" id="pending-badge" title="Show pending changes" style="font-size:11px;padding:2px 8px;cursor:pointer" onclick="pendingPanel()"></span>
     <button class="act pri" id="pending-apply-btn" onclick="applyAllPending()" style="padding:4px 10px;font-size:12px">Apply pending changes</button>
   </span>
 </header>
@@ -212,15 +212,48 @@ async function refreshPendingBadge(){
 }
 async function applyAllPending(){
   try{
-    const devs=await api('/devices');
-    const results=[];
-    for(const d of devs){
-      try{const r=await api(`/devices/${d.id}/pending-apply`,{method:'POST'});
-        if(r.applied&&r.applied.length)results.push(d.name+': '+r.applied.join(', '));}catch(e){}
-    }
-    if(results.length){toast('Applied: '+results.join(' · '));refreshPendingBadge();renderNet&&renderNet();}
-    else{toast('No pending changes to apply');refreshPendingBadge();}
-  }catch(e){toast(String(e),true);}
+    const r=await api('/pending/apply',{method:'POST',body:JSON.stringify({})});
+    if(r.failed)toast(`Applied ${r.applied} device(s), ${r.failed} failed`,true);
+    else if(r.applied)toast('Applied pending changes on '+r.applied+' device(s)');
+    else toast('No pending changes to apply');
+    refreshPendingBadge(); renderNet&&renderNet();
+  }catch(e){toast(String(e),true)}
+}
+async function pendingPanel(){
+  let data={items:[]};
+  try{ data=await api('/pending'); }catch(e){toast('Could not load pending changes: '+String(e),true);return}
+  if(!data.items.length){toast('Nothing pending');return}
+  const rows=data.items.map(it=>`
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)">
+      <div>
+        <strong>${esc(it.name)}</strong> <span class="muted small">${esc(it.host)}</span>
+        <div class="muted small" style="margin-top:2px">${it.features.map(esc).join(' · ')}</div>
+      </div>
+      <button class="act" onclick="pendingApplyOne(${it.device_id},'${esc(it.name)}')">Apply</button>
+    </div>`).join('');
+  const modal=document.createElement('div');
+  modal.className='pending-panel';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;min-width:420px;max-width:640px">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 style="margin:0">Pending changes (${data.count})</h3>
+      <button class="act" onclick="document.querySelector('.pending-panel')?.remove()">Close</button>
+    </div>
+    <div>${rows}</div>
+    <div class="row" style="justify-content:flex-end;margin-top:12px">
+      <button class="act pri" onclick="applyAllPending();document.querySelector('.pending-panel')?.remove()">Apply all</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.onclick=e=>{if(e.target===modal)modal.remove()};
+}
+async function pendingApplyOne(did,name){
+  try{
+    const r=await api('/pending/apply',{method:'POST',body:JSON.stringify({devices:[did]})});
+    if(r.failed)toast(name+': apply failed',true);
+    else toast('Applied on '+name);
+    refreshPendingBadge(); renderNet&&renderNet();
+  }catch(e){toast(String(e),true)}
 }
 const navBtns=[...document.querySelectorAll('nav button')];
 navBtns.forEach(b=>b.onclick=()=>{
