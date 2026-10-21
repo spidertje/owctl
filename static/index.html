@@ -1464,9 +1464,9 @@ async function renderVlans(target){
   const devs=await api('/devices');
   const cfg=await api('/settings').catch(()=>({}));
   const gwId=cfg.network_gateway;
-  const router=devs.find(d=>d.id===gwId)||devs.find(d=>d.role==='router')||devs[0];
+  const router=devs.find(d=>d.id===gwId)||devs.find(d=>(d.role||'')==='router')||devs[0];
   let html=`<h2>VLAN Configuration</h2>
-    <p class="muted">Create and manage VLANs across your network. Each VLAN isolates devices into separate broadcast domains.</p>
+    <p class="muted">Isolated broadcast domains — one card per VLAN. Route it, tag ports, police it between zones.</p>
     ${netTemplatePills('vlans')}`;
   if(NET_ADVANCED){
     html+=`<div class="card">
@@ -1492,17 +1492,208 @@ async function renderVlans(target){
       <button class="act pri" onclick="applyVlan(true)">Save &amp; Apply</button>
     </div>`;
   }
-  html+=`<div id="vlan-results" style="margin-top:16px"></div>`;
+  html+=`<div id="vlan-cards" style="margin-top:16px"></div>`;
   el.innerHTML=html;
-  // Show discovered VLANs live
+  await renderVlanCards();
+}
+async function renderVlanCards(){
+  const box=document.getElementById('vlan-cards');
+  if(!box)return;
+  let vlans=[];
+  try{ vlans=await api('/vlans'); }catch(e){ box.innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(String(e))}</div>`; return; }
+  if(!vlans.length){ box.innerHTML=`<p class="muted">No VLANs configured yet. Create one above, or run Discover to import existing ones.</p>`; return; }
+  box.innerHTML=vlans.map(v=>{
+    const members=(v.members||[]);
+    const router=members.find(m=>m.role==='router');
+    const switches=members.filter(m=>m.role!=='router');
+    return `<div class="card" id="vlan-card-${v.id}" style="margin-bottom:14px">
+      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
+        <strong>VLAN ${v.id} — ${esc(v.name||'vlan_'+v.id)}</strong>
+        <span class="muted small">${esc(v.subnet||'no subnet')}${v.dhcp?' · DHCP':' · no-DHCP'}${router?' · routed on '+esc(router.name):''}</span>
+      </div>
+      <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <span class="pill">switch members:</span>
+        ${switches.map(s=>`<span class="pill">${esc(s.name)}</span>`).join('')||'<span class="muted small">none</span>'}
+      </div>
+      <div class="row" style="gap:6px;flex-wrap:wrap;align-items:center">
+        <button class="act" onclick="vlanEdit(${v.id})">Edit</button>
+        <button class="act" onclick="vlanPorts(${v.id})">Ports</button>
+        <button class="act" onclick="vlanZone(${v.id})">Firewall</button>
+        <button class="act" onclick="vlanLeases(${v.id})">Leases</button>
+        <button class="act" style="border-color:var(--bad);color:var(--bad)" onclick="vlanDelete(${v.id})">Delete</button>
+      </div>
+      <div id="vlan-action-${v.id}"></div>
+    </div>`;
+  }).join('');
+}
+async function vlanActionBox(vlan_id, html){
+  const el=document.getElementById('vlan-action-'+vlan_id);
+  if(el)el.innerHTML=html;
+}
+async function vlanEdit(vid){
+  const v=(await api('/vlans').catch(()=>[])).find(x=>String(x.id)===String(vid));
+  if(!v){toast('VLAN not found',true);return}
+  const members=(v.members||[]);
+  const router=members.find(m=>m.role==='router');
+  const html=`
+    <div style="margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:8px">
+      <div class="row" style="margin-bottom:8px">
+        <div><label>Subnet</label><input id="ve-subnet" value="${esc(v.subnet||'192.168.'+vid+'.0/24')}" style="width:180px"></div>
+        <div style="display:flex;align-items:flex-end"><label style="margin:0 8px 0 0"><input type="checkbox" id="ve-dhcp"${v.dhcp?' checked':''}> DHCP</label></div>
+        <div style="flex:1"><label>Router device</label><select id="ve-router"></select></div>
+      </div>
+      <div class="row" style="gap:6px">
+        <button class="act" onclick="vlanSaveEdit(${vid},false)">Save</button>
+        <button class="act pri" onclick="vlanSaveEdit(${vid},true)">Save &amp; Apply</button>
+        <button class="act" onclick="vlanActionBox(${vid},'')">Cancel</button>
+      </div>
+    </div>`;
+  await vlanActionBox(vid,html);
   try{
-    const vlans=await api('/vlans');
-    if(vlans.length){
-      const box=document.getElementById('vlan-results');
-      box.innerHTML=`<div class="card"><h3>Configured VLANs</h3>`+
-        vlans.map(v=>`<div class="kv"><span>VLAN ${v.id} — ${esc(v.name||'')}</span><span>${esc(v.subnet||'')}${v.dhcp?' · DHCP':''}</span></div>`).join('')+`</div>`;
+    const devs=await api('/devices');
+    const sel=document.getElementById('ve-router');
+    sel.innerHTML=devs.map(d=>`<option value="${d.id}" ${router&&d.id===router.device_id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('');
+  }catch(e){/* router select optional */}
+}
+async function vlanSaveEdit(vid,apply){
+  const subnet=document.getElementById('ve-subnet').value.trim();
+  const dhcp=document.getElementById('ve-dhcp').checked;
+  const router_id=parseInt(document.getElementById('ve-router').value);
+  const v=(await api('/vlans').catch(()=>[])).find(x=>String(x.id)===String(vid));
+  const members=(v&&v.members)||[];
+  const switches=members.filter(m=>m.role!=='router');
+  const devices=[...new Set([router_id,...switches.map(m=>m.device_id)])];
+  if(!devices.length||!router_id){toast('No router device — add one via Create first',true);return}
+  try{
+    toast((apply?'Applying':'Saving')+' VLAN '+vid+'...');
+    const r=await api('/vlans/apply',{method:'POST',body:JSON.stringify({vlan_id:vid,name:v?v.name:('vlan_'+vid),subnet,dhcp,devices,router_id,apply})});
+    const ok=r.results.filter(x=>x.ok).length;
+    await vlanActionBox(vid,`<div style="margin-top:8px;color:var(--ok)">${apply?'Applied':'Saved (not applied)'} on ${ok} device(s).</div>`);
+    toast((apply?'VLAN applied':'VLAN saved')+' ('+ok+' devices)');
+    refreshPendingBadge(); renderVlanCards();
+  }catch(e){toast(String(e),true)}
+}
+async function vlanDelete(vid){
+  if(!confirm('Delete VLAN '+vid+' (network + DHCP + firewall zone) from all its devices?'))return;
+  try{
+    toast('Deleting VLAN '+vid+'...');
+    const r=await api('/vlans/delete',{method:'POST',body:JSON.stringify({vlan_id:vid})});
+    const ok=r.results.filter(x=>x.ok).length;
+    toast('VLAN deleted on '+ok+' device(s)');
+    renderVlanCards(); refreshPendingBadge();
+  }catch(e){toast(String(e),true)}
+}
+async function vlanPorts(vid){
+  let devs=[];
+  try{ devs=await api('/devices'); }catch(e){toast(String(e),true);return}
+  const v=(await api('/vlans').catch(()=>[])).find(x=>String(x.id)===String(vid));
+  const switchIds=(v&&(v.members||[])).filter(m=>m.role!=='router').map(m=>m.device_id);
+  const targets=switchIds.length?switchIds:devs.filter(d=>d.access==='ssh').map(d=>d.id);
+  if(!targets.length){toast('No switch devices available',true);return}
+  const rows=[];
+  for(const did of targets){
+    let sp=null,err=null;
+    try{ const r=await api('/devices/'+did+'/switch-ports'); sp=r.switches||{}; }
+    catch(e){ err=String(e); }
+    const d=devs.find(x=>x.id===did)||{};
+    const ports=[];
+    for(const sw in (sp||{})) for(const k in (sp[sw]||{})) if(String(k)===String(vid)) ports.push(...((sp[sw][k].ports)||[]));
+    rows.push({did,name:d.name||('device '+did),ports,err});
+  }
+  const html=rows.map(r=>{
+    const opts=['0','1','2','3','4','5','6','7','8','9'].map(p=>`<label style="display:inline-flex;align-items:center;gap:3px;margin-right:8px"><input type="checkbox" class="vp-port" data-did="${r.did}" value="${p}" ${r.ports.includes(p)?'checked':''}> ${p}</label>`).join('');
+    return `<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px">
+      <strong>${esc(r.name)}</strong>
+      ${r.err?`<span class="muted small">read failed: ${esc(r.err)}</span>`:''}
+      ${r.ports.length?'':'<span class="muted small">port not tagged on this device</span>'}
+      <div style="margin-top:6px">${opts}</div>
+      <div class="row" style="gap:6px;margin-top:6px">
+        <button class="act" onclick="vlanPortSave(${vid},${r.did},false)">Save</button>
+        <button class="act pri" onclick="vlanPortSave(${vid},${r.did},true)">Save &amp; Apply</button>
+      </div>
+    </div>`;
+  }).join('');
+  await vlanActionBox(vid,`<div style="margin-top:10px"><p class="muted small">Tag LAN ports to VLAN ${vid} (access/untagged). Trunk ports need the 'Nt' form — advanced config only.</p>${html}<button class="act" style="margin-top:8px" onclick="vlanActionBox(${vid},'')">Close</button></div>`);
+}
+async function vlanPortSave(vid,did,apply){
+  const ports=[...document.querySelectorAll('.vp-port[data-did="'+did+'"]:checked')].map(c=>c.value);
+  if(!ports.length){toast('Select at least one port',true);return}
+  try{
+    toast('Tagging ports to VLAN '+vid+'...');
+    const r=await api('/devices/'+did+'/switch-ports',{method:'POST',body:JSON.stringify({vlan_id:vid,ports,apply})});
+    toast('Ports tagged on '+r.device);
+    vlanActionBox(vid,''); renderVlanCards(); refreshPendingBadge();
+  }catch(e){toast(String(e),true)}
+}
+async function vlanZone(vid){
+  const v=(await api('/vlans').catch(()=>[])).find(x=>String(x.id)===String(vid));
+  const router=v&&(v.members||[]).find(m=>m.role==='router');
+  if(!router){toast('No router device on this VLAN to hold its zone',true);return}
+  const zoneName='vlan_'+vid;
+  let zone=null;
+  try{ const st=await api('/devices/'+router.device_id+'/vlans/'+vid); zone=st.zone; }catch(e){}
+  const z=zone||{input:'ACCEPT',output:'ACCEPT',forward:'REJECT'};
+  const opts=p=>['ACCEPT','REJECT','DROP'].map(x=>`<option ${(z[p]||'').toUpperCase()===x?'selected':''}>${x}</option>`).join('');
+  const html=`
+    <div style="margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:8px">
+      <p class="muted small">Zone policies on ${esc(router.name)} (zone ${zoneName}). Inter-VLAN traffic is REJECTed by default — open specific paths with inter-zone rules in the Firewall tab.</p>
+      <div class="row" style="gap:10px;margin-bottom:10px">
+        <div><label>Input</label><select id="vz-in"></select></div>
+        <div><label>Output</label><select id="vz-out"></select></div>
+        <div><label>Forward</label><select id="vz-fwd"></select></div>
+      </div>
+      <div class="row" style="gap:6px">
+        <button class="act" onclick="vlanZoneSave(${vid},${router.device_id},'${zoneName}',false)">Save</button>
+        <button class="act pri" onclick="vlanZoneSave(${vid},${router.device_id},'${zoneName}',true)">Save &amp; Apply</button>
+        <button class="act" onclick="vlanActionBox(${vid},'')">Close</button>
+      </div>
+    </div>`;
+  await vlanActionBox(vid,html);
+  document.getElementById('vz-in').innerHTML=opts('input');
+  document.getElementById('vz-out').innerHTML=opts('output');
+  document.getElementById('vz-fwd').innerHTML=opts('forward');
+}
+async function vlanZoneSave(vid,did,zone,apply){
+  const policies={input:document.getElementById('vz-in').value,output:document.getElementById('vz-out').value,forward:document.getElementById('vz-fwd').value};
+  try{
+    toast('Saving zone '+zone+'...');
+    await api('/firewall/apply',{method:'POST',body:JSON.stringify({did,kind:'zone',zone,policies,apply})});
+    toast((apply?'Zone applied + fw4 reloaded':'Zone saved (not applied)'));
+    vlanActionBox(vid,''); refreshPendingBadge();
+  }catch(e){toast(String(e),true)}
+}
+async function vlanLeases(vid){
+  const v=(await api('/vlans').catch(()=>[])).find(x=>String(x.id)===String(vid));
+  const router=v&&(v.members||[]).find(m=>m.role==='router');
+  if(!router){toast('No router device on this VLAN',true);return}
+  try{
+    const r=await api('/dhcp/leases?did='+router.device_id);
+    const leases=(r.leases||[]);
+    const subnetCidr=v.subnet||'';
+    let filtered=leases;
+    let label='Active leases (all — no subnet recorded on this VLAN)';
+    if(subnetCidr){
+      const network=subnetCidr.split('/')[0].split('.').slice(0,3).join('.');
+      filtered=leases.filter(l=>String(l.ip||'').startsWith(network+'.'));
+      label=`Leases in ${subnetCidr} (${filtered.length} of ${leases.length})`;
     }
-  }catch(e){}
+    const html=filtered.map(l=>`<div class="kv"><span>${esc(l.mac)} ${esc(l.hostname||'')}</span><span style="display:flex;align-items:center;gap:8px"><span>${esc(l.ip)}</span><button class="act" onclick="vlanReserveLease(${vid},'${esc(l.mac)}','${esc(l.hostname||'')}','${esc(l.ip)}')">Reserve</button></span></div>`).join('')||'<span class="muted">none</span>';
+    await vlanActionBox(vid,`<div style="margin-top:10px"><strong>${esc(label)}</strong>${html}<button class="act" style="margin-top:8px" onclick="vlanActionBox(${vid},'')">Close</button></div>`);
+  }catch(e){toast('Leases read failed: '+String(e),true)}
+}
+async function vlanReserveLease(vid, mac, hostname, ip){
+  const v=(await api('/vlans').catch(()=>[])).find(x=>String(x.id)===String(vid));
+  const router=v&&(v.members||[]).find(m=>m.role==='router');
+  if(!router){toast('No router device on this VLAN to hold the reservation',true);return}
+  const name=hostname||mac;
+  if(!ip){toast('This lease has no IP to reserve',true);return}
+  try{
+    toast('Reserving '+ip+' for '+name+'...');
+    const r=await api('/dhcp/reserve',{method:'POST',body:JSON.stringify({
+      did:router.device_id, vlan_id:vid, name, mac, ip, apply:true})});
+    toast('Reserved '+ip+' → '+name+' ('+r.lease_count+' total leases)');
+    vlanActionBox(vid,''); renderVlanCards(); refreshPendingBadge();
+  }catch(e){toast('Reserve failed: '+String(e),true)}
 }
 async function renderDhcp(target){
   const el=target||document.getElementById('tab-dhcp');
@@ -1586,7 +1777,7 @@ function dhcpLeaseEditor(k,leases){
   leases=leases||[];
   const rows=leases.map(l=>dhcpLeaseRow(k,l)).join('');
   return `<div style="margin-bottom:8px">
-    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px"><label>Static leases</label><button class="act" onclick="dhcpAddLease('${k}')">+ Add</button></div>
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px"><label>Static leases</label><div class="row" style="gap:6px"><button class="act" onclick="dhcpKnownPicker('${k}')">+ From known devices</button><button class="act" onclick="dhcpAddLease('${k}')">+ Add</button></div></div>
     <div id="${_dh(k)}leases">${rows}</div>
   </div>`;
 }
@@ -1614,6 +1805,65 @@ function dhcpReadLeases(k){
   });
   return out;
 }
+// ---- known-device picker for IP reservations ----
+function _leaseVlanFromCtx(k){
+  if(k==='new'){
+    const el=document.getElementById('dhpc-new-vlan');
+    return el?(parseInt(el.value)||''):'';
+  }
+  const box=document.getElementById(_dh(k)+'leases');
+  if(!box) return '';
+  let el=box.parentElement;
+  while(el && !el.dataset) el=el.parentElement;
+  while(el && !(el.dataset&&el.dataset.vlan!=null)) el=el.parentElement;
+  return (el&&el.dataset&&el.dataset.vlan!==undefined)?el.dataset.vlan:'';
+}
+async function dhcpKnownPicker(k){
+  const didEl=document.getElementById('dhcp-did');
+  const did=didEl?parseInt(didEl.value):null;
+  if(!did){toast('No SSH device available',true);return}
+  const vlan=_leaseVlanFromCtx(k);
+  let data={devices:[]};
+  try{
+    data=await api('/dhcp/devices?did='+did+(vlan?('&vlan_id='+vlan):''));
+  }catch(e){toast('Known-devices read failed: '+String(e),true);return}
+  const devs=data.devices||[];
+  if(!devs.length){toast('No known devices (leases/ARP) on this device',true);return}
+  const rows=devs.map(d=>{
+    const defIp=d.current_ip||'';
+    return `<tr style="cursor:pointer" onclick="dhcpPickDevice('${esc(k)}','${esc(d.mac)}','${esc(d.name||'')}','${esc(defIp)}')">
+      <td style="padding:4px 6px">${esc(d.name||'—')}</td>
+      <td style="padding:4px 6px;font-family:monospace;font-size:12px">${esc(d.mac)}</td>
+      <td style="padding:4px 6px;font-family:monospace;font-size:12px">${esc(d.current_ip||'')}</td>
+      <td style="padding:4px 6px">${d.reserved?`<span class="badge b-online">reserved ${esc(d.reserved_ip||'')}</span>`:'<span class="muted small">—</span>'}</td>
+      <td style="padding:4px 6px" class="muted small">${esc((d.sources||[]).join('+'))}</td>
+    </tr>`;
+  }).join('');
+  const modal=document.createElement('div');
+  modal.className='dhcp-picker';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;min-width:560px;max-width:760px;max-height:70vh;overflow:auto">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 style="margin:0">Pick a device to reserve</h3>
+      <button class="act" onclick="document.querySelector('.dhcp-picker')?.remove()">Close</button>
+    </div>
+    <p class="muted small" style="margin:0 0 10px">${data.lease_count||0} active leases · ${data.arp_count||0} ARP neighbors · click a row to add it as a lease (pre-filled with its current IP, still editable).</p>
+    <table style="width:100%;border-collapse:collapse"><tbody>${rows}</tbody></table>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.onclick=e=>{if(e.target===modal)modal.remove()};
+}
+function dhcpPickDevice(k,mac,name,ip){
+  document.querySelector('.dhcp-picker')?.remove();
+  const box=document.getElementById(_dh(k)+'leases');
+  if(!box){toast('Lease editor not found',true);return}
+  const row=dhcpLeaseRow(k,{name:name||'',mac:mac,ip:ip||''});
+  box.insertAdjacentHTML('beforeend',row);
+  toast('Added '+ (name||mac) +' — set the IP and Save the section');
+  // auto-scroll to the new row
+  const rows=box.querySelectorAll('.lease-row');
+  rows[rows.length-1]?.scrollIntoView({block:'center'});
+}
 function dhcpNewCard(){
   return `<h3>New / edit VLAN section</h3>
   <div class="row" style="margin-bottom:8px">
@@ -1633,7 +1883,7 @@ function dhcpNewCard(){
 function dhcpSectionCard(d,i){
   const k='s'+i;
   const opts=(d.options||[]).join('\n');
-  return `<div class="card">
+  return `<div class="card" data-vlan="${d.vlan_id!=null?d.vlan_id:''}">
     <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px">
       <h3 style="margin:0">VLAN ${d.vlan_id!=null?d.vlan_id:'\u2014'} <span class="muted small">${esc(d.iface)}</span></h3>
       <span class="badge ${d.enabled?'b-online':'b-offline'}">${d.enabled?'enabled':'disabled'}</span>

@@ -189,6 +189,12 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS pending_applies(
         device_id INTEGER, feature TEXT, restart_cmd TEXT, saved_at TEXT,
         PRIMARY KEY(device_id, feature))""")
+    # Which device carries each VLAN and in what role (routed on the router,
+    # tagged on a switch). Recorded on apply; union of members drives the
+    # "one network" per-VLAN view.
+    execute("""CREATE TABLE IF NOT EXISTS vlans_devices(
+        vlan_id TEXT, device_id INTEGER, role TEXT,
+        PRIMARY KEY(vlan_id, device_id))""")
     for _col, _typ in (("installed_pkgs", "TEXT"), ("obsolete_pkgs", "TEXT"), ("meshd", "TEXT")):
         try:
             execute(f"ALTER TABLE device_status ADD COLUMN {_col} {_typ}")
@@ -1575,6 +1581,17 @@ def pending_apply_for(dev):
     return [{"feature": r["feature"], "saved_at": r["saved_at"]} for r in rows]
 
 
+def record_vlan_membership(vlan_id, device_id, role):
+    """Record that ``device_id`` carries ``vlan_id`` (``role`` = router|switch).
+    Never raises — membership bookkeeping must not break the apply it tracks."""
+    try:
+        execute("INSERT INTO vlans_devices(vlan_id, device_id, role) VALUES(?,?,?) "
+                "ON CONFLICT(vlan_id, device_id) DO UPDATE SET role=excluded.role",
+                (str(vlan_id), device_id, role))
+    except Exception:
+        pass
+
+
 def set_pending(dev, feature, apply):
     """Reconcile the pending-apply ledger with a just-run save. ``apply=True``
     (Save & Apply) clears the feature; ``apply=False`` (Save) records it as
@@ -2263,17 +2280,19 @@ def do_vlan(dev, vlan_id, name, subnet, dhcp, devices, router_id, apply: bool = 
     try:
         is_router = dev["id"] == router_id
         if is_router:
-            # Router: create routed interface + firewall zone
-            ip = subnet.split("/")[0].rsplit(".", 1)[0] + ".1"
-            mask = subnet.split("/")[1] if "/" in subnet else "24"
-            mask_full = {"8": "0.0.0.0", "16": "255.255.0.0",
-                         "24": "255.255.255.0", "30": "255.255.255.252"}.get(
-                mask, "255.255.255.0")
+            # Router: create routed interface + firewall zone. L3 (ipaddr +
+            # netmask) is derived from the CIDR subnet via _parse_subnet — the
+            # same pure helper the DHCP path uses — so any /8../30 works.
+            l3 = _parse_subnet(subnet) if subnet else None
+            if not l3:
+                raise HTTPException(400, f"invalid subnet for VLAN {vlan_id} (expected a.b.c.d/prefix)")
+            ip, mask_full = l3
             cmd = f"""uci set network.vlan_{vlan_id}=interface
 uci set network.vlan_{vlan_id}.proto='static'
 uci set network.vlan_{vlan_id}.ipaddr='{ip}'
 uci set network.vlan_{vlan_id}.netmask='{mask_full}'
 uci set network.vlan_{vlan_id}.ifname='br-lan.{vlan_id}'
+uci set network.vlan_{vlan_id}.vlan='{vlan_id}'
 """
             if dhcp:
                 cmd += f"""uci set dhcp.vlan_{vlan_id}=dhcp
@@ -2312,10 +2331,200 @@ uci commit network
         if status != 0:
             raise RuntimeError(f"VLAN config failed on {dev['name']}: {(err or out)[:200]}")
         set_pending(dev, "vlan", apply)
+        record_vlan_membership(vlan_id, dev["id"], "router" if is_router else "switch")
         log_action(dev, 'vlan', f'vlan_id={vlan_id} role={"router" if is_router else "switch"}', ok=True)
         return {"device": dev["name"], "role": "router" if is_router else "switch", "ok": True}
     finally:
         c.close()
+
+
+def vlan_delete_cmds(vlan_id):
+    """Pure: the uci script that tears down a VLAN's sections on one device.
+
+    Removes the `network.vlan_<id>` section (interface/switch), every
+    `dhcp.<x>` section whose `.interface` points at `vlan_<id>`, and the
+    `firewall.vlan_<id>` zone, then commits the three packages. The `switch`
+    package is deliberately left alone — port assignments are managed via
+    switch-ports and may be shared. Deleting absent sections is a no-op."""
+    vid = int(vlan_id)
+    return (
+        f"uci delete network.vlan_{vid} 2>/dev/null || true\n"
+        "uci commit network 2>/dev/null || true\n"
+        "for s in $(uci show dhcp 2>/dev/null | "
+        "grep -oE 'dhcp\\.[A-Za-z0-9_]+' | sort -u); do "
+        f"if [ \"$(uci -q get $s.interface 2>/dev/null)\" = 'vlan_{vid}' ]; then "
+        "uci delete $s 2>/dev/null || true; fi; done\n"
+        "uci commit dhcp 2>/dev/null || true\n"
+        f"uci delete firewall.vlan_{vid} 2>/dev/null || true\n"
+        "uci commit firewall 2>/dev/null || true\n"
+    )
+
+
+def do_vlan_delete(dev, vlan_id, apply: bool = True):
+    """Remove a VLAN's config from one device (network/dhcp/firewall sections).
+    apply=False commits deletions without restarting (LuCI 'Save')."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "VLAN delete requires SSH access")
+    vid = int(vlan_id)
+    if not (1 <= vid <= 4094):
+        raise HTTPException(400, f"invalid VLAN id {vid}")
+    cmd = vlan_delete_cmds(vid)
+    if apply:
+        cmd += _PENDING_RESTARTS["vlan"] + "\n"
+    c = _ssh_connect(dev)
+    try:
+        out, err, status = _exec_capture(c, cmd, timeout=60)
+        if status != 0:
+            raise RuntimeError(f"VLAN delete failed on {dev['name']}: {(err or out).strip()[:200]}")
+        log_action(dev, "vlan_delete", f"vlan_id={vid}", ok=True)
+        return {"device": dev["name"], "ok": True}
+    finally:
+        c.close()
+
+
+def delete_vlan_membership(vlan_id, device_id=None):
+    """Clear the membership ledger for a VLAN (optionally one device only).
+    Never raises."""
+    try:
+        if device_id is not None:
+            execute("DELETE FROM vlans_devices WHERE vlan_id=? AND device_id=?",
+                    (str(vlan_id), device_id))
+        else:
+            execute("DELETE FROM vlans_devices WHERE vlan_id=?", (str(vlan_id),))
+    except Exception:
+        pass
+
+
+def parse_mac(s):
+    """Normalize/validate a MAC: 'AA:BB:CC:DD:EE:FF' (also accepts dashes).
+    Returns lowercase colon form, or None when invalid. Pure."""
+    s = (s or "").strip().lower().replace("-", ":")
+    if not re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", s):
+        return None
+    return s
+
+
+def lease_key(lease):
+    """Identity of a static lease = its MAC (lowercase)."""
+    return parse_mac((lease or {}).get("mac"))
+
+
+def merge_leases(leases, name, mac, ip):
+    """Upsert one static lease into a list, keyed by MAC. Returns a NEW list.
+    Same MAC -> the entry is replaced (name/ip updated); new MAC -> appended.
+    Pure (no I/O)."""
+    mac = parse_mac(mac)
+    if not mac:
+        raise HTTPException(400, f"invalid MAC address: {mac!r}")
+    out = [dict(l) for l in (leases or [])]
+    for i, l in enumerate(out):
+        if lease_key(l) == mac:
+            out[i] = {"name": str(name or l.get("name") or "").strip(),
+                      "mac": mac, "ip": str(ip or l.get("ip") or "").strip()}
+            return out
+    out.append({"name": str(name or "").strip(), "mac": mac, "ip": str(ip or "").strip()})
+    return out
+
+
+def remove_leases(leases, mac):
+    """Drop every lease whose MAC matches. Returns a NEW list. Pure."""
+    mac = parse_mac(mac)
+    if not mac:
+        raise HTTPException(400, f"invalid MAC address: {mac!r}")
+    return [l for l in (leases or []) if lease_key(l) != mac]
+
+
+def validate_reservation(ip, mac, subnet=None, gateway_ip=None, leases=None):
+    """Validate a single IP reservation BEFORE any SSH. Returns an error string
+    or None when the reservation is acceptable.
+
+    Checks: MAC format; IP format; IP in the VLAN subnet (when a subnet is
+    known); IP is not the gateway address (when known); IP is not already
+    reserved for a different MAC (same-MAC re-reservation is fine — that's an
+    edit).
+    """
+    mac = parse_mac(mac)
+    if not mac:
+        return f"invalid MAC address: {mac!r}"
+    ip = (ip or "").strip()
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return f"invalid IP address: {ip!r}"
+    if a.version != 4:
+        return f"IPv4 required: {ip!r}"
+    if subnet:
+        try:
+            net = ipaddress.ip_network(subnet, strict=False)
+        except ValueError:
+            net = None  # bad subnet recorded upstream — skip containment check
+        if net and a.version == 4 and a not in net:
+            return f"IP {ip} is not in subnet {subnet}"
+    if gateway_ip:
+        try:
+            if a == ipaddress.ip_address(gateway_ip.strip()):
+                return f"IP {ip} is the VLAN gateway address"
+        except ValueError:
+            pass
+    for l in (leases or []):
+        if lease_key(l) == mac:
+            continue  # same device re-reserved — allowed (edit)
+        if str(l.get("ip") or "").strip() == ip:
+            return f"IP {ip} is already reserved for {l.get('mac')}"
+    return None
+
+
+def merge_known_devices(leases, neighbors, reservations):
+    """Merge known-device sources into one inventory, deduped by MAC.
+
+    leases: [{mac, ip, hostname}] (active /tmp/dhcp.leases); neighbors:
+    [{ip, iface, mac}] (ARP table); reservations: [{name, mac, ip}] (existing
+    static leases). Output: [{name, mac, current_ip, source(s), reserved,
+    reserved_ip}] — name prefers reservation > hostname; 'reserved' marks MACs
+    with an existing pin (reserved_ip is where it's pinned). Sorted by name.
+    Pure (no I/O)."""
+    by_mac = {}
+    def _entry(mac):
+        mac = parse_mac(mac)
+        if not mac:
+            return None
+        return by_mac.setdefault(mac, {"name": None, "mac": mac, "current_ip": None,
+                                       "sources": set(), "reserved": False, "reserved_ip": None})
+    for l in (reservations or []):
+        e = _entry((l or {}).get("mac"))
+        if not e:
+            continue
+        e["name"] = (l or {}).get("name") or e["name"]
+        e["reserved"] = True
+        e["reserved_ip"] = (l or {}).get("ip")
+    for l in (leases or []):
+        e = _entry((l or {}).get("mac"))
+        if not e:
+            continue
+        e["name"] = e["name"] or (l or {}).get("hostname")
+        e["current_ip"] = (l or {}).get("ip") or e["current_ip"]
+        e["sources"].add("lease")
+    for n in (neighbors or []):
+        e = _entry((n or {}).get("mac"))
+        if not e:
+            continue
+        e["current_ip"] = e["current_ip"] or (n or {}).get("ip")
+        e["sources"].add("arp")
+    out = []
+    for e in by_mac.values():
+        if not (e["name"] or e["current_ip"]):
+            continue  # MAC with no identity and no IP — not actionable
+        e["sources"] = sorted(e["sources"])
+        out.append(e)
+    out.sort(key=lambda x: (x["name"] or "~").lower(), reverse=False)
+    return out
+
+
+def vlan_members(vlan_id):
+    """Which devices carry a VLAN and in what role: [{device_id,name,role}]."""
+    rows = q("SELECT d.id, d.name, m.role FROM vlans_devices m JOIN devices d ON d.id=m.device_id "
+             "WHERE m.vlan_id=? ORDER BY m.role DESC, d.id", (str(vlan_id),))
+    return [{"device_id": r["id"], "name": r["name"], "role": r["role"]} for r in rows]
 
 
 def do_mesh(dev, cfg, apply: bool = True):
@@ -3021,6 +3230,54 @@ async def apply_vlan(request: Request):
                 (str(vlan_id), name, subnet, 1 if dhcp else 0, now()))
     return {"results": results}
 
+@app.get("/api/devices/{did}/vlans/{vid}")
+def read_vlan_state_endpoint(did: int, vid: int):
+    """Live state of one VLAN on one device — subnet, DHCP, zone policy.
+    The UI's 'edit' prefill and post-apply verification both read this."""
+    dev = _require_device(did)
+    r = read_vlan_state(dev, vid)
+    if r.get("error"):
+        if r["error"].startswith("luci-only"):
+            return {"device": dev["name"], "vlan_id": str(vid), "configured": False}
+        raise HTTPException(502, f"VLAN read failed on {dev['name']}: {r['error']}")
+    configured = bool(r.get("subnet") or r.get("dhcp") or r.get("zone"))
+    return {"device": dev["name"], "vlan_id": str(vid), "configured": configured,
+            "subnet": r.get("subnet"), "dhcp": r.get("dhcp"), "zone": r.get("zone")}
+
+
+@app.post("/api/vlans/delete")
+async def delete_vlan(request: Request):
+    """Remove a VLAN's config from the selected devices (default: all members).
+    Body: {vlan_id, devices?: [id,...], apply?: bool (default true)}.
+    Clears the membership ledger for each device it touched."""
+    d = await request.json()
+    vlan_id = d.get("vlan_id")
+    if not vlan_id:
+        raise HTTPException(400, "vlan_id required")
+    apply = d.get("apply") is not False
+    devs = [int(x) for x in (d.get("devices") or [])]
+    if not devs:
+        devs = [m["device_id"] for m in vlan_members(vlan_id)]
+    if not devs:
+        # Discovered-but-never-applied VLAN: no membership ledger — ask every
+        # SSH device to drop its sections (deletes are idempotent no-ops).
+        devs = [r["id"] for r in q("SELECT id FROM devices WHERE access='ssh'")]
+    results = []
+    for did in devs:
+        cur = q("SELECT * FROM devices WHERE id=?", (did,))
+        if not cur:
+            continue
+        try:
+            r = do_vlan_delete(cur[0], vlan_id, apply=apply)
+            delete_vlan_membership(vlan_id, did)
+            results.append(r)
+        except Exception as e:
+            results.append({"device": cur[0]["name"], "ok": False, "error": str(e)})
+    if results and any(r.get("ok") for r in results):
+        execute("DELETE FROM vlans WHERE vlan_id=?", (str(vlan_id),))
+    return {"results": results}
+
+
 @app.post("/api/dhcp/apply")
 async def apply_dhcp(request: Request):
     """Apply a FULL per-VLAN DHCP section to a device: pool (start/limit/lease/mode),
@@ -3164,6 +3421,71 @@ def dhcp_read(did: int):
     if dev["access"] != "ssh":
         raise HTTPException(400, "DHCP read requires SSH access on this device")
     return {"saved": _saved_dhcp_rows(dev["id"]), "live": _read_live_dhcp(dev)}
+
+def parse_dhcp_leases(raw):
+    """Pure parser for /tmp/dhcp.leases: lines are
+    'expire mac ip [hostname]' -> [{mac, ip, hostname}]."""
+    out = []
+    for line in (raw or "").splitlines():
+        p = line.split()
+        if len(p) >= 3 and parse_mac(p[1]):
+            out.append({"mac": p[1].lower(), "ip": p[2],
+                        "hostname": p[3] if len(p) > 3 else ""})
+    return out
+
+
+def read_arp_neighbors(dev):
+    """ARP table from a device: [{ip, iface, mac}] (like the gather's
+    'ip neigh show' line). Returns [] on failure — the picker degrades to
+    leases-only rather than erroring."""
+    if dev["access"] != "ssh":
+        return []
+    try:
+        c = _ssh_connect(dev)
+        try:
+            out, _e, _s = _exec_capture(
+                c, "ip neigh show 2>/dev/null | awk '/^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/{print $1\"\\t\"$3\"\\t\"$5}'",
+                timeout=20)
+        finally:
+            c.close()
+        res = []
+        for line in out.splitlines():
+            p = line.split("\t")
+            if len(p) >= 3 and parse_mac(p[2]):
+                res.append({"ip": p[0], "iface": p[1], "mac": p[2].lower()})
+        return res
+    except Exception:
+        return []
+
+
+def build_lease_cmds(iface: str, leases, apply: bool = True) -> str:
+    """Pure: uci script that REPLACES the static-lease list of one dhcp
+    section (mirrored under dnsmasq `dhcp_host` + odhcpd `host`, matching
+    build_dhcp_cmds) and commits. Scoped to leases only — pool/options/ipv6
+    fields of the section are untouched, so a single-lease upsert can't clobber
+    them. apply=True also reloads whichever DHCP daemon is present."""
+    iface = str(iface).strip()
+    if not re.match(r"^[A-Za-z0-9_]+$", iface):
+        raise HTTPException(400, "invalid interface name")
+    s = f"dhcp.{iface}"
+    lines = [
+        f"uci del {s}.dhcp_host 2>/dev/null || true",
+        f"uci del {s}.host 2>/dev/null || true",
+    ]
+    for h in (leases or []):
+        name = str(h.get("name") or "").strip()
+        mac = parse_mac(h.get("mac"))
+        ip = str(h.get("ip") or "").strip()
+        if not (name and mac and ip):
+            raise HTTPException(400, f"static lease missing name/mac/ip: {h!r}")
+        text = f"{name}, {mac}, {ip}"
+        lines.append(f"uci add_list {s}.dhcp_host={_uci_quote(text)}")
+        lines.append(f"uci add_list {s}.host={_uci_quote(text)}")
+    lines.append("uci commit dhcp")
+    if apply:
+        lines.append("/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/odhcpd reload 2>/dev/null || true")
+    return "\n".join(lines) + "\n"
+
 
 def _saved_dhcp_rows(device_id):
     rows = q("SELECT * FROM dhcp WHERE device_id=? ORDER BY vlan_id", (device_id,))
@@ -3348,6 +3670,129 @@ async def get_dhcp_leases(request: Request):
     finally:
         c.close()
 
+@app.get("/api/dhcp/devices")
+async def dhcp_known_devices(request: Request):
+    """Known-device inventory for the IP-reservation picker: active leases +
+    ARP neighbors + existing reservations, merged and deduped by MAC.
+    Query: did (required), vlan_id (optional — scopes the subnet badge)."""
+    did = request.query_params.get("did")
+    if not did:
+        raise HTTPException(400, "did required")
+    dev = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not dev:
+        raise HTTPException(404, "device not found")
+    dev = dev[0]
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "known-devices requires SSH access")
+    leases = []
+    try:
+        c = _ssh_connect(dev)
+        try:
+            _, out, _ = _exec_capture(c, "cat /tmp/dhcp.leases 2>/dev/null", timeout=10)
+        finally:
+            c.close()
+        leases = parse_dhcp_leases(out)
+    except Exception:
+        leases = []  # leases unavailable -> picker still works from ARP/reservations
+    neighbors = read_arp_neighbors(dev)
+    # existing reservations = static leases in the live sections for this VLAN
+    reservations = []
+    vid = (request.query_params.get("vlan_id") or "").strip()
+    if vid:
+        try:
+            secs = _read_live_dhcp(dev)
+            if isinstance(secs, list):
+                for sec in secs:
+                    if (sec.get("iface") == f"vlan_{vid}"
+                            or str(sec.get("vlan_id") or "") == str(vid)):
+                        reservations = sec.get("static_leases") or []
+                        break
+        except Exception:
+            reservations = []
+    devices = merge_known_devices(leases, neighbors, reservations)
+    log_action(dev, "dhcp_devices_list", f"leases={len(leases)} arp={len(neighbors)} reserved={len(reservations)}", ok=True)
+    return {"device": dev["name"], "count": len(devices), "devices": devices,
+            "lease_count": len(leases), "arp_count": len(neighbors)}
+
+
+@app.post("/api/dhcp/reserve")
+async def dhcp_reserve(request: Request):
+    """Reserve (or release) one IP for a MAC on a VLAN — a single-lease upsert
+    on the existing per-VLAN DHCP section (atomic, no load-mutate-resend).
+    Body: {did, vlan_id, name, mac, ip?, remove?: bool, apply?: bool (default true)}."""
+    d = await request.json()
+    did = d.get("did")
+    vid = str(d.get("vlan_id") or "").strip()
+    if not did or not vid:
+        raise HTTPException(400, "did and vlan_id required")
+    dev = q("SELECT * FROM devices WHERE id=?", (did,))
+    if not dev:
+        raise HTTPException(404, "device not found")
+    dev = dev[0]
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "DHCP reserve requires SSH access")
+    apply = d.get("apply") is not False
+    remove = bool(d.get("remove"))
+    name = str(d.get("name") or "").strip()
+    mac = parse_mac(d.get("mac"))
+    ip = str(d.get("ip") or "").strip()
+    if not mac:
+        raise HTTPException(400, f"invalid MAC address: {d.get('mac')!r}")
+    if remove:
+        if not name:
+            name = "released"
+        if not ip:
+            raise HTTPException(400, "ip required to remove a reservation")
+    else:
+        if not (name and ip):
+            raise HTTPException(400, "name and ip required to reserve")
+        try:
+            if ipaddress.ip_address(ip).version != 4:
+                raise ValueError
+        except ValueError:
+            raise HTTPException(400, f"invalid IP address: {ip!r}")
+
+    # Read the current section so we merge, not clobber, and validate against it.
+    live = _read_live_dhcp(dev)
+    secs = live if isinstance(live, list) else []
+    iface = f"vlan_{vid}"
+    current = []
+    subnet = None
+    for sec in secs:
+        if (sec.get("iface") == iface or str(sec.get("vlan_id") or "") == str(vid)):
+            current = sec.get("static_leases") or []
+            subnet = sec.get("subnet")
+            break
+    if not current and not remove:
+        # fall back to the saved row's leases (section may exist only in the DB)
+        for row in q("SELECT * FROM dhcp WHERE device_id=? AND vlan_id=?", (did, vid)):
+            try:
+                current = json.loads(row["static_leases"]) if row["static_leases"] else []
+            except Exception:
+                current = []
+            break
+    err = validate_reservation(ip, mac, subnet=subnet,
+                               leases=current)
+    if err:
+        raise HTTPException(400, err)
+    if remove:
+        new_leases = remove_leases(current, mac)
+    else:
+        new_leases = merge_leases(current, name, mac, ip)
+    cmd = build_lease_cmds(iface, new_leases, apply=apply)
+    c = _ssh_connect(dev)
+    try:
+        out, err_out, status = _exec_capture(c, cmd, timeout=60)
+        if status != 0:
+            raise RuntimeError(f"reservation failed on {dev['name']}: {(err_out or out).strip()[:200]}")
+        set_pending(dev, "dhcp", apply)
+        log_action(dev, "dhcp_reserve", f"vlan={vid} mac={mac} ip={ip} remove={remove}", ok=True)
+        return {"device": dev["name"], "ok": True, "vlan_id": vid, "mac": mac,
+                "ip": ip, "removed": remove, "lease_count": len(new_leases)}
+    finally:
+        c.close()
+
+
 @app.post("/api/dns/apply")
 async def apply_dns(request: Request):
     """Apply DNS servers for the device's active DHCP/DNS backend (odhcpd or dnsmasq)."""
@@ -3491,10 +3936,16 @@ def _read_live_dns(dev):
 
 @app.get("/api/vlans")
 def list_vlans():
-    """Known VLANs (recorded when applied). Shape for the WiFi modal: [{id, name, subnet, dhcp}]."""
+    """Known VLANs (recorded when applied). Shape: [{id,name,subnet,dhcp,
+    members:[{device_id,name,role}]}] — members is the per-device membership
+    ledger (router carries it routed, switches carry it tagged)."""
     rows = q("SELECT * FROM vlans ORDER BY CAST(vlan_id AS INTEGER) DESC, vlan_id DESC")
-    return [{"id": r["vlan_id"], "name": r["name"], "subnet": r["subnet"],
-             "dhcp": bool(r["dhcp"])} for r in rows]
+    out = []
+    for r in rows:
+        out.append({"id": r["vlan_id"], "name": r["name"], "subnet": r["subnet"],
+                    "dhcp": bool(r["dhcp"]), "created_at": r["created_at"],
+                    "members": vlan_members(r["vlan_id"])})
+    return out
 
 
 # ─────────────────────────── QoS + firewall API ─────────────────────────────
@@ -3660,6 +4111,108 @@ def parse_vlan_ids(output):
     return sorted(ids)
 
 
+def parse_switch_vlans(output):
+    """Pure parser: map VLAN id -> {ports:[str], tag:int|None} from `uci show switch`.
+
+    OpenWrt switch-port VLANs live in the `switch` package, not `network`:
+    ``switch.switch0.vlan2='2'`` and ``switch.switch0.vlan2.ports='1 2'``
+    (tag is a value suffix, e.g. ``1t``, or its own ``tag`` option).
+    """
+    vlans = {}
+    for line in (output or "").splitlines():
+        line = line.strip()
+        m = re.match(r"^switch\.\w+\.vlan(\d+)='?(\d+)'?$", line)
+        if m:
+            vlans.setdefault(m.group(1), {"ports": [], "tag": None})
+            continue
+        m = re.match(r"^switch\.\w+\.vlan(\d+)\.ports='?([^']*)'?$", line)
+        if m and m.group(1) in vlans:
+            ports = (m.group(2) or "").split()
+            for p in ports:
+                if p.endswith("t") and p[:-1].isdigit():
+                    vlans[m.group(1)]["tag"] = int(p[:-1])
+                vlans[m.group(1)]["ports"].append(p)
+            continue
+        m = re.match(r"^switch\.\w+\.vlan(\d+)\.tag='?(\d+)'?$", line)
+        if m and m.group(1) in vlans:
+            vlans[m.group(1)]["tag"] = int(m.group(2))
+    return vlans
+
+
+def read_switch_ports(dev):
+    """Read switch-port VLAN assignments from a device. Returns
+    {'name','host','switches':{'switch0':{vid:{ports,tag}}},'error'} or
+    {'error':str} when the box has no switch package (e.g. wifi-only AP)."""
+    if dev["access"] != "ssh":
+        return {"name": dev.get("name"), "host": dev.get("host"), "switches": {},
+                "error": "luci-only device skipped"}
+    try:
+        c = _ssh_connect(dev)
+        try:
+            out, _e, _s = _exec_capture(c, "uci show switch 2>/dev/null; true", timeout=30)
+        finally:
+            c.close()
+        if not out.strip():
+            return {"name": dev.get("name"), "host": dev.get("host"),
+                    "switches": {}, "error": None}
+        parsed = parse_switch_vlans(out)
+        devs = sorted(set(re.findall(r"^switch\.(\w+)\.", out, re.M)))
+        if devs:
+            # One physical switch per device is the normal case; attribute the
+            # parsed VLANs to it (a box with several switches shares the map —
+            # the VLAN ids are per-device unique in practice).
+            return {"name": dev.get("name"), "host": dev.get("host"),
+                    "switches": {devs[0]: parsed}, "error": None}
+        return {"name": dev.get("name"), "host": dev.get("host"),
+                "switches": {}, "error": None}
+    except Exception as e:
+        return {"name": dev.get("name"), "host": dev.get("host"),
+                "switches": {}, "error": str(e)}
+
+
+def do_vlan_port(dev, switch_dev, vlan_id, ports, tag=None, apply: bool = True):
+    """Assign switch ports to a VLAN in the `switch` package (the real home of
+    port tagging — `network` only carries the routed interface).
+
+    ports: list of port tokens (e.g. ['1','2'] or ['1t']). tag: int port that
+    carries the native tag (rewritten as 'Nt'). Idempotent per (vlan,port).
+    apply=False commits without restarting (LuCI 'Save')."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "switch port config requires SSH access")
+    switch_dev = (switch_dev or "switch0").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", switch_dev):
+        raise HTTPException(400, f"invalid switch device name {switch_dev!r}")
+    vid = int(vlan_id)
+    if not (1 <= vid <= 4094):
+        raise HTTPException(400, f"invalid VLAN id {vid}")
+    clean = []
+    for p in ports or []:
+        p = str(p).strip()
+        if not re.fullmatch(r"\d+t?", p) or not p[:-1].isdigit():
+            raise HTTPException(400, f"invalid switch port {p!r}")
+        clean.append(p)
+    if tag is not None and str(tag) + "t" not in clean:
+        clean = [p if p != str(tag) else p + "t" for p in clean]
+    if not clean:
+        raise HTTPException(400, "at least one port required")
+    cmd = (
+        f"uci set switch.{switch_dev}.vlan{vid}='{vid}'\n"
+        f"uci set switch.{switch_dev}.vlan{vid}.ports='{ ' '.join(clean) }'\n"
+        "uci commit switch\n"
+    )
+    if apply:
+        cmd += "switch reset 2>/dev/null || /etc/init.d/network restart 2>/dev/null || true\n"
+    c = _ssh_connect(dev)
+    try:
+        out, err, status = _exec_capture(c, cmd, timeout=60)
+        if status != 0:
+            raise RuntimeError(f"switch port config failed on {dev['name']}: {(err or out).strip()[:200]}")
+        log_action(dev, "vlan_port", f"switch={switch_dev} vlan={vid} ports={clean}", ok=True)
+        return {"device": dev["name"], "ok": True, "switch": switch_dev, "vlan": vid, "ports": clean}
+    finally:
+        c.close()
+
+
 def netmask_to_prefix(mask):
     """'255.255.255.0' -> 24. Returns None on garbage input."""
     try:
@@ -3747,6 +4300,43 @@ def discover_vlans(dev):
                 "details": {}, "error": str(e)}
 
 
+def read_vlan_state(dev, vlan_id):
+    """Read the live state of one VLAN on a device (edit prefill + verification).
+
+    Reuses the pure parsers: `parse_vlan_details` for the routed interface's
+    subnet + DHCP flag, `parse_firewall` for the zone policy. Returns
+    {'name','host','subnet','dhcp','zone':{input,output,forward}|None,'error'}
+    — 'error' only on SSH failure, not when the VLAN simply isn't configured.
+    """
+    if dev["access"] != "ssh":
+        return {"name": dev.get("name"), "host": dev.get("host"), "error":
+                "luci-only device skipped"}
+    try:
+        c = _ssh_connect(dev)
+        try:
+            net, _e1, _s1 = _exec_capture(c, "uci show network 2>/dev/null", timeout=30)
+            dhc, _e2, _s2 = _exec_capture(c, "uci show dhcp 2>/dev/null", timeout=30)
+            fw, _e3, _s3 = _exec_capture(c, "uci show firewall 2>/dev/null", timeout=30)
+        finally:
+            c.close()
+        vid = str(vlan_id)
+        det = parse_vlan_details(net, dhc).get(int(vlan_id)) or {}
+        zone = None
+        parsed_fw = parse_firewall(fw)
+        want_name = f"vlan_{vid}"
+        for z in parsed_fw.get("zones", []):
+            if z.get("name") == want_name or z.get("network") == want_name:
+                zone = {"input": z.get("input"), "output": z.get("output"),
+                        "forward": z.get("forward")}
+                break
+        return {"name": dev.get("name"), "host": dev.get("host"),
+                "vlan_id": vid, "subnet": det.get("subnet"),
+                "dhcp": bool(det.get("dhcp")), "zone": zone, "error": None}
+    except Exception as e:
+        return {"name": dev.get("name"), "host": dev.get("host"),
+                "vlan_id": str(vlan_id), "error": str(e)}
+
+
 def _upsert_discovered_vlan(vlan_id, name, subnet, dhcp):
     """Insert a discovered VLAN without clobbering fields already set by an apply."""
     execute("INSERT INTO vlans(vlan_id, name, subnet, dhcp, created_at) VALUES(?,?,?,?,?) "
@@ -3785,6 +4375,37 @@ async def discover_vlans_endpoint(request: Request):
     return {"devices_scanned": len(devs), "results": results,
             "vlans_found": all_ids, "vlans": list_vlans()}
 
+
+@app.get("/api/devices/{did}/switch-ports")
+def get_switch_ports(did: int):
+    """Read switch-port VLAN assignments (the `switch` package) from a device.
+    WiFi-only APs return an empty switches map, not an error."""
+    dev = _require_device(did)
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "switch port read requires SSH access")
+    r = read_switch_ports(dev)
+    if r.get("error"):
+        # A missing switch package is a normal, non-fatal condition.
+        if r["error"].startswith("luci-only") or r["error"] == "no switch":
+            return {"device": dev["name"], "switches": {}}
+        raise HTTPException(502, f"switch read failed on {dev['name']}: {r['error']}")
+    return {"device": dev["name"], "switches": r.get("switches") or {}}
+
+
+@app.post("/api/devices/{did}/switch-ports")
+async def apply_switch_ports(request: Request, did: int):
+    """Assign switch ports to a VLAN on one device. Body:
+    {switch?: 'switch0', vlan_id: int, ports: ['1','2'...], tag?: int,
+     apply?: bool (default true)}. Replaces the port list for that VLAN."""
+    d = await request.json()
+    dev = _require_device(did)
+    apply = d.get("apply") is not False
+    vlan_id = d.get("vlan_id")
+    if not vlan_id:
+        raise HTTPException(400, "vlan_id required")
+    r = do_vlan_port(dev, d.get("switch", "switch0"), vlan_id,
+                     d.get("ports") or [], d.get("tag"), apply=apply)
+    return r
 
 
 @app.get("/api/devices/{did}/packages")
