@@ -515,13 +515,51 @@ async function renderConsistency(box){
       rows+=`<tr><td><strong>${labels[f]||f}</strong></td><td><span class="badge b-online">ok</span></td><td class="small muted">uniform: ${esc(String(info.uniform_value))} on all ${d.devices}</td></tr>`;
     }
   }
-  const banner=d.count?`<div class="card" style="border-color:var(--err);margin-bottom:16px"><h3>⚠ ${d.count} field(s) diverge across your ${d.devices} devices</h3><p class="small muted">Boxes have drifted — consider re-baselining so the whole network stays one configurable device.</p></div>`
+  const banner=d.count?`<div class="card" style="border-color:var(--err);margin-bottom:16px">
+      <h3>⚠ ${d.count} field(s) diverge across your ${d.devices} devices</h3>
+      <p class="small muted" style="margin-top:2px">Boxes have drifted — bring them back to the fleet baseline in one action.</p>
+      <div id="reb-preview" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:10px;align-items:center;gap:8px">
+        <button class="act pri" onclick="rebaselineAll()">Re-baseline all devices</button>
+        <label class="small muted"><input type="checkbox" id="reb-sysup"> include sysupgrade (firmware)</label>
+      </div>
+    </div>`
     :`<div class="card" style="border-color:var(--ok);margin-bottom:16px"><h3>✓ All ${d.devices} devices are consistent</h3><p class="small muted">Firmware and key packages match across the fleet.</p></div>`;
   box.innerHTML=`${banner}
     <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
     <thead><tr><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Field</th><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Status</th><th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">Detail</th></tr></thead>
     <tbody>${rows}</tbody></table></div>
     <p class="small muted" style="margin-top:12px">Snapped at: ${d.rows.map(r=>esc(r.name)+' '+esc(r.snapshot_at||'')).join(' · ')}</p>`;
+  // Load the re-baseline preview (which boxes lag, and what the baseline is).
+  try{
+    const pv=await api('/rebaseline/preview');
+    const el=document.getElementById('reb-preview');
+    if(el && pv.lagging && pv.lagging.length){
+      const bl=[];
+      if(pv.baseline_firmware)bl.push('firmware '+esc(pv.baseline_firmware));
+      for(const [k,v] of Object.entries(pv.baseline||{}))bl.push(k+' '+esc(v));
+      const lag=pv.lagging.map(l=>{
+        const diffs=Object.entries(l.differs).map(([k,v])=>`${k}: <strong>${esc(String(v))}</strong>`).join(' · ');
+        return `<div class="small" style="margin:3px 0"><strong>${esc(l.name)}</strong> <span class="muted">${esc(l.host)}</span> — ${diffs}</div>`;
+      }).join('');
+      el.innerHTML=`<div class="muted small">Baseline: ${bl.join(' · ')||'—'}</div>
+        <div class="muted small" style="margin-top:4px">${pv.lagging.length} device(s) lagging:</div>${lag}`;
+    }
+  }catch(e){/* preview is best-effort */}
+}
+async function rebaselineAll(){
+  const sysup=document.getElementById('reb-sysup')?.checked||false;
+  const what=sysup?'packages AND firmware (sysupgrade)':'packages (dnsmasq/odhcpd/openwrt)';
+  if(!confirm(`Re-baseline ALL devices: ${what}?\n\nThis refreshes feeds and upgrades the compared packages on every box. Long-running.`))return;
+  toast('Re-baselining all devices… (may take several minutes)');
+  try{
+    const r=await api('/rebaseline/apply',{method:'POST',body:JSON.stringify({sysupgrade:sysup})});
+    if(r.failed)toast(`Re-baselined ${r.ok}, ${r.failed} failed`,true);
+    else toast('Re-baselined '+r.ok+' device(s)');
+    // refresh the consistency + preview
+    const box=document.getElementById('net-detail');
+    if(box)renderConsistency(box);
+  }catch(e){toast(String(e),true)}
 }
 
 async function renderFleetPkgs(box){

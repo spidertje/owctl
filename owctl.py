@@ -270,7 +270,7 @@ _ADMIN_ONLY_PATHS = {
     "/api/devices", "/api/devices/{did}", "/api/devices/{did}/backup",
     "/api/devices/{did}/restore", "/api/devices/{did}/reboot",
     "/api/devices/{did}/upgrade", "/api/devices/{did}/push-key",
-    "/api/fleet/upgrade",
+    "/api/fleet/upgrade", "/api/rebaseline/apply",
     "/api/devices/{did}/guest-wifi", "/api/devices/{did}/wifi-clone",
     "/api/dhcp/apply", "/api/dns/apply", "/api/firewall/apply",
     "/api/qos/apply", "/api/vlans/apply", "/api/vlans/discover",
@@ -2876,6 +2876,143 @@ def drift_report():
             "fields": fields, "divergent": divergent,
             "rows": [{k: r[k] for k in ("name", "host", "online", "snapshot_at")} |
                      {"values": r["values"]} for r in rows]}
+
+
+def _ver_key(v):
+    """Comparable numeric tuple from a package version string (best-effort).
+    '2.90' -> (2, 90), '1:2.3' -> (1, 2, 3); non-numeric runs -> 0."""
+    import re as _re
+    out = []
+    for tok in _re.split(r"[.:\-+~]", str(v)):
+        out.append(int(tok) if tok.isdigit() else 0)
+    return tuple(out)
+
+
+def do_rebaseline(dev, packages, sysupgrade=False):
+    """Bring one device back to baseline: refresh feeds, upgrade the listed
+    packages (each made idempotent so an absent one doesn't fail the batch),
+    optionally run sysupgrade -n (no-reboot) for a firmware align.
+    Returns the command output (truncated). Raises on a hard failure."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "re-baseline requires SSH access on this device")
+    safe = []
+    for p in packages or []:
+        p = str(p)
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]+", p):
+            raise HTTPException(400, f"invalid package name {p!r}")
+        safe.append(p)
+    parts = ["opkg update 2>/dev/null || true"]
+    for p in safe:
+        parts.append(f"opkg upgrade -y {p} 2>/dev/null || opkg install -y {p} 2>/dev/null || true")
+    cmd = "\n".join(parts) + "\n"
+    if sysupgrade:
+        cmd += "sysupgrade -n 2>/dev/null || opkg upgrade -y base 2>/dev/null || true\n"
+    c = _ssh_connect(dev)
+    try:
+        out, err, status = _exec_capture(c, cmd, timeout=3600)
+        result = (out.strip() + "\n--- stderr ---\n" + (err or "").strip()).strip()
+        if status not in (0,):
+            raise RuntimeError(f"re-baseline exited {status} on {dev['name']}")
+    finally:
+        c.close()
+    log_action(dev, "rebaseline",
+               f"packages={','.join(safe) or 'none'} sysupgrade={bool(sysupgrade)}", ok=True)
+    return result[:30000]
+
+
+@app.get("/api/rebaseline/preview")
+def rebaseline_preview():
+    """Which devices lag behind the fleet baseline and what the baseline is.
+    Baseline = the most common firmware among snapshot-carrying devices and
+    the latest known version of each compared package. Read-only (snapshots)."""
+    fields = ["dnsmasq", "odhcpd", "openwrt"]
+    rows = []
+    for dev in q("SELECT * FROM devices ORDER BY id"):
+        st = q("SELECT * FROM device_status WHERE device_id=? LIMIT 1", (dev["id"],))
+        if not st:
+            continue
+        st = st[0]
+        pkgs = []
+        try:
+            pkgs = json.loads(st["installed_pkgs"]) if st["installed_pkgs"] else []
+        except Exception:
+            pkgs = []
+        def _ver(name):
+            for p in pkgs:
+                if isinstance(p, dict) and p.get("pkg") == name:
+                    return p.get("version")
+            return None
+        rows.append({
+            "device_id": dev["id"], "name": dev["name"], "host": dev["host"],
+            "online": dev["status"] == "online",
+            "firmware": st.get("firmware"),
+            "versions": {f: _ver(f) for f in fields},
+        })
+    if len(rows) < 2:
+        return {"baseline": {}, "baseline_firmware": None, "lagging": [],
+                "device_count": len(rows),
+                "note": "need at least 2 devices with status snapshots"}
+    # Most common firmware (tie -> lexicographically latest).
+    fw = {}
+    for r in rows:
+        if r["firmware"]:
+            fw[r["firmware"]] = fw.get(r["firmware"], 0) + 1
+    baseline_firmware = max(fw.items(), key=lambda kv: (kv[1], kv[0]))[0] if fw else None
+    baseline = {}
+    for f in fields:
+        best = None
+        for r in rows:
+            v = r["versions"].get(f)
+            if not v:
+                continue
+            if best is None or _ver_key(v) > _ver_key(best):
+                best = v
+        if best is not None:
+            baseline[f] = best
+    lagging = []
+    for r in rows:
+        diff = {}
+        if r["firmware"] and baseline_firmware and r["firmware"] != baseline_firmware:
+            diff["firmware"] = r["firmware"]
+        for f in fields:
+            bv = baseline.get(f)
+            dv = r["versions"].get(f)
+            if bv and (not dv or _ver_key(dv) < _ver_key(bv)):
+                diff[f] = dv
+        if diff:
+            lagging.append({"device_id": r["device_id"], "name": r["name"],
+                            "host": r["host"], "differs": diff})
+    return {"baseline_firmware": baseline_firmware, "baseline": baseline,
+            "lagging": lagging, "device_count": len(rows)}
+
+
+@app.post("/api/rebaseline/apply")
+async def rebaseline_apply(request: Request):
+    """Re-baseline a scoped set of devices (default: every device): refresh
+    feeds, upgrade the compared packages, optional sysupgrade. Per-device
+    error isolation — one box failing never aborts the fleet. Long-running."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    packages = body.get("packages") or ["dnsmasq", "odhcpd", "openwrt"]
+    sysupgrade = bool(body.get("sysupgrade"))
+    devices = body.get("devices") or [d["id"] for d in q("SELECT id FROM devices ORDER BY id")]
+    results = []
+    for did in devices:
+        cur = q("SELECT * FROM devices WHERE id=?", (did,))
+        if not cur:
+            results.append({"device_id": did, "name": "?", "ok": False, "error": "unknown device"})
+            continue
+        dev = cur[0]
+        try:
+            out = do_rebaseline(dev, packages, sysupgrade=sysupgrade)
+            results.append({"device_id": did, "name": dev["name"], "ok": True,
+                            "output": out[-4000:]})
+        except Exception as e:
+            results.append({"device_id": did, "name": dev["name"], "ok": False, "error": str(e)})
+    ok = sum(1 for r in results if r["ok"])
+    return {"ok": ok, "failed": len(results) - ok, "results": results}
 
 
 # --------------------------------------------------------------------- security
