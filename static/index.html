@@ -649,6 +649,69 @@ async function fleetUpgradeAll(){
   }catch(e){toast(String(e),true)}
 }
 
+async function devReserve(did,name){
+  let vlans=[];
+  try{ vlans=(await api('/vlans').catch(()=>[])); }catch(e){ vlans=[]; }
+  if(!vlans.length){ toast('No VLANs configured — create one in Network → VLANs first',true); return; }
+  let data={devices:[]};
+  try{
+    data=await api('/dhcp/devices?did='+did);
+  }catch(e){ toast('Could not read known devices: '+String(e),true); return; }
+  const devs=data.devices||[];
+  if(!devs.length){ toast('No ARP neighbors or active leases found on '+name, true); return; }
+  const vlanOpts=vlans.map(v=>{
+    const vid=v.id??v.vlan_id;
+    return `<option value="${vid}">VLAN ${vid}${v.name?' — '+esc(v.name):''}</option>`;
+  }).join('');
+  const rows=devs.map(d=>{
+    const st=d.reserved?`<span class="badge b-online">reserved ${esc(d.reserved_ip||'')}</span>`
+      :`<button class="act" onclick="devReservePick(${did},'${esc(name)}','${esc(d.mac)}','${esc(d.name||'')}','${esc(d.current_ip||'')}',this)">Reserve</button>`;
+    return `<tr>
+      <td style="padding:4px 8px">${esc(d.name||'—')}</td>
+      <td style="padding:4px 8px;font-family:monospace;font-size:12px">${esc(d.mac)}</td>
+      <td style="padding:4px 8px;font-family:monospace;font-size:12px">${esc(d.current_ip||'')}</td>
+      <td style="padding:4px 8px">${st}</td>
+    </tr>`;
+  }).join('');
+  const modal=document.createElement('div');
+  modal.className='dev-reserve';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;min-width:560px;max-width:780px;max-height:75vh;overflow:auto">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 style="margin:0">Reserve an IP on ${esc(name)}</h3>
+      <button class="act" onclick="document.querySelector('.dev-reserve')?.remove()">Close</button>
+    </div>
+    <p class="muted small" style="margin:0 0 10px">${data.lease_count||0} active leases · ${data.arp_count||0} ARP neighbors. Pick a VLAN for the reservation, then a device.</p>
+    <div class="row" style="align-items:flex-end;margin-bottom:10px">
+      <div><label>Target VLAN</label><select id="dev-reserve-vlan">${vlanOpts}</select></div>
+    </div>
+    <table style="width:100%;border-collapse:collapse">
+      <thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)">Name</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)">MAC</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)">Current IP</th><th style="padding:4px 8px;border-bottom:1px solid var(--line)"></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.onclick=e=>{if(e.target===modal)modal.remove()};
+}
+async function devReservePick(did,devName,mac,name,ip,btn){
+  const sel=document.getElementById('dev-reserve-vlan');
+  const vid=sel?sel.value:'';
+  if(!vid){toast('Pick a target VLAN first',true);return}
+  if(!ip){
+    ip=prompt('No current IP found — enter the IP to reserve for '+(name||mac)+':','');
+    if(!ip)return;
+  }
+  if(btn)btn.disabled=true;
+  try{
+    toast('Reserving '+ip+' for '+(name||mac)+' on VLAN '+vid+'…');
+    const r=await api('/dhcp/reserve',{method:'POST',body:JSON.stringify({
+      did, vlan_id:vid, name:name||mac, mac, ip, apply:true})});
+    toast('Reserved '+ip+' → '+(name||mac)+' on VLAN '+vid+' ('+r.lease_count+' total leases)');
+    document.querySelector('.dev-reserve')?.remove();
+    refreshPendingBadge&&refreshPendingBadge();
+  }catch(e){ toast('Reserve failed: '+String(e),true); if(btn)btn.disabled=false; }
+}
+
 async function renderDevices(){
   const devs=await api('/devices');
   const host=document.getElementById('tab-devices');
@@ -695,6 +758,7 @@ async function renderDevices(){
         <button class="act" onclick="chk(${d.id})">Check now</button>
         <button class="act" onclick="backup(${d.id})">Backup</button>
         <button class="act" onclick="openUpgrades(${d.id})">Updates</button>
+        ${d.access==='ssh'?'<button class="act" onclick="devReserve('+d.id+',\''+esc(d.name)+'\')">Reserve IP</button>':''}
         <button class="act" onclick="reboot(${d.id})">Reboot</button>
         <button class="act" onclick="restore(${d.id})">Restore</button>
         <button class="act" onclick="showConfigHistory(${d.id})">Config History</button>
