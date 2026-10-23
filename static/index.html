@@ -1392,7 +1392,11 @@ function toggleDropdown(e) {
   e.stopPropagation();
 }
 document.addEventListener('click', toggleDropdown);
-document.querySelector('.dropdown button').addEventListener('click', e => e.stopPropagation());
+// NOTE: toggleDropdown already calls e.stopPropagation() for dropdown clicks.
+// (A previous `document.querySelector('.dropdown button').addEventListener(...)`
+//  here crashed on a clean install: the .dropdown element is created later by
+//  renderDevices(), so querySelector returned null and its .addEventListener
+//  threw, killing bootApp() and the first-boot login screen.)
 async function restore(id){
   try{
     const bks=await api('/backups');
