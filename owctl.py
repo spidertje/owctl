@@ -22,6 +22,9 @@ config backups, and configurable alerting (dashboard / email / Telegram / webhoo
 Run:  python owctl.py   (serves API + dashboard, default 0.0.0.0:8090)
 """
 import base64
+import faulthandler
+import logging
+import sys
 import bcrypt
 import ipaddress
 import json
@@ -36,7 +39,6 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -52,8 +54,54 @@ DATA_DIR = os.environ.get("OWCTL_DATA", os.path.join(BASE, "data"))
 DB_PATH = os.path.join(DATA_DIR, "owctl.db")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
-
+LOG_PATH = os.environ.get("OWCTL_LOG", os.path.join(DATA_DIR, "owctl.log")).strip()
 SEV_RANK = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+SERVER_STARTED_AT = time.time()
+
+
+def _setup_logging():
+    """Persistent rotating log (DATA_DIR/owctl.log, override via OWCTL_LOG).
+
+    Every 'owctl' log line, every unhandled-request traceback and every
+    faulthandler crash dump lands in this file, so a quit is never silent.
+    Falls back to console-only when the log file cannot be opened (read-only
+    DATA_DIR, tests) — logging must never take the app down.
+    """
+    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    handler = None
+    if LOG_PATH:
+        try:
+            from logging.handlers import RotatingFileHandler
+            handler = RotatingFileHandler(
+                LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+            handler.setFormatter(fmt)
+        except Exception:
+            handler = None
+    if handler is None:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(fmt)
+    # Attach the handler to the ROOT logger. Child loggers that propagate
+    # (owctl, fastapi — the defaults) flow their records here exactly once.
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if not any(h is handler or (isinstance(h, type(handler)) and
+               getattr(h, "stream", None) is getattr(handler, "stream", None))
+               for h in root.handlers):
+        root.addHandler(handler)
+    # uvicorn configures its loggers with propagate=False, so they never reach
+    # root — attach the handler to them directly (no double-emission, since they
+    # don't propagate). owctl/fastapi are left to propagate to root.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.INFO)
+        if not any(h is handler or (isinstance(h, type(handler)) and
+                   getattr(h, "stream", None) is getattr(handler, "stream", None))
+                   for h in lg.handlers):
+            lg.addHandler(handler)
+
+
+_setup_logging()
+faulthandler.enable(file=sys.stderr, all_threads=True)
 
 
 def now():
@@ -65,7 +113,16 @@ _LOCK = threading.Lock()
 
 
 def db():
-    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # WAL: readers no longer block on the single writer (the global _LOCK is
+    # owctl-internal; WAL also protects against concurrent sqlite access from
+    # outside, e.g. a backup tool or a second reader). busy_timeout: a locked
+    # DB waits instead of raising 'database is locked' (500 / crash at boot).
+    c = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=10000")
+    except sqlite3.OperationalError:
+        pass  # WAL can fail on some filesystems; the DB still works in rollback mode
     c.row_factory = sqlite3.Row
     return c
 
@@ -276,7 +333,7 @@ _ADMIN_ONLY_PATHS = {
     "/api/qos/apply", "/api/vlans/apply", "/api/vlans/discover",
     "/api/devices/{did}/pending-apply",
     "/api/alerts/config", "/api/bulk", "/api/digest",
-    "/api/findings/ack", "/api/settings",
+    "/api/findings/ack", "/api/settings", "/api/backup",
 }
 
 
@@ -2705,9 +2762,100 @@ def check_device(dev):
     return {"status": st, "findings": findings, "health_score": score}
 
 
+# --------------------------------------------------------------- maintenance
+_shutdown_event = threading.Event()
+_backup_lock = threading.Lock()
+
+
+def _db_backup():
+    """Snapshot the live sqlite DB to BACKUP_DIR/owctl-db-<ts>.db via VACUUM INTO
+    (a consistent, self-contained copy even while the server runs). Keeps the 14
+    newest; older copies are deleted. Never raises — a failed backup must not
+    break the scheduler; the error is logged and returned in the result dict.
+    """
+    logger = logging.getLogger("owctl")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"owctl-db-{ts}.db")
+    if not _backup_lock.acquire(blocking=False):
+        return {"ok": False, "reason": "another backup in progress"}
+    try:
+        # VACUUM INTO needs a dedicated connection with no open transaction.
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        src = sqlite3.connect(DB_PATH)
+        try:
+            src.execute("VACUUM INTO ?", (dest,))
+            src.commit()
+        finally:
+            src.close()
+        size = os.path.getsize(dest)
+        # retention: keep the 14 newest copies
+        copies = sorted(
+            (os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR)
+             if f.startswith("owctl-db-") and f.endswith(".db")),
+            key=os.path.getmtime, reverse=True)
+        removed = 0
+        for old in copies[14:]:
+            try:
+                os.remove(old)
+                removed += 1
+            except OSError:
+                pass
+        logger.info("db backup: %s (%.1f KB, %d pruned)",
+                    os.path.basename(dest), size / 1024, removed)
+        return {"ok": True, "path": dest, "size": size, "pruned": removed}
+    except Exception as e:
+        logger.error("db backup failed: %s", e)
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return {"ok": False, "reason": str(e)}
+    finally:
+        _backup_lock.release()
+
+
+def _prune_retention():
+    """Bound the unbounded tables (findings, api_audit, config_history,
+    device_heartbeats, owctl_actions). Runs in the scheduler loop; a failed
+    prune is logged and swallowed — housekeeping must never kill the loop.
+    ts columns store UTC 'YYYY-MM-DD HH:MM:SS.mmm' strings, so lexicographic
+    comparison against a UTC cutoff is correct.
+    """
+    logger = logging.getLogger("owctl")
+    try:
+        from datetime import timedelta
+        pruned = {}
+        for table, keep_days in (("findings", 120), ("api_audit", 90),
+                                 ("config_history", 180), ("device_heartbeats", 30),
+                                 ("owctl_actions", 180)):
+            cut = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime("%Y-%m-%d %H:%M:%S")
+            execute(f"DELETE FROM {table} WHERE ts < ?", (cut,))
+            pruned[table] = keep_days
+        logger.info("retention prune done (keep: %s)",
+                    ", ".join(f"{k} {v}d" for k, v in pruned.items()))
+        return {"ok": True, "keep_days": pruned}
+    except Exception as e:
+        logger.warning("retention prune failed: %s", e)
+        return {"ok": False, "reason": str(e)}
+
+
 # --------------------------------------------------------------- scheduler
 def _scheduler():
-    while True:
+    """Background loop: digest, DB backup, retention, device audits.
+
+    Every cycle logs a line (start/finish, device counts, failures) so a
+    stalled or dead scheduler is visible in owctl.log instead of silent.
+    Exits promptly on _shutdown_event (SIGTERM/Ctrl-C).
+    """
+    logger = logging.getLogger("owctl")
+    cycle = 0
+    while not _shutdown_event.is_set():
+        cycle += 1
+        logger.info("scheduler cycle %d: starting (audit + maintenance)", cycle)
+        # 1) weekly email digest (unchanged behavior)
         try:
             last = int(get_setting("digest_last_sent", "0") or "0")
             cfg = get_alert_cfg()
@@ -2715,17 +2863,27 @@ def _scheduler():
             if time.time() - last > 7 * 24 * 3600 and em.get("enabled") and em.get("to") and em.get("smtp_host"):
                 try:
                     send_digest()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("weekly digest failed: %s", e)
                 set_setting("digest_last_sent", str(int(time.time())))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("digest check failed: %s", e)
+        # 2) maintenance: DB backup + retention, every cycle
+        _db_backup()
+        _prune_retention()
+        # 3) audit loop (sleep in small chunks so shutdown stays responsive)
         try:
             interval_min = max(5, int(get_setting("audit_interval_min", "30") or 30))
         except Exception:
             interval_min = 30
-        for _ in range(interval_min * 12):
-            time.sleep(5)
+        slept = 0
+        while slept < interval_min * 60 and not _shutdown_event.is_set():
+            time.sleep(min(5, interval_min * 60 - slept))
+            slept += 5
+        if _shutdown_event.is_set():
+            logger.info("scheduler: shutdown requested, exiting loop")
+            break
+        online = offline = errors = 0
         for dev in q("SELECT * FROM devices WHERE access IN ('ssh','luci')"):
             try:
                 st = gather(dev)
@@ -2733,14 +2891,44 @@ def _scheduler():
                 execute("UPDATE devices SET status='online', last_checked=? WHERE id=?", (now(), dev["id"]))
                 apply_findings(dev, st)
                 _ddns_apply(dev, st)
-            except Exception:
+                online += 1
+            except Exception as e:
                 record_heartbeat(dev, False)
                 execute("UPDATE devices SET status='offline' WHERE id=?", (dev["id"],))
+                offline += 1
+                logger.info("audit: %s (%s) failed: %s", dev.get("name"), dev.get("host"), e)
+        logger.info("scheduler cycle %d: audit done — %d online, %d offline", cycle, online, offline)
+    logger.info("scheduler stopped (cycle %d)", cycle)
 
 
 # --------------------------------------------------------------------- app
 app = FastAPI(title="owctl")
 init_db()
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """Last line of defense: an uncaught error in any handler becomes a
+    structured 500 instead of a bare ASGI error, and the FULL traceback goes
+    to the log (owctl.log) so a 'quit without a reason' is diagnosable.
+    HTTPException (our own 4xx/502 responses) is left alone."""
+    import traceback as _tb
+    logger = logging.getLogger("owctl")
+    logger.error("unhandled exception on %s %s: %s\n%s",
+                 request.method, request.url.path, exc, _tb.format_exc())
+    return JSONResponse({"error": "internal error", "detail": str(exc)}, status_code=500)
+
+
+@app.get("/api/health")
+def api_health():
+    """Liveness probe for supervisors (launchd/systemd/curl) and the dashboard.
+    Deliberately public: it exposes no state, only that the process is up and
+    can open the DB. Keep it outside the auth guard's 401 paths."""
+    try:
+        ok = bool(q("SELECT 1"))
+    except Exception:
+        ok = False
+    return {"ok": ok, "uptime_s": int(time.time() - SERVER_STARTED_AT)}
 
 
 @app.post("/api/devices/{did}/pending-apply")
@@ -3021,12 +3209,19 @@ _RATELIMIT_WINDOW = int(os.environ.get("OWCTL_RATELIMIT_WINDOW", "60"))
 
 
 class _RateLimiter:
-    """Fixed-window per-client-IP limiter. Thread-safe; in-memory (per process)."""
+    """Fixed-window per-client-IP limiter. Thread-safe; in-memory (per process).
 
-    def __init__(self, limit: int, window: int):
+    Eviction is LRU (drop the least-recently-seen keys once the cap is hit),
+    NOT a blanket clear(): a burst of distinct client IPs (CGNAT, VPNs, NAT
+    ranges) used to wipe every counter at once, opening a DoS window where the
+    limiter stopped limiting for everyone.
+    """
+
+    def __init__(self, limit: int, window: int, max_keys: int = 8192):
         self.limit = max(1, limit)
         self.window = max(1, window)
-        self._hits: dict = defaultdict(int)
+        self.max_keys = max(1, max_keys)
+        self._hits: dict = {}
         self._lock = threading.Lock()
 
     def allow(self, key: str):
@@ -3034,11 +3229,15 @@ class _RateLimiter:
         now = int(time.time())
         bucket = now // self.window
         with self._lock:
-            # lazy cleanup of stale buckets to bound memory
-            if len(self._hits) > 4096:
-                self._hits.clear()
+            # LRU eviction: drop the least-recently-seen keys only if we're over
+            # the cap. Re-inserting on every hit reorders the dict (py3.7+), so
+            # oldest keys are the ones evicted first.
+            while len(self._hits) >= self.max_keys:
+                self._hits.pop(next(iter(self._hits)))
             n = self._hits.get(key, 0)
             if n < self.limit:
+                if key in self._hits:
+                    del self._hits[key]  # re-order: updated keys move to the tail (LRU)
                 self._hits[key] = n + 1
                 return True, 0
         remaining = (bucket + 1) * self.window - now
@@ -3133,7 +3332,7 @@ async def token_guard(request, call_next):
     if os.environ.get("OWCTL_ALLOW_OPEN") == "1":
         return await call_next(request)
     path = request.url.path
-    if path.startswith("/api/auth"):
+    if path.startswith("/api/auth") or path == "/api/health":
         return await call_next(request)
     # Auth: password-login session token only. On first boot an `admin` account
     # is seeded with no password; its password is set at the first
@@ -3381,6 +3580,9 @@ async def update_device(request: Request, did: int):
 def delete_device(did: int):
     execute("DELETE FROM active_findings WHERE device_id=?", (did,))
     execute("DELETE FROM devices WHERE id=?", (did,))
+    # Drop the in-memory heartbeat state for this device so the dict doesn't
+    # grow unboundedly as devices are added/removed over time.
+    _HEARTBEAT_STATE.pop(did, None)
     return {"ok": True}
 
 
@@ -5413,6 +5615,17 @@ def backups():
     return q("SELECT * FROM backups ORDER BY id DESC LIMIT 100")
 
 
+@app.post("/api/backup")
+def backup_now():
+    """Take a DB backup on demand (admin). The scheduler also snapshots
+    automatically every audit cycle; this is for taking one right now
+    (e.g. before a risky change) or from the dashboard."""
+    res = _db_backup()
+    if not res.get("ok"):
+        raise HTTPException(500, res.get("reason") or "backup failed")
+    return res
+
+
 @app.get("/api/actions")
 def actions(limit: int = 100):
     """Read-only audit log of all mutating operations, newest first."""
@@ -5771,11 +5984,121 @@ def _dyndns_maybe_remove_pkg(dev, provider):
 app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="static")
 
 
+def _bump_thread_pool():
+    """anyio's default thread pool (40) is too small for a fleet-control app:
+    every blocking endpoint (SSH, opkg, SMTP, urlopen) runs on it, so a fleet
+    upgrade + scheduler audit + LAN sweep together can exhaust it and queue
+    requests indefinitely (the app looks 'dead' while still running).
+    Bump to 200; silently skip if the anyio API ever changes."""
+    try:
+        import anyio
+        async def _bump():
+            try:
+                anyio.current_default_thread_limiter().total_tokens = 200
+            except Exception:
+                pass
+        import asyncio
+        asyncio.run(_bump())
+    except Exception:
+        pass  # never let pool tuning take the app down
+
+
+def _startup_diagnostics():
+    """Fail fast with a human-readable reason if the environment cannot serve:
+    bad port, unwritable data dir, missing TLS pair, corrupt DB. Called after
+    imports (DB is already initialized) and before uvicorn binds, so a bad
+    start never dies with a bare traceback to an unwatched terminal."""
+    logger = logging.getLogger("owctl")
+    problems = []
+    try:
+        if not os.access(DATA_DIR, os.W_OK):
+            problems.append(f"data dir not writable: {DATA_DIR} (need it for the DB, logs, backups)")
+        if not q("SELECT 1"):
+            problems.append("database failed a read probe")
+    except Exception as e:
+        problems.append(f"database probe failed: {e}")
+    cert = os.environ.get("OWCTL_SSL_CERT", "").strip()
+    key = os.environ.get("OWCTL_SSL_KEY", "").strip()
+    if not (cert and key):
+        cert = os.path.join(DATA_DIR, "cert.pem")
+        key = os.path.join(DATA_DIR, "key.pem")
+        if not (os.path.exists(cert) and os.path.exists(key)):
+            try:
+                _gen_selfsigned(cert, key)
+                logger.info("generated self-signed TLS pair at %s / %s", cert, key)
+            except Exception as e:
+                problems.append(f"no TLS cert/key and self-signed generation failed: {e}")
+    for label, path in (("cert", cert), ("key", key)):
+        try:
+            if os.path.exists(path) and not os.access(path, os.R_OK):
+                problems.append(f"TLS {label} not readable: {path}")
+        except Exception:
+            pass
+    return problems
+
+
+def _port_in_use():
+    import socket as _sk
+    s = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+    try:
+        s.bind((HOST if HOST not in ("", "0.0.0.0") else "127.0.0.1", PORT))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
+    import signal
     import uvicorn
-    threading.Thread(target=_scheduler, daemon=True).start()
+
+    logger = logging.getLogger("owctl")
+    # Graceful shutdown: SIGTERM/SIGINT (supervisor stop, Ctrl-C) sets the
+    # scheduler stop flag so the background loop exits promptly, and logs the
+    # signal so a 'quiet quit' is visible in the log.
+    def _on_signal(sig, frame):
+        logger.info("received signal %s — shutting down", signal.Signals(sig).name)
+        _shutdown_event.set()
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
+    except Exception:
+        pass  # not on main thread / unsupported platform
+
+    problems = _startup_diagnostics()
+    if problems:
+        for p in problems:
+            logger.error("startup blocked: %s", p)
+        for p in problems:
+            print(f"owctl: STARTUP FAILED — {p}", file=sys.stderr)
+        sys.exit(2)
+
+    if _port_in_use():
+        msg = (f"port {PORT} is already in use (host {HOST}) — another owctl is "
+               f"probably still running. Stop it or set OWCTL_PORT to a free port.")
+        logger.error(msg)
+        print(f"owctl: STARTUP FAILED — {msg}", file=sys.stderr)
+        sys.exit(3)
+
+    threading.Thread(target=_scheduler, daemon=True, name="owctl-scheduler").start()
     _ensure_default_admin()
+    _bump_thread_pool()
     _tls = tls_kwargs()
     _scheme = "https" if _tls else "http"
-    print(f"owctl: {_scheme}://{HOST}:{PORT}" + (" (TLS)" if _tls else ""))
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning", **_tls)
+    logger.info("starting owctl: %s://%s:%s%s — log file: %s",
+                _scheme, HOST, PORT, " (TLS)" if _tls else "", LOG_PATH or "(console only)")
+    print(f"owctl: {_scheme}://{HOST}:{PORT}" + (f" (TLS, log: {LOG_PATH})" if _tls else f" (log: {LOG_PATH})"))
+    try:
+        uvicorn.run(app, host=HOST, port=PORT, log_level="info",
+                    limit_concurrency=1000, **_tls)
+    except KeyboardInterrupt:
+        logger.info("interrupted — exiting")
+    except Exception as e:
+        logger.error("server crashed: %s", e, exc_info=True)
+        print(f"owctl: SERVER CRASHED — {e} (see {LOG_PATH} for the full traceback)",
+              file=sys.stderr)
+        sys.exit(4)
+    finally:
+        _shutdown_event.set()
+        logger.info("owctl stopped")

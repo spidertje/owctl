@@ -35,6 +35,7 @@ python owctl.py                 # http://<this-host>:8090
 Useful env:
 - `OWCTL_HOST` (default 0.0.0.0), `OWCTL_PORT` (default 8090)
 - `OWCTL_DATA` (data dir, default ./data)
+- `OWCTL_LOG` (log file, default `<data dir>/owctl.log` — rotating, 5 MB x 4)
 - `OWCTL_TRUST_PROXY` — set `1` only when owctl sits behind a trusted reverse
   proxy. Then the rate limiter keys on the rightmost `X-Forwarded-For` hop
   instead of the (proxy's) TCP address. Leave unset to rate-limit by real IP.
@@ -144,7 +145,7 @@ python3 -m venv .venv
 
 Hermes-friendly run modes (terminal tool):
 - Foreground while working: `terminal(command="cd owctl && .venv/bin/python owctl.py", background=true)` — the agent then opens `http://<host>:8090` via the browser tool, adds devices, pushes SSH keys, and configures alerting through the UI or the JSON API.
-- Persistent daemon: wrap in systemd or run `terminal(..., background=true, notify_on_complete=true)`.
+- Persistent daemon: see **ROBUSTNESS.md** — `./launch.sh` (any OS, auto-restart on crash), `com.spidertje.owctl.plist` (macOS launchd), or `owctl.service` (Linux systemd). The app also logs to `<data dir>/owctl.log` (rotating), serves `GET /api/health` for liveness, auto-backs up the DB each cycle, and exits with a human-readable reason (exit code 2/3/4) on a bad start instead of a bare traceback.
 
 Agent workflow after boot:
 1. `POST /api/devices` per box (or `POST /api/sweep` with a `spec` like `192.168.1.0/24`).

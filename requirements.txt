@@ -14,10 +14,14 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #
-fastapi
-uvicorn
-paramiko
-bcrypt
-cryptography
+# Pinned to the versions owctl was built and tested against (2026-10).
+# A lower bound (>=) plus an upper major cap (< next major) allows in-major
+# security patches but prevents a breaking new major from silently changing
+# behaviour on a fresh `pip install -r requirements.txt`.
+fastapi>=0.141.1,<0.142
+uvicorn>=0.54.0,<0.55
+paramiko>=5.0.0,<6
+bcrypt>=5.0.0,<6
+cryptography>=50.0.1,<51
 # Test-only: starlette TestClient (test_e2e.py, checks_*.py) needs a real httpx.
-httpx
+httpx>=0.28.1,<0.29

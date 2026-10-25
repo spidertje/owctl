@@ -1,0 +1,45 @@
+# owctl — systemd service (Linux; auto-start at boot, restart on crash).
+#
+# Install (as root):
+#   1. Edit User=, WorkingDirectory=, and the two OWCTL_* Environment lines
+#      below if your paths/user differ.
+#   2. Install + enable:
+#        sudo cp owctl.service /etc/systemd/system/
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now owctl
+#   3. Stop:
+#        sudo systemctl stop owctl
+#   4. Logs: journald (journalctl -u owctl) AND owctl's own rotating file
+#      at <OWCTL_DATA>/owctl.log.
+#
+# Why systemd over the launch.sh loop:
+#   - starts at boot, restarts on crash (Restart=always)
+#   - journalctl gives you the crash traceback even if owctl.log is unwritable
+#
+[Unit]
+Description=owctl — OpenWrt fleet control + threat watch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User running owctl (must own the data dir):
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/data/owctl
+ExecStart=/opt/data/owctl/.venv/bin/python /opt/data/owctl/owctl.py
+Environment=OWCTL_DATA=/opt/data/owctl/data
+Environment=OWCTL_LOG=/opt/data/owctl/data/owctl.log
+
+# Restart on any exit, back off 3s, give it 10s to shut down gracefully.
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+# Hardening (safe to keep; drop any you don't want):
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

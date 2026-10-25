@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  owctl — macOS launchd service (auto-start at login, restart on crash).
+
+  Install (as the user who runs owctl):
+    1. Edit the paths below (WorkingDirectory, ProgramArguments,
+       OWCTL_DATA / OWCTL_LOG) if yours differ.
+    2. Copy to your user LaunchAgents dir and load it:
+         mkdir -p ~/Library/LaunchAgents
+         cp com.spidertje.owctl.plist ~/Library/LaunchAgents/
+         launchctl load ~/Library/LaunchAgents/com.spidertje.owctl.plist
+    3. Unload / stop:
+         launchctl unload ~/Library/LaunchAgents/com.spidertje.owctl.plist
+    4. Logs: owctl writes to <OWCTL_DATA>/owctl.log; launchd also captures
+       stdout/stderr to the two files below.
+
+  Why launchd over the launch.sh loop:
+    - starts automatically at login (no need to remember to start it)
+    - KeepAlive keeps owctl alive through crashes and reboots
+    - logs land in a fixed file, not a terminal you have to keep open
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.spidertje.owctl</string>
+
+    <!-- The repo directory (where owctl.py + .venv live). -->
+    <key>WorkingDirectory</key>
+    <string>/opt/data/owctl</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/data/owctl/.venv/bin/python</string>
+        <string>/opt/data/owctl/owctl.py</string>
+    </array>
+
+    <!-- Data dir + log (override via OWCTL_DATA / OWCTL_LOG if you move them). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OWCTL_DATA</key>
+        <string>/opt/data/owctl/data</string>
+        <key>OWCTL_LOG</key>
+        <string>/opt/data/owctl/data/owctl.log</string>
+    </dict>
+
+    <!-- Start at login. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on any exit (crash, OOM, clean stop) with a 3s backoff. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+
+    <key>StandardOutPath</key>
+    <string>/opt/data/owctl/data/owctl-launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/data/owctl/data/owctl-launchd-stderr.log</string>
+
+    <!-- Shutdown: launchd sends SIGTERM on unload; owctl's signal handler
+         sets the scheduler stop flag and exits within a couple of seconds,
+         after which launchd escalates to SIGKILL. -->
+</dict>
+</plist>
