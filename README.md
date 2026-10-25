@@ -16,12 +16,43 @@
 -->
 # owctl — OpenWrt fleet control + threat watch
 
+> **Alpha software.** This is early, self-hosted, single-operator software.
+> It runs in production on my own LAN, but expect rough edges: breaking
+> changes between commits, no migration path for the data directory, and
+> features landing in the order I need them. Not a supported product — use
+> it if that's your trade-off, pin to a commit you trust.
+
 Single-file backend (FastAPI) + zero-dependency dashboard. Manages multiple
 OpenWrt boxes over **SSH** (primary) or the **LuCI API** (fallback), with
 config-hygiene threat auditing, package upgrades, config backups, LAN sweep,
 and configurable alerting.
 
-![Devices dashboard](docs/screenshot.png)
+| | |
+|---|---|
+| ![Devices](docs/screenshot.png) | ![Network features](docs/screenshot-net.png) |
+| ![Network Map](docs/screenshot-map.png) | ![Alerting](docs/screenshot-alerts.png) |
+
+## Philosophy
+
+owctl exists because managing more than two OpenWrt boxes by hand is where
+networks quietly decay. Every box drifts a little — a package goes stale, a
+port forward gets forgotten, the clock loses sync. Nothing breaks at once;
+it just gets harder to trust the fleet as a whole.
+
+The philosophy is **one pane of glass, read by default, write with intent**:
+
+- **Fleet, not box.** A device card, a threat list, and a network map give
+  you the whole fleet at a glance. You should see "wifi-ap is drifting from
+  the baseline" before you have to ssh in to find it.
+- **Read-only is the safe default.** Most actions observe. Mutations are
+  explicit, idempotent, and named (uci sections applied by name, re-apply
+  and delete-by-name), so a repeat does not duplicate state.
+- **No black box.** Config backups are real uci dumps you can restore or
+  diff. Findings are named, severity-tagged, and alert once — then
+  re-alert only if they disappear and come back.
+- **Boring over clever.** One file, one sqlite DB, standard SSH. The
+  backend is small enough to read end to end. The dashboard has no build
+  step and no npm.
 
 ## Run
 
@@ -89,6 +120,8 @@ default policies (input/forward). Reads live `uci show firewall`; applies via
 named uci sections (idempotent re-apply + delete-by-name), then
 `uci commit firewall && fw4 restart`. Saved state is tracked per device for
 diffing against the live box.
+
+![Firewall](docs/screenshot-firewall.png)
 
 ## Threat engine
 
