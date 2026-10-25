@@ -252,6 +252,23 @@ def init_db():
     execute("""CREATE TABLE IF NOT EXISTS vlans_devices(
         vlan_id TEXT, device_id INTEGER, role TEXT,
         PRIMARY KEY(vlan_id, device_id))""")
+    # ---- Routing (logical "one network" object, realized on devices) ----
+    # A route is one logical network fact (dst + via + metric), NOT a per-device
+    # row. `via` is either a concrete IPv4 gateway or a LOGICAL reference
+    # "vlan:<id>" (resolved to that VLAN's gateway at apply time — see
+    # resolve_via). `policy` distinguishes plain unicast routing ("default")
+    # from policy-routing table entries ("table:<name>"). Per-device
+    # realization (applied/pending/failed) lives in routes_devices, mirroring
+    # vlans_devices so the "one network" endpoints can show a union view.
+    execute("""CREATE TABLE IF NOT EXISTS routes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dst TEXT NOT NULL, via TEXT NOT NULL, metric INTEGER,
+        policy TEXT DEFAULT 'default',
+        note TEXT, created_at TEXT,
+        UNIQUE(dst, via, policy))""")
+    execute("""CREATE TABLE IF NOT EXISTS routes_devices(
+        route_id INTEGER, device_id INTEGER, state TEXT,
+        PRIMARY KEY(route_id, device_id))""")
     for _col, _typ in (("installed_pkgs", "TEXT"), ("obsolete_pkgs", "TEXT"), ("meshd", "TEXT"), ("upgradable_pkgs", "TEXT")):
         try:
             execute(f"ALTER TABLE device_status ADD COLUMN {_col} {_typ}")
@@ -334,6 +351,10 @@ _ADMIN_ONLY_PATHS = {
     "/api/devices/{did}/pending-apply",
     "/api/alerts/config", "/api/bulk", "/api/digest",
     "/api/findings/ack", "/api/settings", "/api/backup",
+    # routing (logical network object): per-device + fleet mutations
+    "/api/devices/{did}/routes", "/api/devices/{did}/routes/delete",
+    "/api/devices/{did}/policy-routes", "/api/devices/{did}/bgp",
+    "/api/routes/apply", "/api/routes/delete",
 }
 
 
@@ -545,6 +566,8 @@ echo '##traffic##'; awk 'NR>2{gsub(/:/,"",$1); printf "%s %s %s\n", $1, $2, $10}
 echo '##thermal##'; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null
 echo '##syslog##'; logread 2>/dev/null | tail -50
 echo '##vlans##'; uci show network 2>/dev/null | grep -E 'switch|vlan' | awk '{print $0}'
+echo '##routing##'; ip route show 2>/dev/null
+echo '##bgp_present##'; opkg list-installed bird 2>/dev/null | head -1
 echo '##end##'
 """
 
@@ -1091,6 +1114,27 @@ def audit_status(st):
                     st["device_date"], "Enable NTP")
         except Exception:
             pass
+    # ---- Routing (no-ops when `routing`/`bgp_present` are absent, i.e. LuCI) ----
+    # BGP daemon installed — deliberate topology, surface it like mesh.
+    if (st.get("bgp_present") or "").strip():
+        add("bgp_enabled", "INFO", "A BGP daemon (bird) is installed/configured",
+            "BGP can override your static routes", "Confirm the BGP peers/AS are intentional")
+    routing_text = (st.get("routing") or "").strip()
+    if routing_text:
+        try:
+            routes = parse_ip_route(routing_text)
+            defaults = [r for r in routes if (r.get("dst") or "").strip() in ("default", "0.0.0.0/0")]
+            if not defaults:
+                add("no_default_route", "MEDIUM", "No default route in the kernel routing table",
+                    "Default-gateway traffic (e.g. internet) will not be forwarded",
+                    "Set a default route or a route via the WAN gateway")
+            elif len(defaults) > 1:
+                gws = ", ".join(d.get("gateway") or "?" for d in defaults[:5])
+                add("multiple_default_routes", "MEDIUM",
+                    f"{len(defaults)} default routes present (conflicting gateways)",
+                    gws, "Keep a single default route; use policy routing for per-source defaults")
+        except Exception:
+            pass
     return f
 
 
@@ -1610,6 +1654,9 @@ _PENDING_RESTARTS = {
     "dns": "/etc/init.d/dnsmasq restart 2>/dev/null || /etc/init.d/odhcpd restart 2>/dev/null || /etc/init.d/system restart 2>/dev/null || true",
     "vlan": "netifd restart 2>/dev/null || true; /etc/init.d/odhcpd reload 2>/dev/null || true; fw4 restart 2>/dev/null || true",
     "wireless": "wifi reload 2>/dev/null || true",
+    # routing: static routes live in the network package (netifd applies them);
+    # BGP (bird) is restarted if present. Both no-op when absent.
+    "routing": "netifd restart 2>/dev/null || true; /etc/init.d/bird restart 2>/dev/null || true; ip route flush cache 2>/dev/null || true",
 }
 
 
@@ -2453,6 +2500,516 @@ def delete_vlan_membership(vlan_id, device_id=None):
             execute("DELETE FROM vlans_devices WHERE vlan_id=?", (str(vlan_id),))
     except Exception:
         pass
+
+
+# ===================================================================== routing
+# A route is a LOGICAL network object (dst + via + metric), realized on one or
+# more physical devices — the same shape as a VLAN. `via` may be a concrete
+# IPv4 gateway or a logical "vlan:<id>" reference resolved to that VLAN's
+# gateway at apply time. `policy` = "default" (plain unicast) or "table:<name>"
+# (policy-routing table entry).
+
+_IP4 = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+
+
+def _valid_ip4(ip):
+    if not (isinstance(ip, str) and _IP4.match(ip)):
+        return False
+    return all(0 <= int(o) <= 255 for o in ip.split("."))
+
+
+def _valid_cidr(dst):
+    """Validate an IPv4 CIDR (a.b.c.d or a.b.c.d/p, p in 0..32). Pure."""
+    if not isinstance(dst, str):
+        return False
+    dst = dst.strip()
+    if "/" in dst:
+        base, _, prefix = dst.partition("/")
+        if not prefix.isdigit() or not (0 <= int(prefix) <= 32):
+            return False
+        if not _valid_ip4(base):
+            return False
+        # for a network route the host bits are conventionally zero, but we
+        # accept any base and normalize; for /32 the host IS the network.
+        return True
+    return _valid_ip4(dst)
+
+
+def _route_iface(dev, dst, via, policy):
+    """Choose the network section to hang a static route off of.
+
+    OpenWrt attaches a static route to an interface via `network.<if>.route`
+    list (+ per-route gateway). We pin logical routes to the interface that
+    owns the gateway's subnet when it can be determined from `via`; otherwise
+    the device's primary routed interface (the one with a `static` proto),
+    falling back to 'lan'. Pure — no I/O.
+    """
+    # via "vlan:<id>" -> the VLAN's routed interface is "vlan_<id>".
+    if isinstance(via, str) and via.startswith("vlan:"):
+        try:
+            vid = int(via.split(":", 1)[1])
+        except (ValueError, IndexError):
+            vid = 0
+        if vid:
+            return f"vlan_{vid}"
+    return None  # caller falls back to the device's primary routed interface
+
+
+def _primary_routed_iface(dev):
+    """Best-effort primary routed interface name for a device (no I/O): prefer
+    a VLAN router role if recorded, else 'lan'. Used only as the attach point
+    when the route's own `via` doesn't name an interface."""
+    try:
+        row = q("SELECT d.name FROM vlans_devices m JOIN devices d ON d.id=m.device_id "
+                "WHERE m.device_id=? AND m.role='router' ORDER BY d.id LIMIT 1", (dev["id"],))
+        if row:
+            return f"vlan_{row[0]['name']}"
+    except Exception:
+        pass
+    return "lan"
+
+
+def resolve_via(dev, via):
+    """Resolve a route's `via` to a concrete IPv4 gateway, or raise HTTPException(400).
+
+    - a concrete IPv4 address is returned as-is
+    - "vlan:<id>" resolves to the gateway of that VLAN's routed interface
+      (network.vlan_<id>.gateway), falling back to the .1 of its subnet.
+    Pure with respect to SSH (reads only the in-memory/DB VLAN record); the
+    actual on-device gateway is read separately when the route is applied.
+    """
+    via = (via or "").strip()
+    if _valid_ip4(via):
+        return via
+    if via.startswith("vlan:"):
+        try:
+            vid = int(via.split(":", 1)[1])
+        except (ValueError, IndexError):
+            raise HTTPException(400, f"invalid logical via {via!r} (expected vlan:<id> or an IPv4 address)")
+        if not (1 <= vid <= 4094):
+            raise HTTPException(400, f"invalid VLAN id {vid} in via")
+        # The concrete gateway is determined at apply time from the device's
+        # config; for validation/storage we just confirm the VLAN exists.
+        vlan = q("SELECT * FROM vlans WHERE vlan_id=?", (str(vid),))
+        if not vlan:
+            raise HTTPException(400, f"via refers to unknown VLAN {vid} (create it first)")
+        return f"vlan_{vid}"  # marker: the do_* op resolves to the live gateway
+    raise HTTPException(400, f"invalid via {via!r} (expected an IPv4 address or vlan:<id>)")
+
+
+def parse_routing(uci_network_show):
+    """Pure parser: `uci show network` text -> {iface: {gateway, statics:[{dst,gateway,metric}]}}.
+
+    OpenWrt static routes are parallel lists on an interface:
+    ``network.<if>.route='CIDR1 CIDR2'`` plus ``.route.gateway='G1 G2'`` and
+    ``.route.metric='M1 M2'``. `uci show` renders a list as a single quoted,
+    space-separated value, so we split with _uci_values and zip the three
+    parallel lists. Per-interface default gateway comes from ``.gateway``.
+    Returns {} for empty/absent input so "no routes" and "no data" are the same.
+    """
+    raw = _parse_uci_show(uci_network_show or "")
+    out = {}
+    for section, opts in raw.items():
+        m = re.match(r"^network\.(\w+)$", section)
+        if not m:
+            continue
+        iface = m.group(1)
+        d = {"gateway": None, "statics": []}
+        d["gateway"] = (opts.get("gateway") or [None])[0]
+        dsts = _uci_list_values(uci_network_show or "", section, "route")
+        gws = _uci_list_values(uci_network_show or "", section, "route.gateway")
+        mets = _uci_list_values(uci_network_show or "", section, "route.metric")
+        for i, dst in enumerate(dsts):
+            d["statics"].append({
+                "dst": dst,
+                "gateway": gws[i] if i < len(gws) else None,
+                "metric": int(mets[i]) if i < len(mets) and mets[i].isdigit() else None,
+            })
+        out[iface] = d
+    return out
+
+
+def parse_ip_route(ip_route_output):
+    """Pure parser: `ip route` (Linux) text -> list of
+    {dst, gateway, dev, metric}. Handles the default route and CIDR entries.
+    Returns [] for empty/absent input."""
+    routes = []
+    for line in (ip_route_output or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        dst = parts[0]
+        entry = {"dst": dst, "gateway": None, "dev": None, "metric": None}
+        for i, tok in enumerate(parts):
+            if tok == "via" and i + 1 < len(parts):
+                entry["gateway"] = parts[i + 1]
+            elif tok == "dev" and i + 1 < len(parts):
+                entry["dev"] = parts[i + 1]
+            elif tok == "metric" and i + 1 < len(parts):
+                try:
+                    entry["metric"] = int(parts[i + 1])
+                except ValueError:
+                    pass
+        routes.append(entry)
+    return routes
+
+
+def parse_bgp_config(bird_or_bgp_conf):
+    """Pure parser: detect and summarize a BGP daemon config from raw text.
+
+    Accepts bird `router` blocks or a quagga/bgpd `router bgp` stanza. Returns
+    {present:bool, asn:int|None, peers:[{addr, as, name}]}. Empty/None input ->
+    {present:False, asn:None, peers:[]} so callers can no-op cleanly."""
+    res = {"present": False, "asn": None, "peers": []}
+    if not (bird_or_bgp_conf or "").strip():
+        return res
+    text = bird_or_bgp_conf
+    # BGP ASN — bird `local as N;`, quagga `router bgp N`, bgpd `as N` / `as = N`.
+    m = (re.search(r"\blocal\s+as\s+(\d+)", text)
+         or re.search(r"\bras\s*=\s*(\d+)", text)
+         or re.search(r"\brouter\s+bgp\s+(\d+)", text)
+         or re.search(r"\bas\s+(\d+)", text))
+    if m:
+        res["asn"] = int(m.group(1))
+        res["present"] = True
+    # Peers: bird `neighbor X { as N }` or quagga `neighbor X remote-as N`
+    for pm in re.finditer(r"neighbor\s+([\d.]+|[\w:-]+)\s*\{?[^}]*?\b(as|remote-as)\s*=?\s*(\d+)", text):
+        res["peers"].append({"addr": pm.group(1), "as": int(pm.group(3)), "name": None})
+        res["present"] = True
+    return res
+
+
+def build_route_cmds(dev, dst, via, metric, iface, apply):
+    """Pure: the uci script that adds a static route to `iface` on one device.
+
+    Idempotent: removes any existing route with the same dst on that iface
+    before adding, then commits network (and restarts when apply=True).
+    `via` here is a CONCRETE gateway (resolved by the do_* op).
+    """
+    if not _valid_cidr(dst):
+        raise HTTPException(400, f"invalid destination CIDR {dst!r}")
+    if not _valid_ip4(via):
+        raise HTTPException(400, f"invalid gateway {via!r}")
+    cmd = (
+        f"for r in $(uci -q list network.{iface}.route 2>/dev/null); do "
+        f"n=${{r#network.{iface}.route}}; "
+        f"d=$(uci -q get network.{iface}.route.$n 2>/dev/null); "
+        f"if [ \"$d\" = '{dst}' ]; then uci -q del_list network.{iface}.route.$n 2>/dev/null; "
+        f"uci -q del network.{iface}.route.gateway.$n 2>/dev/null; "
+        f"uci -q del network.{iface}.route.metric.$n 2>/dev/null; fi; done\n"
+        f"n=$(uci add network.{iface}.route '{dst}')\n"
+        f"uci set network.{iface}.route.gateway.$n='{via}'\n"
+    )
+    if metric is not None:
+        cmd += f"uci set network.{iface}.route.metric.$n='{int(metric)}'\n"
+    cmd += "uci commit network\n"
+    if apply:
+        cmd += (_PENDING_RESTARTS["routing"] + "\n")
+    return cmd
+
+
+def build_policy_route_cmds(dev, table, match_dst, route_dst, via, iface, apply):
+    """Pure: uci script for a POLICY-routing table entry on one device.
+
+    OpenWrt policy routing = a named `network` interface whose `proto=static`
+    route lives in a `route` table, selected by an `ip rule` match. We model it
+    as: ensure a routing table named `table`, add the route there, and an
+    `ip rule` from `match_dst` -> that table. `via` must be concrete.
+    """
+    if not _valid_cidr(match_dst):
+        raise HTTPException(400, f"invalid match CIDR {match_dst!r}")
+    if not _valid_cidr(route_dst):
+        raise HTTPException(400, f"invalid route destination {route_dst!r}")
+    if not _valid_ip4(via):
+        raise HTTPException(400, f"invalid gateway {via!r}")
+    t = re.sub(r"[^A-Za-z0-9_]", "_", table)
+    cmd = (
+        f"t=$(ip route show table {t} 2>/dev/null)\n"
+        f"if [ -z \"$t\" ]; then ip route add table {t} default via '{via}' dev {iface} 2>/dev/null || "
+        f"ip route add table {t} {route_dst} via '{via}' dev {iface} 2>/dev/null; fi\n"
+        f"ip rule add from {match_dst} lookup {t} 2>/dev/null || true\n"
+    )
+    if apply:
+        cmd += _PENDING_RESTARTS["routing"] + "\n"
+    return cmd
+
+
+def build_bgp_cmds(dev, asn, peers, apply):
+    """Pure: install a minimal BGP (bird) config on one device and restart it.
+
+    `peers` is a list of {addr, as, name}. Generates /etc/birdc/owctl.bgp with
+    one router block, then `birdc configure`. Requires the `bird` package
+    (installed by the do_* op via ensure_pkg). Raises HTTPException(400) on a
+    bad ASN or peer.
+    """
+    if not (isinstance(asn, int) and 1 <= asn <= 4294967295):
+        raise HTTPException(400, f"invalid BGP ASN {asn!r}")
+    peer_lines = []
+    for p in peers:
+        if not _valid_ip4(p.get("addr")):
+            raise HTTPException(400, f"invalid BGP peer address {p.get('addr')!r}")
+        if not (isinstance(p.get("as"), int) and 1 <= p["as"] <= 4294967295):
+            raise HTTPException(400, f"invalid BGP peer ASN {p.get('as')!r} for {p.get('addr')}")
+        peer_lines.append(
+            f"\tnet {p['addr']}/32;\n"
+            f"\tgraceful restart;\n"
+            f"\tprotocol bgp owctl_{re.sub(r'[^A-Za-z0-9]', '_', p['addr'])} {{\n"
+            f"\t\tlocal as {asn};\n"
+            f"\t\tdynamic paths yes;\n"
+            f"\t\tmultihop true;\n"
+            f"\t\tlearn;\n"
+            f"\t\texport all;\n"
+            f"\t\timport all;\n"
+            f"\t}}\n"
+        )
+    body = (
+        f"router id '127.0.0.1';\n"
+        f"protocol device;\n"
+        f"protocol bgp owctl_self {{\n"
+        f"\tlocal as {asn};\n"
+        f"\timport all;\n"
+        f"\texport all;\n"
+        f"}}\n"
+        + "\n".join(peer_lines)
+    )
+    cmd = (
+        "opkg list-installed bird >/dev/null 2>&1 || opkg install -y bird\n"
+        "mkdir -p /etc/birdc\n"
+        "cat > /etc/birdc/owctl.bgp <<'OWCTL_BGP'\n" + body + "\nOWCTL_BGP\n"
+        "if [ -f /etc/birdc/bird.cfg ]; then "
+        "grep -q 'owctl.bgp' /etc/birdc/bird.cfg || echo \"include \"/etc/birdc/owctl.bgp\";\" >> /etc/birdc/bird.cfg; fi\n"
+        "birdc configure 2>/dev/null || /etc/init.d/bird restart 2>/dev/null || true\n"
+    )
+    if apply:
+        cmd += _PENDING_RESTARTS["routing"] + "\n"
+    return cmd
+
+
+def _bgp_pkg_present(dev):
+    try:
+        c = _ssh_connect(dev)
+        try:
+            out, _e, _s = _exec_capture(c, "opkg list-installed bird 2>/dev/null", timeout=20)
+        finally:
+            c.close()
+        return bool(out.strip())
+    except Exception:
+        return False
+
+
+def read_routing(dev):
+    """Read a device's live routing table + network config. Returns a dict with
+    {name,host,gateways,statics,ip_routes,policy,bgp,error} or {error:..} on
+    failure. Pure-SSH; never raises past the error field."""
+    if dev["access"] != "ssh":
+        return {"name": dev.get("name"), "host": dev.get("host"), "error": "luci-only device skipped"}
+    try:
+        c = _ssh_connect(dev)
+        try:
+            out, _e, _s = _exec_capture(c, (
+                "echo '##uci##'; uci show network 2>/dev/null; "
+                "echo '##iproute##'; ip route show 2>/dev/null; "
+                "echo '##iprule##'; ip rule list 2>/dev/null; "
+                "echo '##bgp##'; cat /etc/birdc/owctl.bgp 2>/dev/null || cat /etc/birdc/bird.cfg 2>/dev/null; "
+                "true"), timeout=30)
+        finally:
+            c.close()
+        secs = _split_sections(out)
+        uci = secs.get("uci", "")
+        iproute = secs.get("iproute", "")
+        iprule = secs.get("iprule", "")
+        bgp = secs.get("bgp", "")
+        routing = parse_routing(uci)
+        return {
+            "name": dev.get("name"), "host": dev.get("host"),
+            "interfaces": routing,
+            "ip_routes": parse_ip_route(iproute),
+            "policy": parse_ip_rule(iprule),
+            "bgp": parse_bgp_config(bgp),
+            "error": None,
+        }
+    except Exception as e:
+        return {"name": dev.get("name"), "host": dev.get("host"), "error": str(e)}
+
+
+def _split_sections(out):
+    """Split a gather-style '##name##' section dump into {name: body}."""
+    sections = {}
+    cur = None
+    buf = []
+    for line in (out or "").splitlines():
+        m = re.match(r"^##(\w+)##$", line.strip())
+        if m:
+            if cur:
+                sections[cur] = "\n".join(buf)
+            cur = m.group(1)
+            buf = []
+        else:
+            buf.append(line)
+    if cur:
+        sections[cur] = "\n".join(buf)
+    return sections
+
+
+def parse_ip_rule(ip_rule_output):
+    """Pure parser: `ip rule` text -> list of {priority, from, lookup, table}.
+
+    Real `ip rule` output: ``0:      from all lookup local`` / ``1000:   from
+    192.168.50.0/24 lookup owctl`` — the priority is the leading ``NNN:``.
+    Returns [] for empty/absent input."""
+    rules = []
+    for line in (ip_rule_output or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rule = {"priority": None, "from": None, "lookup": None, "table": None}
+        m = re.match(r"^(\d+):", line)
+        if m:
+            rule["priority"] = int(m.group(1))
+            line = line[m.end():].strip()
+        parts = line.split()
+        for i, tok in enumerate(parts):
+            if tok == "from" and i + 1 < len(parts):
+                rule["from"] = parts[i + 1]
+            elif tok in ("lookup", "table") and i + 1 < len(parts):
+                rule["lookup"] = rule["lookup"] or parts[i + 1]
+        if rule["priority"] is not None or rule["lookup"] or rule["from"]:
+            rules.append(rule)
+    return rules
+
+
+def _record_route_realization(route_id, device_id, state):
+    """Record per-device realization of a logical route. Never raises."""
+    try:
+        execute("INSERT INTO routes_devices(route_id, device_id, state) VALUES(?,?,?) "
+                "ON CONFLICT(route_id, device_id) DO UPDATE SET state=excluded.state",
+                (route_id, device_id, state))
+    except Exception:
+        pass
+
+
+def do_route(dev, dst, via, metric, iface, apply=True):
+    """Add/replace a static route on one device. `via` may be logical
+    (vlan:<id>) — resolved to the device's live gateway first. Idempotent."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "routing config requires SSH access")
+    # Resolve logical via to a concrete gateway using the device's live config.
+    concrete = _resolve_concrete_via(dev, via)
+    if iface is None:
+        iface = _route_iface(dev, dst, via, "default") or _primary_routed_iface(dev)
+    cmd = build_route_cmds(dev, dst, concrete, metric, iface, apply)
+    c = _ssh_connect(dev)
+    try:
+        out, err, status = _exec_capture(c, cmd, timeout=60)
+        if status != 0:
+            raise RuntimeError(f"route apply failed on {dev['name']}: exit {status} {(err or out).strip()[:200]}")
+    finally:
+        c.close()
+    set_pending(dev, "routing", apply)
+    log_action(dev, "route", f"dst={dst} via={via} iface={iface} metric={metric}", ok=True)
+    return {"device": dev["name"], "ok": True, "iface": iface}
+
+
+def do_route_delete(dev, dst, iface, apply=True):
+    """Remove a static route (by dst) from one device. Idempotent no-op when absent."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "routing config requires SSH access")
+    if not _valid_cidr(dst):
+        raise HTTPException(400, f"invalid destination CIDR {dst!r}")
+    if iface is None:
+        iface = _primary_routed_iface(dev)
+    cmd = (
+        f"for r in $(uci -q list network.{iface}.route 2>/dev/null); do "
+        f"n=${{r#network.{iface}.route}}; "
+        f"d=$(uci -q get network.{iface}.route.$n 2>/dev/null); "
+        f"if [ \"$d\" = '{dst}' ]; then uci -q del_list network.{iface}.route.$n 2>/dev/null; "
+        f"uci -q del network.{iface}.route.gateway.$n 2>/dev/null; "
+        f"uci -q del network.{iface}.route.metric.$n 2>/dev/null; fi; done\n"
+        "uci commit network\n"
+    )
+    if apply:
+        cmd += _PENDING_RESTARTS["routing"] + "\n"
+    c = _ssh_connect(dev)
+    try:
+        out, err, status = _exec_capture(c, cmd, timeout=60)
+        if status != 0:
+            raise RuntimeError(f"route delete failed on {dev['name']}: exit {status} {(err or out).strip()[:200]}")
+    finally:
+        c.close()
+    set_pending(dev, "routing", apply)
+    log_action(dev, "route_delete", f"dst={dst} iface={iface}", ok=True)
+    return {"device": dev["name"], "ok": True}
+
+
+def _resolve_concrete_via(dev, via):
+    """Resolve a route `via` to a concrete IPv4 gateway on THIS device.
+
+    Concrete IPv4 -> as-is. "vlan:<id>" -> read that VLAN's routed interface
+    gateway (network.vlan_<id>.gateway) from the device; fall back to the .1
+    of its subnet from the vlans table; else 400.
+    """
+    via = (via or "").strip()
+    if _valid_ip4(via):
+        return via
+    if via.startswith("vlan:"):
+        vid = via.split(":", 1)[1]
+        iface = f"vlan_{vid}"
+        gw = None
+        try:
+            c = _ssh_connect(dev)
+            try:
+                out, _e, _s = _exec_capture(
+                    c, f"uci -q get network.{iface}.gateway 2>/dev/null", timeout=20)
+            finally:
+                c.close()
+            gw = out.strip()
+        except Exception:
+            gw = None
+        if _valid_ip4(gw):
+            return gw
+        vlan = q("SELECT * FROM vlans WHERE vlan_id=?", (vid,))
+        if vlan and vlan[0].get("subnet"):
+            base = vlan[0]["subnet"].split("/")[0]
+            return base.rsplit(".", 1)[0] + ".1"
+        raise HTTPException(400, f"could not resolve via for VLAN {vid} on {dev['name']} (no gateway found)")
+    raise HTTPException(400, f"invalid via {via!r}")
+
+
+def do_policy_route(dev, table, match_dst, route_dst, via, iface, apply=True):
+    """Add a policy-routing table entry on one device."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "policy routing requires SSH access")
+    concrete = _resolve_concrete_via(dev, via)
+    if iface is None:
+        iface = _primary_routed_iface(dev)
+    cmd = build_policy_route_cmds(dev, table, match_dst, route_dst, concrete, iface, apply)
+    c = _ssh_connect(dev)
+    try:
+        out, err, status = _exec_capture(c, cmd, timeout=60)
+        if status != 0:
+            raise RuntimeError(f"policy route failed on {dev['name']}: exit {status} {(err or out).strip()[:200]}")
+    finally:
+        c.close()
+    set_pending(dev, "routing", apply)
+    log_action(dev, "policy_route", f"table={table} from={match_dst} to={route_dst} via={via}", ok=True)
+    return {"device": dev["name"], "ok": True}
+
+
+def do_bgp(dev, asn, peers, apply=True):
+    """Install a minimal bird-based BGP config on one device and restart it."""
+    if dev["access"] != "ssh":
+        raise HTTPException(400, "BGP requires SSH access")
+    cmd = build_bgp_cmds(dev, asn, peers, apply)
+    c = _ssh_connect(dev)
+    try:
+        out, err, status = _exec_capture(c, cmd, timeout=300)
+        if status != 0:
+            raise RuntimeError(f"BGP config failed on {dev['name']}: exit {status} {(err or out).strip()[:200]}")
+    finally:
+        c.close()
+    set_pending(dev, "routing", apply)
+    log_action(dev, "bgp", f"asn={asn} peers={len(peers)}", ok=True)
+    return {"device": dev["name"], "ok": True}
 
 
 def parse_mac(s):
@@ -3738,6 +4295,183 @@ async def delete_vlan(request: Request):
         execute("DELETE FROM vlans WHERE vlan_id=?", (str(vlan_id),))
     return {"results": results}
 
+
+# ===================================================================== routing endpoints
+@app.get("/api/devices/{did}/routing")
+def read_routing_endpoint(did: int):
+    """Live routing state of one device: per-interface gateways + static
+    routes, the kernel routing table (ip route), policy rules (ip rule), and any
+    BGP (bird) config. No mutation."""
+    dev = _require_device(did)
+    r = read_routing(dev)
+    if r.get("error"):
+        if r["error"].startswith("luci-only"):
+            return {"device": dev["name"], "configured": False}
+        raise HTTPException(502, f"routing read failed on {dev['name']}: {r['error']}")
+    configured = bool(r.get("interfaces") or r.get("ip_routes") or r.get("policy") or (r.get("bgp") or {}).get("present"))
+    return {"device": dev["name"], "configured": configured, **r}
+
+
+@app.post("/api/devices/{did}/routes")
+async def add_route_endpoint(request: Request, did: int):
+    """Add or replace a static route on one device.
+    Body: {dst, via, metric?, iface?, apply?}. `via` may be a concrete IPv4
+    gateway or a logical 'vlan:<id>' (resolved to that VLAN's gateway).
+    Idempotent (same dst replaces the existing entry)."""
+    dev = _require_device(did)
+    d = await request.json()
+    dst = (d.get("dst") or "").strip()
+    via = (d.get("via") or "").strip()
+    metric = d.get("metric")
+    iface = d.get("iface") or None
+    apply = d.get("apply") is not False
+    if not dst or not via:
+        raise HTTPException(400, "dst and via are required")
+    r = do_route(dev, dst, via, metric, iface, apply=apply)
+    row = q("SELECT id FROM routes WHERE dst=? AND policy='default'", (dst,))
+    if row:
+        _record_route_realization(row[0]["id"], dev["id"], "applied" if apply else "pending")
+    return r
+
+
+@app.post("/api/devices/{did}/routes/delete")
+async def delete_route_endpoint(request: Request, did: int):
+    """Remove a static route (by dst) from one device. Body: {dst, iface?}."""
+    dev = _require_device(did)
+    d = await request.json()
+    dst = (d.get("dst") or "").strip()
+    iface = d.get("iface") or None
+    apply = d.get("apply") is not False
+    if not dst:
+        raise HTTPException(400, "dst is required")
+    return do_route_delete(dev, dst, iface, apply=apply)
+
+
+@app.post("/api/devices/{did}/policy-routes")
+async def policy_route_endpoint(request: Request, did: int):
+    """Add a policy-routing table entry on one device.
+    Body: {table, match_dst, route_dst, via, iface?, apply?}."""
+    dev = _require_device(did)
+    d = await request.json()
+    table = (d.get("table") or "owctl").strip()
+    match_dst = (d.get("match_dst") or "").strip()
+    route_dst = (d.get("route_dst") or "").strip()
+    via = (d.get("via") or "").strip()
+    iface = d.get("iface") or None
+    apply = d.get("apply") is not False
+    if not (match_dst and route_dst and via):
+        raise HTTPException(400, "match_dst, route_dst and via are required")
+    return do_policy_route(dev, table, match_dst, route_dst, via, iface, apply=apply)
+
+
+@app.post("/api/devices/{did}/bgp")
+async def bgp_endpoint(request: Request, did: int):
+    """Install/replace a minimal bird-based BGP config on one device.
+    Body: {asn, peers:[{addr, as, name?}], apply?}. Installs the `bird` package
+    if missing, writes /etc/birdc/owctl.bgp, and (re)starts BGP."""
+    dev = _require_device(did)
+    d = await request.json()
+    asn = d.get("asn")
+    peers = d.get("peers") or []
+    apply = d.get("apply") is not False
+    if not peers:
+        raise HTTPException(400, "at least one BGP peer is required")
+    return do_bgp(dev, asn, peers, apply=apply)
+
+
+@app.get("/api/routes")
+def fleet_routes():
+    """One-network view: every logical route with its per-device realization
+    (applied/pending/failed) and the union of devices it is expected on. Read
+    from the DB ledger — no SSH, instant."""
+    rows = q("SELECT r.*, GROUP_CONCAT(rd.device_id) AS device_ids, "
+             "GROUP_CONCAT(rd.state) AS states FROM routes r "
+             "LEFT JOIN routes_devices rd ON rd.route_id = r.id GROUP BY r.id ORDER BY r.id")
+    out = []
+    for r in rows:
+        ids = [int(x) for x in (r["device_ids"] or "").split(",") if x.strip().isdigit()]
+        states = (r["states"] or "").split(",")
+        devs = []
+        for i, s in zip(ids, states):
+            dr = q("SELECT id, name FROM devices WHERE id=?", (i,))
+            devs.append({"id": i, "name": dr[0]["name"] if dr else "?", "state": s or "?"})
+        out.append({**r, "devices": devs})
+    return {"routes": out}
+
+
+@app.post("/api/routes/apply")
+async def fleet_routes_apply(request: Request):
+    """Apply a logical route to the set of devices it is expected on.
+    Body: {dst, via, metric?, devices:[id,...], apply?}. `via` may be
+    'vlan:<id>'. Per-device error isolation: one box failing is reported, not
+    fatal to the batch."""
+    d = await request.json()
+    dst = (d.get("dst") or "").strip()
+    via = (d.get("via") or "").strip()
+    metric = d.get("metric")
+    apply = d.get("apply") is not False
+    if not (dst and via):
+        raise HTTPException(400, "dst and via are required")
+    dids = [int(x) for x in (d.get("devices") or [])]
+    if not dids:
+        raise HTTPException(400, "devices (list of ids) is required")
+    rid = q("SELECT id FROM routes WHERE dst=? AND policy='default'", (dst,))
+    if rid:
+        execute("UPDATE routes SET via=?, metric=?, note=?, created_at=? WHERE id=?",
+                (via, metric, d.get("note"), now(), rid[0]["id"]))
+        rid = rid[0]["id"]
+    else:
+        rid = execute("INSERT INTO routes(dst, via, metric, policy, note, created_at) VALUES(?,?,?,?,?,?)",
+                      (dst, via, metric, "default", d.get("note"), now()))
+    results = []
+    for did in dids:
+        cur = q("SELECT * FROM devices WHERE id=?", (did,))
+        if not cur:
+            results.append({"device_id": did, "name": "?", "ok": False, "error": "unknown device"})
+            continue
+        try:
+            r = do_route(cur[0], dst, via, metric, None, apply=apply)
+            _record_route_realization(rid, did, "applied" if apply else "pending")
+            results.append({"device_id": did, "name": cur[0]["name"], "ok": True, **r})
+        except Exception as e:
+            _record_route_realization(rid, did, "failed")
+            results.append({"device_id": did, "name": cur[0]["name"], "ok": False, "error": str(e)})
+    ok = sum(1 for r in results if r["ok"])
+    return {"ok": ok, "failed": len(results) - ok, "results": results}
+
+
+@app.post("/api/routes/delete")
+async def fleet_routes_delete(request: Request):
+    """Remove a logical route (by dst) from the selected devices and drop the
+    ledger rows. Body: {dst, devices?: [id,...], apply?}."""
+    d = await request.json()
+    dst = (d.get("dst") or "").strip()
+    apply = d.get("apply") is not False
+    if not dst:
+        raise HTTPException(400, "dst is required")
+    row = q("SELECT id FROM routes WHERE dst=? AND policy='default'", (dst,))
+    rid = row[0]["id"] if row else None
+    dids = [int(x) for x in (d.get("devices") or [])]
+    if rid and not dids:
+        dids = [r["device_id"] for r in q("SELECT device_id FROM routes_devices WHERE route_id=?", (rid,))]
+    if not dids:
+        dids = [r["id"] for r in q("SELECT id FROM devices WHERE access='ssh'")]
+    results = []
+    for did in dids:
+        cur = q("SELECT * FROM devices WHERE id=?", (did,))
+        if not cur:
+            continue
+        try:
+            do_route_delete(cur[0], dst, None, apply=apply)
+            if rid:
+                execute("DELETE FROM routes_devices WHERE route_id=? AND device_id=?", (rid, did))
+            results.append({"device_id": did, "name": cur[0]["name"], "ok": True})
+        except Exception as e:
+            results.append({"device_id": did, "name": cur[0]["name"], "ok": False, "error": str(e)})
+    if rid:
+        execute("DELETE FROM routes WHERE id=?", (rid,))
+    ok = sum(1 for r in results if r["ok"])
+    return {"ok": ok, "failed": len(results) - ok, "results": results}
 
 @app.post("/api/dhcp/apply")
 async def apply_dhcp(request: Request):

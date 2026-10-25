@@ -452,6 +452,10 @@ async function renderNet(activeSection){
         <h3>Switch Map <span class="pill">→</span></h3>
         <p class="small muted">Physical ports, VLANs and link state.</p>
       </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='routing'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('routing')">
+        <h3>Routing <span class="pill">→</span></h3>
+        <p class="small muted">Static routes, policy routing and BGP.</p>
+      </div>
     </div>
     <div id="net-detail"></div>`;
   el.innerHTML=html;
@@ -493,7 +497,227 @@ async function loadNetSection(name){
     await renderFleetPkgs(box);
   }else if(name==='switchmap'){
     await renderSwitchMap(box);
+  }else if(name==='routing'){
+    await renderRouting(box);
   }
+}
+
+// ===================================================================== routing
+let _routingDevs = [];
+async function renderRouting(box){
+  let devs=[]; try{ devs=await api('/devices'); }catch(e){ box.innerHTML=`<p class="muted">Could not load devices: ${esc(String(e))}</p>`;return; }
+  _routingDevs = devs;
+  const sshDevs = devs.filter(d=>(d.access||'')==='ssh');
+  const first = sshDevs[0]||devs[0];
+  box.innerHTML = `
+  <div class="card" style="margin-bottom:16px">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h3 style="margin:0">Device routing state</h3>
+      <div><label>Device</label>
+        <select id="rt-dev" style="width:220px" onchange="routingRenderDetail()">
+          ${devs.map(d=>`<option value="${d.id}" ${first&&d.id===first.id?'selected':''}>${esc(d.name)} (${esc(d.host)})${(d.access||'')!=='ssh'?' — luci':''}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div id="rt-detail" style="margin-top:12px"><p class="muted">Loading…</p></div>
+  </div>
+
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr));margin-bottom:16px">
+    <div class="card">
+      <h3>Add static route</h3>
+      <div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+        <div><label>Destination</label><input id="rt-dst" placeholder="10.20.0.0/24" style="width:150px"></div>
+        <div><label>Via (gw or vlan:ID)</label><input id="rt-via" placeholder="192.168.1.254 or vlan:10" style="width:160px"></div>
+      </div>
+      <div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+        <div><label>Metric</label><input id="rt-metric" type="number" min="0" placeholder="opt" style="width:80px"></div>
+        <div><label>Iface</label><input id="rt-iface" placeholder="default: auto" style="width:110px"></div>
+        <label style="align-self:flex-end"><input type="checkbox" id="rt-apply" checked> apply now</label>
+      </div>
+      <div class="row">
+        <button class="act" onclick="routingAddRoute(false)">Save</button>
+        <button class="act pri" onclick="routingAddRoute(true)">Save &amp; Apply</button>
+        <button class="act" style="border-color:var(--bad);color:var(--bad)" onclick="routingDelRoute()">Delete route</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Policy route</h3>
+      <p class="small muted">Send traffic from a source net to a destination via a gateway (ip rule + table).</p>
+      <div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+        <div><label>Table</label><input id="rt-p-table" value="owctl" style="width:100px"></div>
+        <div><label>From (match)</label><input id="rt-p-from" placeholder="192.168.50.0/24" style="width:150px"></div>
+      </div>
+      <div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+        <div><label>To (route dst)</label><input id="rt-p-to" placeholder="10.0.0.0/8" style="width:150px"></div>
+        <div><label>Via</label><input id="rt-p-via" placeholder="192.168.1.254" style="width:150px"></div>
+      </div>
+      <div class="row">
+        <button class="act" onclick="routingAddPolicy(false)">Save</button>
+        <button class="act pri" onclick="routingAddPolicy(true)">Save &amp; Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr));margin-bottom:16px">
+    <div class="card">
+      <h3>BGP (bird)</h3>
+      <p class="small muted">Installs <code>bird</code> if missing, writes <code>/etc/birdc/owctl.bgp</code>, restarts the daemon.</p>
+      <div class="row" style="margin-bottom:8px"><div><label>Local ASN</label><input id="rt-b-asn" type="number" min="1" placeholder="65000" style="width:120px"></div></div>
+      <div style="margin-bottom:8px"><label>Peers — one per line: <code>addr,asn</code></label>
+        <textarea id="rt-b-peers" rows="3" style="width:100%" placeholder="10.0.0.254,65001&#10;10.0.1.254,65002"></textarea></div>
+      <div class="row">
+        <button class="act pri" onclick="routingApplyBgp()">Apply BGP</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Fleet routes (ledger)</h3>
+      <p class="small muted">Logical routes and their per-device state. Apply one route to several devices at once.</p>
+      <div id="rt-fleet" style="margin-top:10px"><p class="muted">Loading…</p></div>
+      <div class="row" style="margin-top:10px;flex-wrap:wrap;gap:8px">
+        <div><label>Dst</label><input id="rt-f-dst" placeholder="10.40.0.0/24" style="width:140px"></div>
+        <div><label>Via</label><input id="rt-f-via" placeholder="vlan:10 or IP" style="width:140px"></div>
+        <button class="act" onclick="routingFleetApply(false)">Save</button>
+        <button class="act pri" onclick="routingFleetApply(true)">Save &amp; Apply</button>
+        <button class="act" style="border-color:var(--bad);color:var(--bad)" onclick="routingFleetDelete()">Delete</button>
+      </div>
+    </div>
+  </div>`;
+  await routingRenderDetail();
+  await routingRenderFleet();
+}
+function _routingDevId(){
+  const el=document.getElementById('rt-dev');
+  return el?parseInt(el.value,10):null;
+}
+async function routingRenderDetail(){
+  const box=document.getElementById('rt-detail');
+  if(!box)return;
+  const did=_routingDevId();
+  if(!did){box.innerHTML='<p class="muted">No device selected.</p>';return;}
+  box.innerHTML='<p class="muted">Loading routing state…</p>';
+  let r;
+  try{ r=await api(`/devices/${did}/routing`); }
+  catch(e){ box.innerHTML=`<p class="muted">Could not read routing: ${esc(String(e))}</p>`; return; }
+  if(r.configured===false){ box.innerHTML='<p class="muted">This device is read-only (LuCI) or has no routing data.</p>'; return; }
+  let ifrows='';
+  const ifs=r.interfaces||{};
+  for(const [ifname,info] of Object.entries(ifs)){
+    const st=(info.statics||[]).map(s=>`${esc(s.dst)} → ${esc(s.gateway||'?')}${s.metric!=null?' (m'+s.metric+')':''}`).join(' · ');
+    ifrows+=`<tr><td><strong>${esc(ifname)}</strong></td><td>${esc(info.gateway||'—')}</td><td class="small">${st||'<span class="muted">no static routes</span>'}</td></tr>`;
+  }
+  let iprows='';
+  for(const rt of (r.ip_routes||[])){
+    iprows+=`<tr><td>${esc(rt.dst)}</td><td>${esc(rt.gateway||'— (dev link)')}</td><td>${esc(rt.dev||'')}</td><td>${rt.metric!=null?rt.metric:''}</td></tr>`;
+  }
+  let prow='';
+  const pr=(r.policy||[]).filter(p=>p.lookup&&p.lookup!=='local'&&p.lookup!=='main'&&p.lookup!=='default');
+  if(pr.length){ prow=pr.map(p=>`<div class="small" style="margin:3px 0">prio ${p.priority??'?'} — from ${esc(p.from||'all')} → table <strong>${esc(p.lookup)}</strong></div>`).join(''); }
+  let b='';
+  const bg=r.bgp||{};
+  if(bg.present){
+    b=`<div class="card" style="margin-top:12px;border-color:var(--acc)"><h3>BGP active</h3>
+       <p class="small">ASN <strong>${esc(String(bg.asn))}</strong> · peers: ${(bg.peers||[]).map(p=>`${esc(p.addr)} (as ${esc(String(p.as))})`).join(', ')||'—'}</p></div>`;
+  }
+  box.innerHTML=`
+    <table style="width:100%;border-collapse:collapse;margin-bottom:10px">
+      <thead><tr><th style="text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)">Iface</th><th style="text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)">Gateway</th><th style="text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)">Static routes</th></tr></thead>
+      <tbody>${ifrows||'<tr><td colspan="3" class="muted">no routed interfaces found</td></tr>'}</tbody>
+    </table>
+    <h4 style="margin:14px 0 6px">Kernel routing table</h4>
+    <table style="width:100%;border-collapse:collapse">
+      <thead><tr><th style="text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)">Dst</th><th style="text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)">Via</th><th style="text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)">Dev</th><th style="text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)">Metric</th></tr></thead>
+      <tbody>${iprows||'<tr><td colspan="4" class="muted">no routes reported</td></tr>'}</tbody>
+    </table>
+    ${pr.length?`<h4 style="margin:14px 0 6px">Policy rules (ip rule)</h4>${prow}`:''}
+    ${b}`;
+}
+async function routingPost(path, body, label){
+  const did=_routingDevId();
+  if(!did){toast('No device selected',true);return null;}
+  try{
+    const r=await api(path,{method:'POST',body:JSON.stringify(body)});
+    toast(label+' ✓');
+    await routingRenderDetail();
+    return r;
+  }catch(e){ toast(String(e),true); return null; }
+}
+async function routingAddRoute(apply){
+  const dst=(document.getElementById('rt-dst').value||'').trim();
+  const via=(document.getElementById('rt-via').value||'').trim();
+  const m=(document.getElementById('rt-metric').value||'').trim();
+  const ifc=(document.getElementById('rt-iface').value||'').trim();
+  if(!dst||!via){toast('destination and via are required',true);return;}
+  const did=_routingDevId();
+  const body={dst,via,apply,
+    metric: m!==''?parseInt(m,10):null,
+    iface: ifc||undefined};
+  await routingPost(`/devices/${did}/routes`, body, (apply?'Route applied':'Route saved'));
+}
+async function routingDelRoute(){
+  const dst=(document.getElementById('rt-dst').value||'').trim();
+  if(!dst){toast('enter the destination to delete',true);return;}
+  const did=_routingDevId();
+  await routingPost(`/devices/${did}/routes/delete`, {dst, apply:true}, 'Route deleted');
+}
+async function routingAddPolicy(apply){
+  const table=(document.getElementById('rt-p-table').value||'owctl').trim();
+  const from=(document.getElementById('rt-p-from').value||'').trim();
+  const to=(document.getElementById('rt-p-to').value||'').trim();
+  const via=(document.getElementById('rt-p-via').value||'').trim();
+  if(!from||!to||!via){toast('from, to and via are required',true);return;}
+  const did=_routingDevId();
+  await routingPost(`/devices/${did}/policy-routes`, {table, match_dst:from, route_dst:to, via, apply}, (apply?'Policy route applied':'Policy route saved'));
+}
+async function routingApplyBgp(){
+  const asn=parseInt((document.getElementById('rt-b-asn').value||'').trim(),10);
+  const txt=(document.getElementById('rt-b-peers').value||'').trim();
+  if(!asn||!txt){toast('ASN and at least one peer are required',true);return;}
+  const peers=txt.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
+    const [addr,as]=line.split(',').map(x=>x.trim());
+    return {addr, as:parseInt(as,10)};
+  });
+  const bad=peers.find(p=>!p.addr||!p.as);
+  if(bad){toast('bad peer line: '+bad.addr+', '+bad.as,true);return;}
+  const did=_routingDevId();
+  await routingPost(`/devices/${did}/bgp`, {asn, peers, apply:true}, 'BGP applied');
+}
+async function routingRenderFleet(){
+  const box=document.getElementById('rt-fleet');
+  if(!box)return;
+  let d; try{ d=await api('/routes'); }catch(e){ box.innerHTML=`<p class="muted">${esc(String(e))}</p>`;return; }
+  if(!d.routes.length){ box.innerHTML='<p class="muted">No logical routes in the ledger yet.</p>'; return; }
+  const rows=d.routes.map(r=>{
+    const states=(r.devices||[]).map(x=>`${esc(x.name)}: ${esc(x.state)}`).join(' · ');
+    return `<div class="small" style="margin:6px 0;padding:8px;border:1px solid var(--line);border-radius:8px">
+      <strong>${esc(r.dst)}</strong> → <span class="muted">${esc(r.via||'?')}</span>${r.metric!=null?' · m'+esc(String(r.metric)):''}
+      <div style="margin-top:3px">${states||'<span class="muted">no devices</span>'}</div>
+    </div>`;
+  }).join('');
+  box.innerHTML=rows;
+}
+async function routingFleetApply(apply){
+  const dst=(document.getElementById('rt-f-dst').value||'').trim();
+  const via=(document.getElementById('rt-f-via').value||'').trim();
+  if(!dst||!via){toast('dst and via are required',true);return;}
+  const devs=(await api('/devices').catch(()=>[])).filter(d=>(d.access||'')==='ssh').map(d=>d.id);
+  if(!devs.length){toast('no SSH devices available',true);return;}
+  try{
+    const r=await api('/routes/apply',{method:'POST',body:JSON.stringify({dst,via,devices:devs,apply})});
+    if(r.failed)toast(`Fleet route: ${r.ok} ok, ${r.failed} failed`,true);
+    else toast(`Fleet route ${apply?'applied':'saved'} on ${r.ok} device(s)`);
+    await routingRenderFleet();
+  }catch(e){toast(String(e),true);}
+}
+async function routingFleetDelete(){
+  const dst=(document.getElementById('rt-f-dst').value||'').trim();
+  if(!dst){toast('enter the destination to delete',true);return;}
+  const devs=(await api('/devices').catch(()=>[])).filter(d=>(d.access||'')==='ssh').map(d=>d.id);
+  if(!devs.length){toast('no SSH devices available',true);return;}
+  try{
+    const r=await api('/routes/delete',{method:'POST',body:JSON.stringify({dst,devices:devs,apply:true})});
+    toast(`Fleet route deleted: ${r.ok} ok${r.failed?', '+r.failed+' failed':''}`);
+    await routingRenderFleet();
+  }catch(e){toast(String(e),true);}
 }
 
 async function renderConsistency(box){
