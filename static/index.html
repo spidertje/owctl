@@ -1702,13 +1702,29 @@ async function renderThreats(){
 }
 async function ack(did,rule){await api('/findings/ack',{method:'POST',body:JSON.stringify({device_id:did,rule_id:rule})});renderThreats()}
 
+// Last sweep result, kept in JS state so it survives tab re-renders: the 60s
+// poll, the Refresh button and tab switches all call renderDevices(), which
+// rebuilds #tab-devices (and thus #sweep-body) from scratch — without this,
+// every refresh wiped the sweep results out from under the user.
+let _lastSweep=null;
+function sweepResultHTML(r){
+  return `<p>${r.found}/${r.requested} hosts up. Likely OpenWrt: ${(r.openwrt||[]).map(esc).join(', ')||'none detected'}</p>
+  <table><tr><th>IP</th><th>Ports</th><th>Hints</th><th></th></tr>`+
+  (r.candidates||[]).map(c=>`<tr><td>${esc(c.host)}</td><td>${(c.ports||[]).join(', ')}</td>
+    <td class="small muted">${(c.hints||[]).map(esc).join(' · ')||'—'}</td>
+    <td><button class="act" onclick="addFromSweep('${esc(c.host)}')">${c.likely_openwrt?'Add device':'Add'}</button></td></tr>`).join('')+`</table>`;
+}
 async function renderSweep(){
   const el=document.getElementById('sweep-body')||document.getElementById('tab-sweep');
+  const spec=_lastSweep?esc(_lastSweep.spec):'';
   el.innerHTML=`<h2>LAN sweep</h2>
   <p class="muted">Scans a user-defined IPv4 range (CIDR, a-b list, or comma list) for live hosts and hints at OpenWrt devices. Max 4096 addresses per run.</p>
-  <div class="row"><input id="sweep-spec" placeholder="192.168.1.0/24  or  192.168.1.1-192.168.1.250" style="min-width:320px">
+  <div class="row"><input id="sweep-spec" placeholder="192.168.1.0/24  or  192.168.1.1-192.168.1.250" value="${spec}" style="min-width:320px">
   <button class="act pri" id="sweep-go">Sweep</button></div>
   <div id="sweep-out"></div>`;
+  // Restore the previous result (if any) so a re-render never loses it.
+  const out=document.getElementById('sweep-out');
+  if(_lastSweep&&out)out.innerHTML=sweepResultHTML(_lastSweep.result);
   document.getElementById('sweep-go').onclick=async()=>{
     const spec=document.getElementById('sweep-spec').value.trim();
     if(!spec)return;
@@ -1716,12 +1732,8 @@ async function renderSweep(){
     out.innerHTML='<p class="muted">Sweeping '+esc(spec)+' …</p>';
     try{
       const r=await api('/sweep',{method:'POST',body:JSON.stringify({spec})});
-      let html=`<p>${r.found}/${r.requested} hosts up. Likely OpenWrt: ${r.openwrt.map(esc).join(', ')||'none detected'}</p>
-        <table><tr><th>IP</th><th>Ports</th><th>Hints</th><th></th></tr>`+
-        r.candidates.map(c=>`<tr><td>${esc(c.host)}</td><td>${(c.ports||[]).join(', ')}</td>
-          <td class="small muted">${(c.hints||[]).map(esc).join(' · ')||'—'}</td>
-          <td><button class="act" onclick="addFromSweep('${esc(c.host)}')">${c.likely_openwrt?'Add device':'Add'}</button></td></tr>`).join('')+`</table>`;
-      out.innerHTML=html;
+      _lastSweep={spec,result:r};          // remember it for the next re-render
+      out.innerHTML=sweepResultHTML(r);
     }catch(e){out.innerHTML='<p class="muted" style="color:var(--bad)">'+esc(e.message)+'</p>'}
   };
 }
