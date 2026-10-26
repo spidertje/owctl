@@ -1714,13 +1714,53 @@ function sweepResultHTML(r){
     <td class="small muted">${(c.hints||[]).map(esc).join(' · ')||'—'}</td>
     <td><button class="act" onclick="addFromSweep('${esc(c.host)}')">${c.likely_openwrt?'Add device':'Add'}</button></td></tr>`).join('')+`</table>`;
 }
+// ---- Copy / export the current sweep result (survives re-renders via _lastSweep) ----
+function sweepCSV(){
+  if(!_lastSweep)return '';
+  const r=_lastSweep.result;
+  const cell=v=>{v=String(v==null?'':v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
+  const lines=['ip,ports,hints,likely_openwrt'];
+  (r.candidates||[]).forEach(c=>lines.push([c.host,(c.ports||[]).join(' '),
+    (c.hints||[]).join(' | '),c.likely_openwrt?'yes':'no'].map(cell).join(',')));
+  return lines.join('\n')+'\n';
+}
+async function sweepCopy(){
+  if(!_lastSweep){toast('No sweep results to copy',true);return;}
+  const txt=sweepCSV();
+  try{
+    await navigator.clipboard.writeText(txt);
+    toast('Copied '+_lastSweep.result.candidates.length+' host(s) to clipboard');
+  }catch(e){
+    // Clipboard API needs a secure context; fall back to a temp textarea.
+    const ta=document.createElement('textarea');
+    ta.value=txt;ta.style.cssText='position:fixed;opacity:0';document.body.appendChild(ta);
+    ta.select();
+    try{document.execCommand('copy');toast('Copied to clipboard');}
+    catch(e2){toast('Copy failed — select and copy manually',true);}
+    ta.remove();
+  }
+}
+function sweepDownload(){
+  if(!_lastSweep){toast('No sweep results to export',true);return;}
+  const blob=new Blob([sweepCSV()],{type:'text/csv;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  const d=new Date();
+  const ts=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+'-'+String(d.getHours()).padStart(2,'0')+String(d.getMinutes()).padStart(2,'0');
+  a.href=url;a.download='owctl-sweep-'+ts+'.csv';
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1500);
+  toast('Exported sweep results to CSV');
+}
 async function renderSweep(){
   const el=document.getElementById('sweep-body')||document.getElementById('tab-sweep');
   const spec=_lastSweep?esc(_lastSweep.spec):'';
   el.innerHTML=`<h2>LAN sweep</h2>
   <p class="muted">Scans a user-defined IPv4 range (CIDR, a-b list, or comma list) for live hosts and hints at OpenWrt devices. Max 4096 addresses per run.</p>
   <div class="row"><input id="sweep-spec" placeholder="192.168.1.0/24  or  192.168.1.1-192.168.1.250" value="${spec}" style="min-width:320px">
-  <button class="act pri" id="sweep-go">Sweep</button></div>
+  <button class="act pri" id="sweep-go">Sweep</button>
+  <button class="act" onclick="sweepCopy()" title="Copy all results as CSV to the clipboard">Copy results</button>
+  <button class="act" onclick="sweepDownload()" title="Save the results as a .csv file">Export CSV</button></div>
   <div id="sweep-out"></div>`;
   // Restore the previous result (if any) so a re-render never loses it.
   const out=document.getElementById('sweep-out');
