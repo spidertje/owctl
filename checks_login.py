@@ -81,6 +81,25 @@ def main():
     ok = client.get("/api/network", headers={"Authorization": f"Bearer {sess}"})
     check("valid session -> 200", ok.status_code == 200, f"got {ok.status_code}")
 
+    # --- cleared-hash takeover regression (audit P0) ---
+    # If another account still has a password, a cleared admin hash must NOT be
+    # re-seedable by whoever logs in next (the takeover). With the ONLY account
+    # cleared, seeding is legitimate first-boot recovery (still allowed).
+    import owctl
+    oid = owctl.q("SELECT id FROM users WHERE username='admin' LIMIT 1")[0]["id"]
+    # a second account that has a password -> the guard's trigger
+    owctl.execute("INSERT INTO users(username, password_hash, role, enabled, created_at) VALUES(?,?,?,1,?)",
+                  ("observer1", owctl._hash_password("obs-1234"), "observer", owctl.now()))
+    owctl.execute("UPDATE users SET password_hash='' WHERE id=?", (oid,))  # clear admin
+    r = client.post("/api/auth/login", json={"username": "admin", "password": "takeover-attempt"})
+    check("cleared-hash + other account has pw -> 403 (takeover blocked)", r.status_code == 403, f"got {r.status_code}")
+    check("takeover did not set a new hash",
+          (owctl.q("SELECT password_hash FROM users WHERE id=?", (oid,))[0]["password_hash"] or "") == "")
+    # with the other account gone, the single-admin seed path works again (first-boot)
+    owctl.execute("DELETE FROM users WHERE username='observer1'")
+    r2 = client.post("/api/auth/login", json={"username": "admin", "password": "recovered-1234"})
+    check("single-admin cleared hash -> seed allowed (first-boot recovery)", r2.status_code == 200, f"got {r2.status_code}")
+
     print(f"\n=== SUMMARY ===\n{sum(1 for _, ok, _ in CHECKS if ok)}/{len(CHECKS)} checks passed")
     failed = [n for n, ok, _ in CHECKS if not ok]
     if failed:

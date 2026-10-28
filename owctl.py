@@ -26,6 +26,7 @@ import faulthandler
 import logging
 import sys
 import bcrypt
+import paramiko
 import ipaddress
 import json
 import os
@@ -587,12 +588,49 @@ def _parse_sections(raw):
     return {k: "\n".join(v).strip() for k, v in sections.items()}
 
 
+def _ssh_known_hosts_path():
+    """On-disk pin for device host keys (trust-on-first-use). Kept under DATA_DIR
+    so it survives restarts — the whole point of pinning is that a *later* process
+    still verifies the host against the key it saw the first time."""
+    return os.path.join(DATA_DIR, "ssh_known_hosts")
+
+
+class _TrustOnFirstUse(paramiko.MissingHostKeyPolicy):
+    """Accept-and-pin on first sight; paramiko verifies every later connection.
+
+    Replaces AutoAddPolicy() (which silently trusted any key — a MITM's fabricated
+    host key was accepted). On a first-seen host we add its key to the client's
+    host-key set and persist it; on every later connection paramiko itself checks
+    the presented key against that set and raises BadHostKeyException on a
+    mismatch (rotated / replaced / MITM'd key). Re-trust a legitimately rotated
+    key by deleting its line from the pin file (or set OWCTL_SSH_TRUST_ANY=1 to
+    revert to accept-all for ephemeral test hosts)."""
+    def __init__(self, pin_path):
+        self.pin_path = pin_path
+    def missing_host_key(self, client, hostname, key):
+        client.get_host_keys().add(hostname, key.get_name(), key)
+        try:
+            os.makedirs(os.path.dirname(self.pin_path) or ".", exist_ok=True)
+            client.save_host_keys(self.pin_path)
+        except Exception:
+            pass  # pinning is best-effort; still connect on first sight
+
+
 def _ssh_connect(dev):
     import paramiko
     import socket as _socket
     from paramiko.ssh_exception import AuthenticationException as SSHAuthError
     c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    pin = _ssh_known_hosts_path()
+    if os.environ.get("OWCTL_SSH_TRUST_ANY") == "1":
+        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # test/ephemeral hosts
+    else:
+        if os.path.exists(pin):
+            try:
+                c.load_host_keys(pin)  # pinned keys become paramiko's verify set
+            except Exception:
+                pass  # unreadable/corrupt pin -> start fresh rather than break SSH
+        c.set_missing_host_key_policy(_TrustOnFirstUse(pin))
     kw = dict(hostname=dev["host"], port=int(dev.get("ssh_port") or 22),
               username=dev.get("ssh_user") or "root", timeout=15,
               banner_timeout=20, auth_timeout=20,
@@ -605,6 +643,11 @@ def _ssh_connect(dev):
         kw["key_filename"] = ensure_server_key()
     try:
         c.connect(**kw)
+    except paramiko.BadHostKeyException as e:
+        raise RuntimeError(
+            f"SSH host key for {dev['host']} does not match the pinned key — "
+            f"possible MITM, or the device's key changed. Verify the device and "
+            f"remove its entry from {pin} to re-trust: {e}") from e
     except SSHAuthError as e:
         if dev.get("ssh_password"):
             raise RuntimeError(f"SSH authentication failed for {dev.get('ssh_user')}@{dev['host']} "
@@ -712,9 +755,21 @@ def _build_status(dev, backend, s):
         essid = parts[0].replace("ESSID:", "").strip('"')
         chan = parts[1].replace("Channel:", "").strip()
         enc = parts[2].replace("Encryption:", "").strip()
-        # Determine band from channel
-        band = "2.4GHz" if chan and int(chan.split()[0]) <= 14 else "5GHz"
-        ap_list.append({"essid": essid, "channel": chan, "band": band, "encryption": enc if enc else "open"})
+        # Determine band from channel. A channel can be non-numeric (device
+        # reported 'auto'/'unknown') or empty — int() would raise ValueError
+        # and, because _build_status is called unguarded in ssh_gather, crash
+        # the ENTIRE gather for this device. Skip the band (None) when the
+        # channel can't be parsed rather than failing the whole status.
+        band = None
+        _first = chan.split()
+        if _first:
+            try:
+                band = "2.4GHz" if int(_first[0]) <= 14 else "5GHz"
+            except (ValueError, TypeError):
+                band = None
+        ap_list.append({
+            "essid": essid, "channel": chan,
+            "band": band, "encryption": enc if enc else "open"})
     st["wifi"] = ap_list
     st["wifi_capable"] = len(ap_list) > 0
     # Parse stations: ESSID\tclient_count
@@ -1139,19 +1194,28 @@ def audit_status(st):
 
 
 def check_config_changes(dev, st):
-    """Detect config file changes since last check."""
+    """Detect config file changes since last check.
+
+    The baseline is the FULL latest snapshot: one row per config path, all
+    sharing the snapshot's ts. The old code used `ORDER BY ts DESC LIMIT 1`,
+    which returned a SINGLE path's row (one of N), so only that one path was
+    ever baselined and changes to every other config file went undetected.
+    """
     changed = []
     current_hashes = st.get("config_hashes", {})
     if not current_hashes:
         return changed
-    prev = q("SELECT hash FROM config_hashes WHERE device_id=? ORDER BY ts DESC LIMIT 1", (dev["id"],))
+    prev = q("SELECT hash FROM config_hashes WHERE device_id=? AND ts=(SELECT MAX(ts) FROM config_hashes WHERE device_id=?)",
+             (dev["id"], dev["id"]))
     if not prev:
         return changed  # first check, no baseline
     prev_map = {}
-    for h in prev[0]["hash"].splitlines():
-        if "=" in h:
-            path, hash_val = h.split("=", 1)
-            prev_map[path] = hash_val
+    for row in prev:
+        # each row is "path=hash"; be tolerant of a multi-line blob too
+        for line in (row["hash"] or "").splitlines():
+            if "=" in line:
+                path, hash_val = line.split("=", 1)
+                prev_map[path] = hash_val
     for path, curr_h in current_hashes.items():
         prev_h = prev_map.get(path)
         if prev_h and prev_h != curr_h:
@@ -2287,12 +2351,19 @@ def push_ssh_key(dev):
         # remotely, de-dup, and set correct permissions.
         import base64
         b64 = base64.b64encode(pub.encode()).decode()
+        # Resolve the SSH user's real home from the session ($HOME, set by
+        # dropbear from /etc/passwd to the account's actual home — /root for
+        # root, $HOME for any non-root user). The old code hardcoded
+        # /home/root, which does not exist on OpenWrt (root's home is /root),
+        # so the key landed in a directory dropbear never consulted and the
+        # follow-up key-only auth check failed on a real device. $HOME is
+        # correct for every user; /root is a safe fallback if it's unset.
         cmd = (
-            "set -e; "
-            "mkdir -p /home/root/.ssh && chmod 700 /home/root/.ssh; "
-            "grep -qF '" + pub + "' /home/root/.ssh/authorized_keys 2>/dev/null || "
-            "printf '%s' '" + b64 + "' | base64 -d >> /home/root/.ssh/authorized_keys; "
-            "chmod 600 /home/root/.ssh/authorized_keys"
+            "set -e; H=\"${HOME:-/root}\"; "
+            "mkdir -p \"$H/.ssh\" && chmod 700 \"$H/.ssh\"; "
+            "grep -qF '" + pub + "' \"$H/.ssh/authorized_keys\" 2>/dev/null || "
+            "printf '%s' '" + b64 + "' | base64 -d >> \"$H/.ssh/authorized_keys\"; "
+            "chmod 600 \"$H/.ssh/authorized_keys\""
         )
         out, err, status = _exec_capture(c, cmd, timeout=60)
         if status != 0:
@@ -2342,12 +2413,30 @@ def do_backup(dev):
     return local
 
 
+def _resolve_backup_path(path):
+    """Confine a user-supplied restore path to the backups directory so it can't
+    read/push an arbitrary server file. Resolves symlinks and `..` so neither
+    `/etc/shadow`, `../etc/passwd`, nor a symlink can escape BACKUP_DIR.
+    Relative paths are anchored at BACKUP_DIR. Returns the safe absolute path;
+    raises 400 (escapes the dir) or 404 (missing/not a file)."""
+    if not path:
+        raise HTTPException(400, "backup path required")
+    root = os.path.realpath(BACKUP_DIR)
+    candidate = path if os.path.isabs(path) else os.path.join(root, path)
+    real = os.path.realpath(candidate)
+    if real != root and not real.startswith(root + os.sep):
+        raise HTTPException(400, "backup path must live under the backups directory")
+    if not os.path.isfile(real):
+        raise HTTPException(404, "backup file not found")
+    return real
+
+
 def do_restore(dev, backup_path):
-    """Restore device config from a backup file. Only for SSH-accessible devices."""
+    """Restore device config from a backup file. Only for SSH-accessible devices.
+    The file must live under the backups directory (see _resolve_backup_path)."""
     if dev["access"] != "ssh":
         raise HTTPException(400, "restore requires SSH access on this device")
-    if not os.path.exists(backup_path):
-        raise HTTPException(404, "backup file not found")
+    backup_path = _resolve_backup_path(backup_path)
     with open(backup_path, "r") as fh:
         content = fh.read()
     if not content.strip():
@@ -3207,19 +3296,22 @@ def do_guest_wifi(dev, ssid, password, vlan_id=None, apply: bool = True):
         out = stdout.read().decode()
         if "wifi-iface" not in out and "wifi-device" not in out:
             raise HTTPException(400, f"{dev['name']} has no wireless interface")
-        # Generate UCI config for guest WiFi
-        # Sanitize: UCI section names can only contain [a-zA-Z0-9_]
-        iface_name = f"guest_{ssid.replace(' ', '_').replace('-', '_')}"
+        # Generate UCI config for guest WiFi. Reuse the shared helpers so the
+        # SSID/password/section name are shell-safe: a quote or backtick in the
+        # SSID or password can no longer break out of the `uci set` line.
+        iface_name = "guest_" + _uci_slug(ssid) if ssid else "guest_guest"
+        sq = _uci_quote
+        vlan_net = f"vlan_{re.sub(r'[^0-9]', '', str(vlan_id))}" if vlan_id else None
         cmd = f"""uci set wireless.{iface_name}=wifi-iface
-uci set wireless.{iface_name}.device='radio0'
-uci set wireless.{iface_name}.network='lan'"""
-        if vlan_id:
-            cmd += f"\nuci set wireless.{iface_name}.network='vlan_{vlan_id}'"
+uci set wireless.{iface_name}.device={sq('radio0')}
+uci set wireless.{iface_name}.network={sq('lan')}"""
+        if vlan_net:
+            cmd += f"\nuci set wireless.{iface_name}.network={sq(vlan_net)}"
         cmd += f"""
-uci set wireless.{iface_name}.mode='ap'
-uci set wireless.{iface_name}.ssid='{ssid}'
-uci set wireless.{iface_name}.encryption='psk2'
-uci set wireless.{iface_name}.key='{password}'
+uci set wireless.{iface_name}.mode={sq('ap')}
+uci set wireless.{iface_name}.ssid={sq(ssid)}
+uci set wireless.{iface_name}.encryption={sq('psk2')}
+uci set wireless.{iface_name}.key={sq(password)}
 uci commit wireless
 uci commit firewall"""
         stdin, stdout, stderr = c.exec_command(cmd, timeout=30)
@@ -3283,13 +3375,19 @@ def check_device(dev):
         findings.append({"rule_id": "config_changed", "severity": "INFO",
                          "message": f"{len(changed)} config file(s) changed",
                          "detail": ", ".join(changed[:5]), "rec": "Review config if unexpected"})
-    # Store config hashes
+    # Store config hashes — ONE row per snapshot, all paths as a single blob
+    # (newline-separated "path=hash" lines). The table's UNIQUE(device_id, ts)
+    # forbids two rows at the same ts, so a one-row-per-path write (the old
+    # approach) silently dropped every path after the first. A single blob row
+    # keeps the constraint intact and the baseline unambiguous: the latest
+    # snapshot is exactly `MAX(ts)`.
     if st.get("config_hashes"):
+        snap_ts = now()
         execute("DELETE FROM config_hashes WHERE device_id=? AND ts<?",
-                (dev["id"], now()))  # keep only latest
-        for path, h in st["config_hashes"].items():
-            execute("INSERT OR IGNORE INTO config_hashes(device_id, ts, hash) VALUES(?,?,?)",
-                    (dev["id"], now(), f"{path}={h}"))
+                (dev["id"], snap_ts))  # keep only latest
+        blob = "\n".join(f"{p}={h}" for p, h in st["config_hashes"].items())
+        execute("INSERT OR REPLACE INTO config_hashes(device_id, ts, hash) VALUES(?,?,?)",
+                (dev["id"], snap_ts, blob))
     # Store config history for diff view
     execute("INSERT INTO config_history(device_id, ts, hash) VALUES(?,?,?)",
             (dev["id"], now(), ";".join(f"{p}={h}" for p,h in st.get("config_hashes",{}).items())))
@@ -3301,10 +3399,17 @@ def check_device(dev):
         for iface, counters in st["traffic"].items():
             execute("INSERT INTO traffic_samples(device_id, ts, iface, rx_bytes, tx_bytes) VALUES(?,?,?,?,?)",
                     (dev["id"], now(), iface, counters["rx"], counters["tx"]))
-        # prune old samples: keep only last 48 per device/iface
+        # prune old samples: keep only last 48 PER INTERFACE (the comment above
+        # always said so; the old query's bare `LIMIT 48` scoped only by device,
+        # so one busy interface evicted every other's samples from the trend
+        # chart). PARTITION BY (device_id, iface) keeps each interface's own 48.
         execute("""DELETE FROM traffic_samples WHERE id NOT IN (
-            SELECT id FROM traffic_samples
-            WHERE device_id=? ORDER BY ts DESC LIMIT 48
+            SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (PARTITION BY device_id, iface ORDER BY ts DESC) AS rn
+                FROM traffic_samples
+                WHERE device_id=?
+            ) WHERE rn <= 48
         ) AND device_id=?""", (dev["id"], dev["id"]))
     # Store recent syslog entries (keep last 100 per device)
     if st.get("syslog"):
@@ -3821,30 +3926,32 @@ def _client_key(request) -> str:
 
 
 def _gen_selfsigned(cert_path: str, key_path: str) -> None:
-    """Generate a self-signed cert if neither exists. ponytail: one-shot fallback;
-    replace with a CA-signed cert in production by setting OWCTL_SSL_CERT/KEY."""
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
-    import datetime as _dt
+    """Generate a self-signed TLS fallback pair (HTTPS is mandatory; this is the
+    one-shot path when no CA cert is configured). Delegates to the shared
+    gen_selfsigned_cert.make_cert so the SAN handling is in exactly one place.
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, "192.168.55.179"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "owctl"),
-    ])
-    now = _dt.datetime.now(_dt.timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now)
-        .not_valid_after(now + _dt.timedelta(days=365))
-        .sign(key, hashes.SHA256())
-    )
+    The SAN covers the real ways a LAN client reaches this box: 127.0.0.1, the
+    configured bind host when it is a concrete IP (0.0.0.0/empty excluded), and
+    the DNS names localhost / owctl / owctl.local. Before this, the inline
+    generator produced a cert with NO SubjectAlternativeName at all (just a
+    hardcoded CN of 192.168.55.179) — modern clients ignore the CN, so any
+    verification against it failed. Replace with a CA-signed cert in production
+    by setting OWCTL_SSL_CERT/KEY (or OWCTL_SSL_CN for a custom CN)."""
+    import gen_selfsigned_cert as gsc
+    from cryptography.hazmat.primitives import serialization
+
+    cn = (os.environ.get("OWCTL_SSL_CN") or "").strip() or "owctl"
+    ips = ["127.0.0.1"]
+    host = (os.environ.get("OWCTL_HOST") or "").strip()
+    if host and host not in ("0.0.0.0", "::", "[::]"):
+        try:
+            ipaddress.ip_address(host)  # raises ValueError for hostnames
+            if host not in ips:
+                ips.append(host)
+        except ValueError:
+            pass
+    dns = ["localhost", "owctl", "owctl.local"]
+    key, cert = gsc.make_cert(cn=cn, days=825, ips=ips, dns=dns)
     with open(cert_path, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
     with open(key_path, "wb") as f:
@@ -6419,28 +6526,35 @@ async def auth_setup(request: Request):
 
 @app.post("/api/auth/login")
 async def auth_login(request: Request):
-    """User login. On first boot (no users) the caller must register as admin."""
+    """User login. On first boot (no user has a password) the first login seeds
+    the admin password; afterwards login only verifies. The seed path is gated
+    on "no user has any password set yet" so a later-cleared hash cannot be
+    re-seeded by whoever logs in next (takeover)."""
     d = await request.json()
     username = (d.get("username") or "").strip()
     password = (d.get("password") or "").strip()
     if not username or not password:
-        raise HTTPException(status_code=400, detail="username and password required")
-    # First-boot: no users at all. Register the caller as the admin.
-    users = q("SELECT 1 FROM users LIMIT 1")
-    if not users:
-        _ensure_default_admin()
+        raise HTTPException(400, "username and password required")
     user = _user_by_username(username)
     if not user:
-        raise HTTPException(status_code=401, detail="invalid credentials")
+        # First boot: no such user. Seed the default admin and continue.
+        _ensure_default_admin()
+        user = _user_by_username(username)
+    if not user:
+        raise HTTPException(401, "invalid credentials")
     if not user["enabled"]:
-        raise HTTPException(status_code=403, detail="account disabled")
+        raise HTTPException(403, "account disabled")
     if not user["password_hash"]:
-        # Password not yet set — seed it (first-time admin setup).
+        # Seed only while NO other account has a password yet (true first-boot).
+        # If some account already has one, refusing the seed means a later-cleared
+        # admin hash can't be re-seeded by whoever logs in next (takeover).
+        if q("SELECT 1 FROM users WHERE password_hash != '' AND id != ? LIMIT 1", (user["id"],)):
+            raise HTTPException(403, "another account already has a password; ask an admin to reset yours")
         user["password_hash"] = _hash_password(password)
         execute("UPDATE users SET password_hash=?, role='admin' WHERE id=?",
                 (user["password_hash"], user["id"]))
     elif not _verify_password(password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="invalid credentials")
+        raise HTTPException(401, "invalid credentials")
     tok = _create_session(user["id"])
     return {"session": tok, "expires_in": _SESSION_TTL, "role": user["role"]}
 

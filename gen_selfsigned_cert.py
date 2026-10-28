@@ -75,7 +75,12 @@ def main():
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     ip_list = a.ip or ["127.0.0.1"]
-    dns_list = a.hostname or []
+    # Union the explicit hostnames with the sensible defaults (cn, cn.local,
+    # localhost) instead of replacing them — before, `--hostname foo` produced a
+    # cert whose SAN only had `foo`, dropping the names clients usually reach it
+    # by (e.g. `owctl.local`). Dedup, preserve order.
+    defaults = [a.cn, f"{a.cn}.local", "localhost"]
+    dns_list = list(dict.fromkeys((a.hostname or []) + defaults))
 
     key, cert = make_cert(cn=a.cn, days=a.days, ips=ip_list, dns=dns_list)
 

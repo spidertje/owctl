@@ -57,6 +57,21 @@ def main():
     check("no certs: self-signed key exists",
           os.path.exists(kw["ssl_keyfile"]), kw.get("ssl_keyfile", ""))
 
+    # SAN: the generated fallback cert MUST carry a SubjectAlternativeName with
+    # 127.0.0.1 + the DNS names (before the fix it had NO SAN at all — just a
+    # hardcoded CN of 192.168.55.179 — so every modern client's verification
+    # failed).
+    from cryptography import x509
+    loaded = x509.load_pem_x509_certificate(open(kw["ssl_certfile"], "rb").read())
+    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    san_ips = san.get_values_for_type(x509.IPAddress)
+    san_dns = san.get_values_for_type(x509.DNSName)
+    check("fallback cert has a SAN (not CN-only)", san_ips or san_dns, f"ips={san_ips} dns={san_dns}")
+    check("fallback cert SAN has 127.0.0.1",
+          any(getattr(ip, "packed", None) == bytes([127, 0, 0, 1]) for ip in san_ips), str(san_ips))
+    check("fallback cert SAN has localhost", "localhost" in san_dns, str(san_dns))
+    check("fallback cert SAN has owctl.local", "owctl.local" in san_dns, str(san_dns))
+
     # both -> TLS kwargs passed through to the provided files
     os.environ["OWCTL_SSL_CERT"] = cert
     os.environ["OWCTL_SSL_KEY"] = key
