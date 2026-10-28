@@ -638,7 +638,7 @@ def _ssh_connect(dev):
     if dev.get("key_path"):
         kw["key_filename"] = dev["key_path"]
     elif dev.get("ssh_password"):
-        kw["password"] = dev["ssh_password"]
+        kw["password"] = _stored_device_cred(dev["ssh_password"])
     else:
         kw["key_filename"] = ensure_server_key()
     try:
@@ -875,10 +875,42 @@ def _luci_schemes(host):
     return _LUCI_SCHEMES[host]
 
 
+def _unverified_tls_ok(host) -> bool:
+    """Whether unverified (self-signed) TLS is acceptable for an outbound
+    connection to `host`.
+
+    Loopback / private / link-local targets (the normal case — self-signed
+    OpenWrt boxes on the LAN) keep CERT_NONE, because demanding a real
+    certificate chain would break every stock device. A host that is a public
+    IP literal, or that resolves to a public address, demands VERIFIED TLS
+    (chain + hostname): owctl should not talk unverified-TLS to the open
+    internet — that path is how a misconfigured (or DNS-rebound) host gets
+    its device session MITM'd. Unresolvable hosts fail closed (verify).
+    """
+    def _ok_ip(ip):
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    try:
+        return _ok_ip(ipaddress.ip_address(host))
+    except ValueError:
+        pass  # not an IP literal — check the resolved address(es)
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False  # unresolvable -> require verification (fail closed)
+    for _fam, _ty, _proto, _canon, sa in infos:
+        try:
+            ip = ipaddress.ip_address(sa[0])
+        except ValueError:
+            return False
+        if not _ok_ip(ip):
+            return False
+    return True
+
+
 def _luci_rpc(dev, method, obj=None, args=None):
     """Call a LuCI RPC method. NOTE: the endpoint is /rpc (NOT /cgi-bin/luci/rpc)."""
     user = dev.get("luci_user") or "root"
-    pw = dev.get("luci_pass") or ""
+    pw = _stored_device_cred(dev.get("luci_pass") or "")
     port = dev.get("luci_port")
     base = f"{dev['host']}:{port}" if port else dev["host"]
     body = json.dumps({"method": "call", "params": ["luci.rpc", method, obj or "", args or []],
@@ -891,9 +923,15 @@ def _luci_rpc(dev, method, obj=None, args=None):
             headers={"Content-Type": "application/json", "Authorization": auth})
         try:
             if scheme == "https":
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+                host_only = (dev.get("host") or "").split(":")[0]
+                if _unverified_tls_ok(host_only):
+                    # self-signed LAN device — the normal case, keep unverified
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                else:
+                    # public / unresolvable host — demand a verified chain
+                    ctx = ssl.create_default_context()
                 r = urllib.request.urlopen(req, timeout=15, context=ctx)
             else:
                 r = urllib.request.urlopen(req, timeout=15)
@@ -1405,6 +1443,69 @@ def _uci_slug(name: str) -> str:
 def _uci_quote(v) -> str:
     """Quote a uci value for a shell-safe `uci set` line."""
     return "'" + str(v).replace("'", "'\\''") + "'"
+
+
+# ─────────────── device credentials: encrypt at rest (SQLite) ───────────────
+# Device SSH/LuCI passwords used to sit in owctl.db as plaintext. They are
+# now AES-256-GCM encrypted before storage (prefix 'enc.v1.' marks an
+# encrypted value). The key lives in the settings table (or the
+# OWCTL_CRED_KEY env var when set), and legacy plaintext rows keep working:
+# reads detect the prefix and decrypt; non-prefixed values are returned as-is
+# (and re-encrypted the next time the device row is written).
+_ENC_PREFIX = "enc.v1."
+_FALLBACK_CRED_KEY = None  # in-memory key when the DB is unavailable (tests)
+
+
+def _load_cred_key() -> bytes:
+    """32-byte key for device-credential encryption (AES-256)."""
+    env = (os.environ.get("OWCTL_CRED_KEY") or "").strip()
+    if env:
+        return base64.b64decode(env)
+    try:
+        key = (get_setting("cred_key", "") or "").strip()
+        if key:
+            return base64.b64decode(key)
+        k = secrets.token_bytes(32)
+        set_setting("cred_key", base64.b64encode(k).decode())
+        return k
+    except Exception:
+        global _FALLBACK_CRED_KEY
+        if _FALLBACK_CRED_KEY is None:
+            _FALLBACK_CRED_KEY = secrets.token_bytes(32)
+        return _FALLBACK_CRED_KEY
+
+
+def _store_device_cred(value: str) -> str:
+    """Encrypt a credential for storage; returns the plaintext unchanged when
+    encryption is unavailable so the app keeps working without `cryptography`.
+    Idempotent: an already-encrypted value passes through untouched."""
+    if not value:
+        return value
+    if isinstance(value, str) and value.startswith(_ENC_PREFIX):
+        return value
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key = _load_cred_key()
+        if not key:
+            return value
+        nonce = secrets.token_bytes(12)
+        ct = AESGCM(key).encrypt(nonce, str(value).encode(), None)
+        return _ENC_PREFIX + base64.b64encode(nonce + ct).decode()
+    except Exception:
+        return value
+
+
+def _stored_device_cred(value) -> str:
+    """Decrypt a stored credential; legacy plaintext passes through untouched."""
+    if not value or not isinstance(value, str) or not value.startswith(_ENC_PREFIX):
+        return value or ""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        raw = base64.b64decode(value[len(_ENC_PREFIX):])
+        nonce, ct = raw[:12], raw[12:]
+        return AESGCM(_load_cred_key()).decrypt(nonce, ct, None).decode()
+    except Exception:
+        return ""  # undecryptable (e.g. key rotated) — treat as empty, never crash
 
 
 def _uci_values(rest: str) -> list:
@@ -2257,9 +2358,14 @@ def _probe(ip):
         try:
             scheme = "http" if http_port == 80 else "https"
             req = urllib.request.Request(f"{scheme}://{ip}/", headers={"User-Agent": "owctl-sweep"})
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            if _unverified_tls_ok(ip):
+                # private/loopback sweep targets keep unverified TLS (self-signed)
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            else:
+                # public IP: verified chain required (fail closed on rejection)
+                ctx = ssl.create_default_context()
             with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
                 head = r.read(1024).decode(errors="replace").lower()
                 res["hints"].append("http:" + (r.headers.get("Server") or "no-server-header"))
@@ -3427,15 +3533,50 @@ def check_device(dev):
 # --------------------------------------------------------------- maintenance
 _shutdown_event = threading.Event()
 _backup_lock = threading.Lock()
+# Throttle for scheduler-driven backups (manual `force=True` bypasses this).
+BACKUP_MIN_INTERVAL_S = 3600
+_last_backup_at = 0.0
 
 
-def _db_backup():
+def _prune_backup_copies():
+    """Keep only the 14 newest DB snapshot copies; delete the rest. Cheap
+    (listdir + unlink) and runs on every backup cycle — even when the
+    snapshot itself is throttled — so the dir never grows unbounded."""
+    removed = 0
+    copies = sorted(
+        (os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR)
+         if f.startswith("owctl-db-") and f.endswith(".db")),
+        key=os.path.getmtime, reverse=True)
+    for old in copies[14:]:
+        try:
+            os.remove(old)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _db_backup(force=False):
     """Snapshot the live sqlite DB to BACKUP_DIR/owctl-db-<ts>.db via VACUUM INTO
     (a consistent, self-contained copy even while the server runs). Keeps the 14
     newest; older copies are deleted. Never raises — a failed backup must not
     break the scheduler; the error is logged and returned in the result dict.
-    """
+    The scheduler calls it without `force`; to bound write amplification and
+    preserve a meaningful retention window, scheduler-driven snapshots are
+    throttled to one per BACKUP_MIN_INTERVAL_S (1h) — the old 'every cycle'
+    call (default 30 min) filled the 14-copy retention in ~7h. Retention
+    pruning still runs on every call (it is cheap); `force=True` (manual
+    /api/backup) always takes a snapshot immediately."""
     logger = logging.getLogger("owctl")
+    if not force:
+        global _last_backup_at
+        if time.time() - _last_backup_at < BACKUP_MIN_INTERVAL_S:
+            try:
+                removed = _prune_backup_copies()
+            except Exception:
+                removed = 0
+            return {"ok": True, "skipped": True, "pruned": removed,
+                    "reason": f"last backup {int(time.time() - _last_backup_at)}s ago (< {BACKUP_MIN_INTERVAL_S}s); manual /api/backup bypasses"}
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     dest = os.path.join(BACKUP_DIR, f"owctl-db-{ts}.db")
     if not _backup_lock.acquire(blocking=False):
@@ -3454,19 +3595,14 @@ def _db_backup():
             src.close()
         size = os.path.getsize(dest)
         # retention: keep the 14 newest copies
-        copies = sorted(
-            (os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR)
-             if f.startswith("owctl-db-") and f.endswith(".db")),
-            key=os.path.getmtime, reverse=True)
         removed = 0
-        for old in copies[14:]:
-            try:
-                os.remove(old)
-                removed += 1
-            except OSError:
-                pass
+        try:
+            removed = _prune_backup_copies()
+        except Exception:
+            removed = 0
         logger.info("db backup: %s (%.1f KB, %d pruned)",
                     os.path.basename(dest), size / 1024, removed)
+        _last_backup_at = time.time()
         return {"ok": True, "path": dest, "size": size, "pruned": removed}
     except Exception as e:
         logger.error("db backup failed: %s", e)
@@ -3564,7 +3700,26 @@ def _scheduler():
 
 
 # --------------------------------------------------------------------- app
-app = FastAPI(title="owctl")
+def _install_thread_pool_hook():
+    """Lifespan context: on startup, bump the default thread pool on the LIVE
+    uvicorn event loop. anyio's default thread limiter is per-event-loop — the
+    old code ran _bump_thread_pool() in a throwaway asyncio.run() loop before
+    uvicorn started, so the running server's pool stayed at the 40-worker
+    default. Doing it here, on the actual request loop, makes the bump stick.
+    """
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app):
+        if _bump_thread_pool():
+            logging.getLogger("owctl").info(
+                "default thread pool raised to 200 on the live event loop")
+        yield
+
+    return _lifespan
+
+
+app = FastAPI(title="owctl", lifespan=_install_thread_pool_hook())
 init_db()
 
 
@@ -4199,8 +4354,8 @@ async def add_device(request: Request):
             "luci_user,luci_pass,luci_port,added_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, host, role, d.get("access") or "ssh",
              int(d.get("ssh_port") or 22), d.get("ssh_user") or "root",
-             d.get("ssh_password") or "", d.get("key_path") or "",
-             d.get("luci_user") or "root", d.get("luci_pass") or "",
+             _store_device_cred(d.get("ssh_password") or ""), d.get("key_path") or "",
+             d.get("luci_user") or "root", _store_device_cred(d.get("luci_pass") or ""),
              (int(d["luci_port"]) if d.get("luci_port") else None), now()))
     except sqlite3.IntegrityError:
         raise HTTPException(400, f"host {host} already registered")
@@ -4226,9 +4381,9 @@ async def update_device(request: Request, did: int):
     # sends a real value when the user actually changes it). Prevents redaction
     # from being mistaken for a credential wipe.
     ssh_pw = (d.get("ssh_password") or "").strip()
-    ssh_pw = ssh_pw if ssh_pw else (dev["ssh_password"] or "")
+    ssh_pw = _store_device_cred(ssh_pw) if ssh_pw else (dev["ssh_password"] or "")
     luci_pw = (d.get("luci_pass") or "").strip()
-    luci_pw = luci_pw if luci_pw else (dev["luci_pass"] or "")
+    luci_pw = _store_device_cred(luci_pw) if luci_pw else (dev["luci_pass"] or "")
     execute("UPDATE devices SET name=?, role=?, access=?, ssh_port=?, ssh_user=?, ssh_password=?, "
             "key_path=?, luci_user=?, luci_pass=?, luci_port=?, tags=? WHERE id=?",
             (g("name", dev["name"]), role, g("access", dev["access"]),
@@ -6459,9 +6614,10 @@ def backups():
 @app.post("/api/backup")
 def backup_now():
     """Take a DB backup on demand (admin). The scheduler also snapshots
-    automatically every audit cycle; this is for taking one right now
-    (e.g. before a risky change) or from the dashboard."""
-    res = _db_backup()
+    automatically (throttled to at most one per hour; manual bypasses the
+    throttle). This endpoint takes one immediately (e.g. before a risky
+    change) or from the dashboard."""
+    res = _db_backup(force=True)
     if not res.get("ok"):
         raise HTTPException(500, res.get("reason") or "backup failed")
     return res
@@ -6833,22 +6989,30 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="
 
 
 def _bump_thread_pool():
-    """anyio's default thread pool (40) is too small for a fleet-control app:
-    every blocking endpoint (SSH, opkg, SMTP, urlopen) runs on it, so a fleet
-    upgrade + scheduler audit + LAN sweep together can exhaust it and queue
-    requests indefinitely (the app looks 'dead' while still running).
-    Bump to 200; silently skip if the anyio API ever changes."""
+    """Bump anyio's default thread pool (40) to 200 — but ONLY when called
+    inside a running event loop (anyio's limiter is per-loop; calling outside
+    one is a safe no-op, not an error).
+    Why it matters: every blocking endpoint (SSH, opkg, SMTP, urlopen) runs
+    on this pool, so a fleet upgrade + scheduler audit + LAN sweep together
+    can exhaust 40 workers and queue requests indefinitely (the app looks
+    'dead' while still running).
+    anyio 4.x API: anyio.to_thread.current_default_thread_limiter()
+    (the old top-level `anyio.current_default_thread_limiter` alias no longer
+    exists in 4.15 — using it raised AttributeError, which the old
+    `except: pass` swallowed, making the whole function a silent no-op).
+    The server actually installs this bump on its live loop via the lifespan
+    hook (_install_thread_pool_hook); this function remains the single
+    implementation both paths (and the robustness check) use."""
     try:
         import anyio
-        async def _bump():
-            try:
-                anyio.current_default_thread_limiter().total_tokens = 200
-            except Exception:
-                pass
-        import asyncio
-        asyncio.run(_bump())
+        try:
+            lim = anyio.to_thread.current_default_thread_limiter()
+        except Exception:
+            return False  # not on an async loop (sync check / import) — safe no-op
+        lim.total_tokens = 200
+        return True
     except Exception:
-        pass  # never let pool tuning take the app down
+        return False  # pool tuning is best-effort; never take the app down
 
 
 def _startup_diagnostics():

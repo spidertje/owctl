@@ -59,10 +59,14 @@ def main():
     check("has_ssh_password flag true", dev.get("has_ssh_password") is True, str(dev.get("has_ssh_password")))
     check("has_luci_pass flag true", dev.get("has_luci_pass") is True, str(dev.get("has_luci_pass")))
 
-    # raw value must still be in the DB (server-side apply paths depend on it)
+    # The seeded row is LEGACY plaintext (inserted directly, pre-encryption):
+    # it must still read back exactly (backward compat), and the API must not
+    # leak it. (Encryption-at-rest for API-written rows is proven separately in
+    # checks_cred_encryption.py, which seeds via the API.)
     row = owctl.q("SELECT ssh_password, luci_pass FROM devices WHERE id=1")
-    check("db still has ssh_password", row[0]["ssh_password"] == "hunter2", str(row[0]))
-    check("db still has luci_pass", row[0]["luci_pass"] == "lucipw", str(row[0]))
+    stored_ssh, stored_luci = row[0]["ssh_password"], row[0]["luci_pass"]
+    check("db: legacy ssh reads back via server path", owctl._stored_device_cred(stored_ssh) == "hunter2", str(stored_ssh))
+    check("db: legacy luci reads back via server path", owctl._stored_device_cred(stored_luci) == "lucipw", str(stored_luci))
 
     # a device with no passwords -> flags false
     owctl.execute(
@@ -78,16 +82,16 @@ def main():
         "name": "r1", "role": "router", "access": "ssh", "ssh_port": 22, "ssh_user": "root",
         "ssh_password": "", "luci_user": "root", "luci_pass": ""})
     row = owctl.q("SELECT ssh_password, luci_pass FROM devices WHERE id=1")
-    check("update with empty pw: ssh_password kept", row[0]["ssh_password"] == "hunter2", str(row[0]))
-    check("update with empty pw: luci_pass kept", row[0]["luci_pass"] == "lucipw", str(row[0]))
+    check("update with empty pw: ssh_password kept", owctl._stored_device_cred(row[0]["ssh_password"]) == "hunter2", str(row[0]))
+    check("update with empty pw: luci_pass kept", owctl._stored_device_cred(row[0]["luci_pass"]) == "lucipw", str(row[0]))
 
-    # a real new value still overwrites
+    # a real new value still overwrites (stored encrypted, decrypts to the new value)
     client.put("/api/devices/1", json={
         "name": "r1", "role": "router", "access": "ssh", "ssh_port": 22, "ssh_user": "root",
         "ssh_password": "newpass123", "luci_user": "root", "luci_pass": ""})
     row = owctl.q("SELECT ssh_password, luci_pass FROM devices WHERE id=1")
-    check("update with new pw: overwritten", row[0]["ssh_password"] == "newpass123", str(row[0]))
-    check("update with new pw: luci kept", row[0]["luci_pass"] == "lucipw", str(row[0]))
+    check("update with new pw: overwritten", owctl._stored_device_cred(row[0]["ssh_password"]) == "newpass123", str(row[0]))
+    check("update with new pw: luci kept", owctl._stored_device_cred(row[0]["luci_pass"]) == "lucipw", str(row[0]))
 
     print(f"\n=== SUMMARY ===\n{sum(1 for _, ok, _ in CHECKS if ok)}/{len(CHECKS)} checks passed")
     failed = [n for n, ok, _ in CHECKS if not ok]
