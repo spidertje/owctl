@@ -20,6 +20,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>owctl — OpenWrt control</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20x='2'%20y='2'%20width='60'%20height='60'%20rx='15'%20fill='%232b82e0'/%3E%3Cg%20stroke='%23fff'%20stroke-width='3'%20stroke-linecap='round'%3E%3Cline%20x1='32'%20y1='41'%20x2='20'%20y2='30'/%3E%3Cline%20x1='32'%20y1='41'%20x2='44'%20y2='30'/%3E%3Cline%20x1='32'%20y1='41'%20x2='32'%20y2='25'/%3E%3C/g%3E%3Ccircle%20cx='20'%20cy='30'%20r='4'%20fill='%23eaf3ff'/%3E%3Ccircle%20cx='44'%20cy='30'%20r='4'%20fill='%23eaf3ff'/%3E%3Ccircle%20cx='32'%20cy='25'%20r='4'%20fill='%23fff'/%3E%3Ccircle%20cx='32'%20cy='41'%20r='6.5'%20fill='%23fff'/%3E%3Ccircle%20cx='32'%20cy='41'%20r='2.6'%20fill='%232b82e0'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#0f1420;--panel:#161d2e;--panel2:#1c2540;--tx:#dbe4f5;--mut:#8b98b8;--acc:#4da3ff;--ok:#39c07f;--warn:#f5b544;--bad:#f4636e;--crit:#ff5470;--line:#26314f}
 .light{--bg:#f0f2f5;--panel:#fff;--panel2:#e8eaf0;--tx:#1a1a2e;--mut:#6b7280;--acc:#2563eb;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--crit:#e11d48;--line:#d1d5db}
@@ -31,7 +32,11 @@ body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var
 #login-gate[hidden]{display:none}
 .lg-box{width:100%;max-width:360px;background:var(--panel);border:1px solid var(--line);border-radius:14px;
   padding:26px 24px;text-align:center}
-.lg-logo{font-size:40px;line-height:1;margin-bottom:6px}
+.lg-logo{font-size:40px;line-height:1;margin-bottom:6px;display:flex;justify-content:center}
+.ow-logo{display:block}
+.lg-logo .ow-logo{width:72px;height:72px}
+#ow-hdr-logo{display:inline-flex;align-items:center;line-height:0}
+#ow-hdr-logo .ow-logo{width:30px;height:30px;margin-right:2px;vertical-align:middle}
 .lg-box h1{font-size:24px;margin:2px 0 4px;font-weight:650}
 .lg-box h1 span{color:var(--acc)}
 .lg-sub{color:var(--mut);font-size:13px;margin:0 0 16px}
@@ -120,7 +125,28 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
 <body>
 <div id="login-gate">
   <div class="lg-box">
-    <div class="lg-logo">🛰️</div>
+    <div class="lg-logo">
+      <svg class="ow-logo" viewBox="0 0 64 64" role="img" aria-label="owctl" xmlns="http://www.w3.org/2000/svg">
+        <rect x="3" y="3" width="58" height="58" rx="15" fill="#2f83e8"/>
+        <rect x="3" y="3" width="58" height="58" rx="15" fill="none" stroke="#fff" stroke-opacity="0.28" stroke-width="2"/>
+        <g fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round">
+          <path d="M25 39 a9.5 9.5 0 0 1 14 0"/>
+          <path d="M20 45 a16 16 0 0 1 24 0"/>
+        </g>
+        <circle cx="32" cy="45" r="3.8" fill="#fff"/>
+        <g fill="#0e1a33" stroke="#fff" stroke-width="1.4">
+          <circle cx="17" cy="21" r="4.2"/>
+          <circle cx="32" cy="16" r="4.2"/>
+          <circle cx="47" cy="21" r="4.2"/>
+        </g>
+        <g stroke="#fff" stroke-opacity="0.65" stroke-width="1.6">
+          <line x1="32" y1="42" x2="18" y2="24"/>
+          <line x1="32" y1="42" x2="32" y2="19"/>
+          <line x1="32" y1="42" x2="46" y2="24"/>
+        </g>
+        <circle cx="52" cy="12" r="5.2" fill="#39c07f" stroke="#fff" stroke-width="2.2"/>
+      </svg>
+    </div>
     <h1>ow<span>ctl</span></h1>
     <p id="login-sub" class="lg-sub">OpenWrt control + threat watch — sign in with your account.</p>
     <div class="lg-body">
@@ -144,7 +170,31 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
   </div>
 </div>
 <header>
-  <h1>ow<span>ctl</span> <span class="pill">OpenWrt control + threat watch</span></h1>
+  <h1>
+    <span id="ow-hdr-logo">
+      <svg class="ow-logo" viewBox="0 0 64 64" role="img" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+        <rect x="3" y="3" width="58" height="58" rx="15" fill="#2f83e8"/>
+        <rect x="3" y="3" width="58" height="58" rx="15" fill="none" stroke="#fff" stroke-opacity="0.28" stroke-width="2"/>
+        <g fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round">
+          <path d="M25 39 a9.5 9.5 0 0 1 14 0"/>
+          <path d="M20 45 a16 16 0 0 1 24 0"/>
+        </g>
+        <circle cx="32" cy="45" r="3.8" fill="#fff"/>
+        <g fill="#0e1a33" stroke="#fff" stroke-width="1.6">
+          <circle cx="17" cy="21" r="4.4"/>
+          <circle cx="32" cy="16" r="4.4"/>
+          <circle cx="47" cy="21" r="4.4"/>
+        </g>
+        <g stroke="#fff" stroke-opacity="0.6" stroke-width="1.8">
+          <line x1="32" y1="42" x2="18" y2="24"/>
+          <line x1="32" y1="42" x2="32" y2="19"/>
+          <line x1="32" y1="42" x2="46" y2="24"/>
+        </g>
+        <circle cx="52" cy="12" r="5.4" fill="#39c07f" stroke="#fff" stroke-width="2.4"/>
+      </svg>
+    </span>
+    ow<span>ctl</span> <span class="pill">OpenWrt control + threat watch</span>
+  </h1>
   <nav>
     <button data-tab="network" class="on">Home</button>
      <button data-tab="devices">Devices</button>
@@ -156,6 +206,7 @@ pre{background:#0b111e;border:1px solid var(--line);border-radius:8px;padding:10
      <button data-tab="users" class="adm-only" style="display:none">Users</button>
   </nav>
   <button class="act" id="theme-btn" onclick="toggleTheme()" title="Toggle theme" style="margin-left:auto">🌓</button>
+  <button class="act" onclick="openPassModal()" title="Change my password" style="padding:4px 10px;font-size:12px">Change password</button>
   <span id="pending-apply" style="display:none;align-items:center;gap:6px;margin-left:8px">
     <span class="badge b-MEDIUM" id="pending-badge" title="Show pending changes" style="font-size:11px;padding:2px 8px;cursor:pointer" onclick="pendingPanel()"></span>
     <button class="act pri" id="pending-apply-btn" onclick="applyAllPending()" style="padding:4px 10px;font-size:12px">Apply pending changes</button>
@@ -1322,13 +1373,18 @@ async function renderMap(){
     children.forEach((r,i)=>pos[r.device.id]={x:childrenX[i],y:row1Y,type:r.device.role==='ap'?'ap':'wired'});
     orphans.forEach((r,i)=>pos[r.device.id]={x:orphansX[i],y:row2Y,type:r.device.role==='ap'?'ap':'wired'});
     const xvals=Object.values(pos).map(p=>p.x);
+    const yvals=Object.values(pos).map(p=>p.y);
     const minx=Math.min(0,...xvals),maxx=Math.max(0,...xvals);
+    // Derive the viewBox from the ACTUAL content bounding box so the whole
+    // device graph (router + children + orphans) is centered and visible.
+    // Previously oy was pinned to +topPad while the topmost node (the router)
+    // sat at y=0, which pushed the router OFFSCREEN above the visible region.
+    const miny=Math.min(...yvals),maxy=Math.max(...yvals);
     const topPad=90,botPad=70;
-    const maxy=Math.max(row1Y,orphans.length?row2Y:row1Y);
     const padL=60,padR=60;
-    const ox=minx-padL, oy=topPad;
+    const ox=minx-padL, oy=miny-topPad;
     const vbW=(maxx-minx)+nodeW+padL+padR;
-    const vbH=(maxy-topPad+nodeH)+botPad;
+    const vbH=(maxy-miny+nodeH)+topPad+botPad;
     svg.setAttribute('viewBox',`${ox} ${oy} ${vbW} ${vbH}`);
 
     let s='';
@@ -3200,7 +3256,7 @@ async function loadUsers(){
   const el=document.getElementById('user-list');if(!el)return;
   try{
     const users=await api('/users');
-    el.innerHTML=users.length?'<table class="ut">'+users.map(u=>`<tr><td>${esc(u.username)}</td><td><span class="pill" style="font-size:11px">${esc(u.role)}</span></td><td>${u.enabled?'<span style="color:var(--ok)">active</span>':'<span style="color:var(--bad)">disabled</span>'}</td><td>${u.last_login||''}</td><td>${u.id!==1?`<button onclick="toggleUser(${u.id},${u.enabled?0:1})" style="padding:3px 8px;border-radius:5px;border:1px solid var(--line);background:transparent;color:var(--tx);cursor:pointer">${u.enabled?'Disable':'Enable'}</button><button onclick="deleteUser(${u.id})" style="padding:3px 8px;border-radius:5px;border:1px solid var(--bad);background:transparent;color:var(--bad);cursor:pointer;margin-left:4px">Delete</button>`:''}</td></tr>`).join(''):'<p>No users.</p>';
+    el.innerHTML=users.length?'<table class="ut">'+users.map(u=>`<tr><td>${esc(u.username)}</td><td><span class="pill" style="font-size:11px">${esc(u.role)}</span></td><td>${u.enabled?'<span style="color:var(--ok)">active</span>':'<span style="color:var(--bad)">disabled</span>'}</td><td>${u.last_login||''}</td><td>${u.id!==1?`<button onclick="toggleUser(${u.id},${u.enabled?0:1})" style="padding:3px 8px;border-radius:5px;border:1px solid var(--line);background:transparent;color:var(--tx);cursor:pointer">${u.enabled?'Disable':'Enable'}</button><button onclick="resetUserPass(${u.id})" style="padding:3px 8px;border-radius:5px;border:1px solid var(--line);background:transparent;color:var(--tx);cursor:pointer;margin-left:4px">Reset&nbsp;pw</button><button onclick="deleteUser(${u.id})" style="padding:3px 8px;border-radius:5px;border:1px solid var(--bad);background:transparent;color:var(--bad);cursor:pointer;margin-left:4px">Delete</button>`:''}</td></tr>`).join(''):'<p>No users.</p>';
   }catch(e){el.textContent='Error loading users: '+e.message;}
 }
 async function addUser(){
@@ -3218,6 +3274,56 @@ async function toggleUser(uid,on){
 async function deleteUser(uid){
   if(!confirm('Delete this user?'))return;
   try{await api('/users/'+uid,{method:'DELETE'});toast('Deleted');loadUsers();}
+  catch(e){toast(e.message,true);}
+}
+
+/* ── Password management (self-service + admin reset) ─────────────────── */
+function openPassModal(){
+  if(document.getElementById('pass-modal'))return;
+  const m=document.createElement('div');
+  m.id='pass-modal';
+  m.style.cssText='position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;padding:16px';
+  m.innerHTML=
+    '<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;width:100%;max-width:380px">'+
+      '<h2 style="margin:0 0 4px;font-size:17px">Change my password</h2>'+
+      '<p class="small muted" style="margin:0 0 14px">Applies to your account only.</p>'+
+      '<div style="display:flex;flex-direction:column;gap:10px">'+
+        '<label class="small muted">Current password<input id="pc-cur" type="password" autocomplete="current-password" style="width:100%;margin-top:4px;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--tx)"></label>'+
+        '<label class="small muted">New password (min 4 chars)<input id="pc-new" type="password" autocomplete="new-password" style="width:100%;margin-top:4px;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--tx)"></label>'+
+        '<label class="small muted">Confirm new password<input id="pc-conf" type="password" autocomplete="new-password" style="width:100%;margin-top:4px;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--tx)"></label>'+
+        '<div id="pc-err" class="lg-err" role="alert"></div>'+
+        '<div class="row" style="justify-content:flex-end;gap:8px">'+
+          '<button class="act" onclick="document.getElementById(\'pass-modal\').remove()">Cancel</button>'+
+          '<button class="act pri" id="pc-go" onclick="submitMyPass()">Save password</button>'+
+        '</div>'+
+      '</div>'+
+    '</div>';
+  m.onclick=e=>{if(e.target===m)m.remove()};
+  document.body.appendChild(m);
+  setTimeout(()=>document.getElementById('pc-cur').focus(),0);
+}
+async function submitMyPass(){
+  const cur=document.getElementById('pc-cur').value||'';
+  const nw=document.getElementById('pc-new').value||'';
+  const cf=document.getElementById('pc-conf').value||'';
+  const err=document.getElementById('pc-err');
+  const go=document.getElementById('pc-go');
+  err.textContent='';
+  if(!cur){err.textContent='Enter your current password';return;}
+  if(nw.length<4){err.textContent='New password must be at least 4 characters';return;}
+  if(nw!==cf){err.textContent='New passwords do not match';return;}
+  go.disabled=true;
+  try{
+    await api('/users/me/password-change',{method:'POST',body:JSON.stringify({current_password:cur,new_password:nw})});
+    document.getElementById('pass-modal').remove();
+    toast('Password updated');
+  }catch(e){err.textContent=e.message||String(e);go.disabled=false;}
+}
+async function resetUserPass(uid){
+  const pw=prompt('New password for this user (min 4 chars):');
+  if(pw===null)return;
+  if((pw||'').length<4){toast('Password must be at least 4 characters',true);return;}
+  try{await api('/users/'+uid,{method:'PUT',body:JSON.stringify({password:pw})});toast('Password reset');}
   catch(e){toast(e.message,true);}
 }
 

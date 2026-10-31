@@ -339,6 +339,9 @@ _SESSION_TTL = 86400  # 24h
 _OBSERVER_OK_POST = {
     "/api/devices/{did}/check", "/api/devices/{did}/test",
     "/api/devices/{did}/heartbeat", "/api/sweep",
+    # self-service: a logged-in user changes their OWN password (resolved from
+    # the bearer token, never another account) — allowed for every role.
+    "/api/users/me/password-change",
 }
 # Mutating paths observers can never touch, even if the route is a POST.
 _ADMIN_ONLY_PATHS = {
@@ -356,8 +359,6 @@ _ADMIN_ONLY_PATHS = {
     "/api/devices/{did}/routes", "/api/devices/{did}/routes/delete",
     "/api/devices/{did}/policy-routes", "/api/devices/{did}/bgp",
     "/api/routes/apply", "/api/routes/delete",
-    # self-service password change
-    "/api/users/me/password-change",
 }
 
 
@@ -6776,6 +6777,19 @@ async def users_update(uid: int, request: Request):
 def users_delete(uid: int):
     execute("DELETE FROM users WHERE id=?", (uid,))
     return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    """Who is the caller (resolved from the bearer token). Read-only; the
+    middleware already rejected unauthenticated /api/ requests, so a valid
+    session is guaranteed here. Returns {username, role, id} or 401."""
+    auth = request.headers.get("authorization", "").split(" ", 1)
+    if len(auth) == 2 and auth[0].lower() == "bearer":
+        u = _session_user(auth[1].strip())
+        if u:
+            return {"username": u["username"], "role": u["role"], "id": u["id"]}
+    raise HTTPException(401, "no valid session")
 
 
 @app.post("/api/users/me/password-change")
