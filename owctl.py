@@ -287,6 +287,11 @@ def init_db():
         execute("ALTER TABLE device_status ADD COLUMN wifi_capable INTEGER")
     except sqlite3.OperationalError:
         pass
+    # Idempotent migration for firmware_info column.
+    try:
+        execute("ALTER TABLE device_status ADD COLUMN firmware_info TEXT")
+    except sqlite3.OperationalError:
+        pass
     # Idempotent migration for databases created before the tags column existed.
     try:
         execute("ALTER TABLE devices ADD COLUMN tags TEXT")
@@ -524,6 +529,11 @@ def record_status_snapshot(dev_row, st):
             cols += ["installed_pkgs", "obsolete_pkgs", "meshd", "upgradable_pkgs"]
             vals += [_json.dumps(installed or []), _json.dumps(obsolete or []), meshd,
                      _json.dumps(upgradable or [])]
+        # firmware_info: JSON-encoded dict from parse_openwrt_release
+        firmware_info = st.get("firmware_info")
+        if firmware_info is not None and isinstance(firmware_info, dict) and firmware_info:
+            cols += ["firmware_info"]
+            vals += [_json.dumps(firmware_info)]
         # Null-safe: only write a column when its source is present.
         set_clause = ", ".join(
             f"{c}=excluded.{c}" for c, v in zip(cols, vals) if v is not None
@@ -700,6 +710,7 @@ def _exec_capture(client, cmd, timeout=300):
 def _build_status(dev, backend, s):
     st = {"backend": backend, "online": True, "host": dev["host"], "name": dev["name"]}
     st["firmware"] = s.get("release", "")
+    st["firmware_info"] = parse_openwrt_release(s.get("release", ""))
     st["model"] = s.get("model", "")
     st["device_date"] = s.get("date", "")
     st["uptime_s"] = int(s.get("uptime") or 0)
@@ -1285,6 +1296,63 @@ def _uci_unquote(val: str) -> str:
         if val[0] == '"' and val[-1] == '"':
             return val[1:-1]
     return val
+
+
+def parse_openwrt_release(text: str) -> dict:
+    """Parse /etc/openwrt_release content (DISTRIB_* lines OR single description line).
+
+    Returns a dict with keys: description, version, arch, target, revision.
+    Each value is a string or None when absent. The 'description' key holds
+    DISTRIB_DESCRIPTION when present; otherwise the entire trimmed text (single-line
+    fallback). When text is empty/blank, all values are None except description=''.
+    """
+    # Default all-None dict
+    result = {
+        "description": None,
+        "version": None,
+        "arch": None,
+        "target": None,
+        "revision": None,
+    }
+    if not text or not text.strip():
+        result["description"] = ""
+        return result
+
+    # Try to parse DISTRIB_* lines
+    distrib = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"DISTRIB_(\w+)='?(.*?)'?$", line)
+        if m:
+            key = m.group(1).lower()
+            val = m.group(2)
+            distrib[key] = val
+
+    if distrib:
+        # DISTRIB_* format found
+        result["description"] = distrib.get("description", "")
+        result["version"] = distrib.get("version")
+        result["arch"] = distrib.get("arch")
+        result["target"] = distrib.get("target")
+        result["revision"] = distrib.get("revision")
+    else:
+        # Single-line fallback: the whole text is the description
+        result["description"] = text.strip()
+
+    # Fallback extraction from description when DISTRIB fields missing
+    desc = result["description"] or ""
+    if not result["version"]:
+        m = re.search(r"(\d+\.\d+(?:\.\d+)*)", desc)
+        if m:
+            result["version"] = m.group(1)
+    if not result["revision"]:
+        m = re.search(r"\br\d+-[0-9a-f]+", desc)
+        if m:
+            result["revision"] = m.group(0)
+
+    return result
 
 
 def parse_uci_show(raw: str) -> dict:
@@ -4226,18 +4294,27 @@ def network_overview():
     """
     rows = q("""SELECT d.id, d.name, d.host, d.role, d.access, d.status,
                       d.health_score, d.last_checked,
-                      s.clients, s.uptime_s, s.firmware
+                      s.clients, s.uptime_s, s.firmware, s.firmware_info
                FROM devices d
                LEFT JOIN device_status s ON s.device_id = d.id
                ORDER BY d.id""")
     devices = []
     for r in rows:
+        fi = r["firmware_info"]
+        firmware_info = None
+        if fi:
+            try:
+                import json as _json
+                firmware_info = _json.loads(fi)
+            except Exception:
+                firmware_info = None
         devices.append({
             "id": r["id"], "name": r["name"], "host": r["host"],
             "role": r["role"], "access": r["access"], "status": r["status"],
             "health_score": r["health_score"], "last_checked": r["last_checked"],
             "clients": r["clients"], "uptime_s": r["uptime_s"],
             "firmware": r["firmware"],
+            "firmware_info": firmware_info,
         })
 
     # Gateway: settings.network_gateway -> device id, if that device exists.
@@ -4252,17 +4329,26 @@ def network_overview():
     gateway_missing = True
     if gw_id is not None:
         gw_rows = q("""SELECT d.id, d.name, d.host, d.status, d.health_score,
-                              d.last_checked, s.uptime_s, s.firmware
+                              d.last_checked, s.uptime_s, s.firmware, s.firmware_info
                        FROM devices d
                        LEFT JOIN device_status s ON s.device_id = d.id
                        WHERE d.id=?""", (gw_id,))
         if gw_rows:
             g = gw_rows[0]
+            fi = g["firmware_info"]
+            gateway_firmware_info = None
+            if fi:
+                try:
+                    import json as _json
+                    gateway_firmware_info = _json.loads(fi)
+                except Exception:
+                    gateway_firmware_info = None
             gateway = {
                 "id": g["id"], "name": g["name"], "host": g["host"],
                 "status": g["status"], "health_score": g["health_score"],
                 "firmware": g["firmware"], "uptime_s": g["uptime_s"],
                 "last_checked": g["last_checked"],
+                "firmware_info": gateway_firmware_info,
             }
             gateway_missing = False
 
