@@ -5657,9 +5657,9 @@ def parse_switch_port_map(output):
 
 def read_switch_port_map(dev):
     """Live per-port link state keyed by switch port index. Reads the port
-    name + phys_port_id from sysfs for every port on the device's first
-    switch. Returns {index:{name,up}} — possibly empty (wifi-only box or
-    LuCI-only access); never raises."""
+    name + operstate from sysfs for every port on the device's first
+    switch that has a ports directory. Returns {index:{name,up}} — possibly
+    empty (wifi-only box or LuCI-only access); never raises."""
     if dev["access"] != "ssh":
         return {}
     try:
@@ -5667,10 +5667,15 @@ def read_switch_port_map(dev):
         try:
             out, _e, _s = _exec_capture(
                 c,
-                "for d in /sys/class/switch/switch0/ports/*/; do "
-                "i=$(basename $d); [ -n \"$i\" ] || continue; "
-                "n=$(cat $d/name 2>/dev/null); [ -n \"$n\" ] || n=$i; "
-                "v=$(cat $d/phys_port_id 2>/dev/null); [ -n \"$v\" ] || v=0; "
+                "sw=\"\"; for s in /sys/class/switch/switch0 /sys/class/switch/switch*; do "
+                "[ -d \"$s/ports\" ] && { sw=\"$s\"; break; }; done; "
+                "[ -n \"$sw\" ] || { exit 0; }; "
+                "for d in \"$sw\"/ports/*/; do "
+                "[ -d \"$d\" ] || continue; "
+                "i=$(basename \"$d\"); [ -n \"$i\" ] || continue; "
+                "n=$(cat \"$d\"/name 2>/dev/null); [ -n \"$n\" ] || n=$i; "
+                "st=$(cat \"$d\"/operstate 2>/dev/null); "
+                "case \"$st\" in up) v=1;; *) v=0;; esac; "
                 "echo \"port $i $n $v\"; "
                 "done 2>/dev/null; true",
                 timeout=30)
