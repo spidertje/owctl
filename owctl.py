@@ -4313,12 +4313,22 @@ def network_overview():
         status = "online"
 
     recent_offline = []
-    for r in q("SELECT device_name, went_offline, offline_seconds "
+    for r in q("SELECT device_name, went_offline, went_online, offline_seconds "
                "FROM offline_events ORDER BY id DESC LIMIT 5"):
+        try:
+            t_off = datetime.fromisoformat(r["went_offline"].replace(" ", "T"))
+            if r["went_online"]:
+                t_on = datetime.fromisoformat(r["went_online"].replace(" ", "T"))
+            else:
+                t_on = datetime.fromisoformat(now().replace(" ", "T"))
+            offline_seconds = max(0, int((t_on - t_off).total_seconds()))
+        except Exception:
+            offline_seconds = 0
         recent_offline.append({
             "device_name": r["device_name"],
             "went_offline": r["went_offline"],
-            "offline_seconds": r["offline_seconds"],
+            "went_online": r["went_online"],
+            "offline_seconds": offline_seconds,
         })
 
     vlans = list_vlans()
