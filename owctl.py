@@ -356,6 +356,8 @@ _ADMIN_ONLY_PATHS = {
     "/api/devices/{did}/routes", "/api/devices/{did}/routes/delete",
     "/api/devices/{did}/policy-routes", "/api/devices/{did}/bgp",
     "/api/routes/apply", "/api/routes/delete",
+    # self-service password change
+    "/api/users/me/password-change",
 }
 
 
@@ -6773,6 +6775,58 @@ async def users_update(uid: int, request: Request):
 @app.delete("/api/users/{uid}")
 def users_delete(uid: int):
     execute("DELETE FROM users WHERE id=?", (uid,))
+    return {"ok": True}
+
+
+@app.post("/api/users/me/password-change")
+async def users_me_password_change(request: Request):
+    """Self-service password change for the currently authenticated user.
+    
+    Body: {current_password, new_password}
+    Resolves caller from bearer token (NOT from body id).
+    Verifies current_password matches stored hash.
+    Requires new_password length >= 4.
+    Updates only that caller's password.
+    """
+    # Extract bearer token
+    auth = request.headers.get("authorization", "").split(" ", 1)
+    if len(auth) != 2 or auth[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = auth[1].strip()
+    
+    # Resolve caller from session
+    caller = _session_user(token)
+    if not caller:
+        raise HTTPException(status_code=401, detail="invalid or expired session")
+    if not caller["enabled"]:
+        raise HTTPException(status_code=403, detail="account disabled")
+    
+    # Parse body
+    try:
+        d = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    
+    current_password = (d.get("current_password") or "").strip()
+    new_password = (d.get("new_password") or "").strip()
+    
+    if not current_password:
+        raise HTTPException(status_code=400, detail="current_password required")
+    if not new_password:
+        raise HTTPException(status_code=400, detail="new_password required")
+    
+    # Verify current password
+    if not caller.get("password_hash") or not _verify_password(current_password, caller["password_hash"]):
+        raise HTTPException(status_code=400, detail="current password is incorrect")
+    
+    # Validate new password length
+    if len(new_password) < 4:
+        raise HTTPException(status_code=400, detail="new password must be at least 4 characters")
+    
+    # Update the caller's password
+    new_hash = _hash_password(new_password)
+    execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, caller["id"]))
+    
     return {"ok": True}
 
 
