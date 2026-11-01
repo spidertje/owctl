@@ -355,7 +355,10 @@ async function renderNetwork() {
         <div class="kv"><span>Name</span><strong>${esc(gw.name)}</strong></div>
         <div class="kv"><span>Host</span><span>${esc(gw.host)}</span></div>
         <div class="kv"><span>Status</span><span class="badge b-${gw.status}">${gw.status}</span></div>
-        <div class="kv"><span>Firmware</span><span class="small">${esc(gw.firmware)}</span></div>
+        <div class="kv"><span>Version</span><span class="small">${esc((gw.firmware_info&&gw.firmware_info.description)||gw.firmware||'—')}</span></div>
+        <div class="kv"><span>Architecture</span><span class="small">${esc((gw.firmware_info&&gw.firmware_info.arch)||'—')}</span></div>
+        <div class="kv"><span>HW target</span><span class="small">${esc((gw.firmware_info&&gw.firmware_info.target)||'—')}</span></div>
+        <div class="kv"><span>Distribution version</span><span class="small">${esc((gw.firmware_info&&gw.firmware_info.revision)||'—')}</span></div>
         <div class="kv"><span>Uptime</span><span>${fmtUptime(gw.uptime_s)}</span></div>
       ` : '<p class="muted">No gateway set. Assign one in the table below.</p>'}
     </div>`;
