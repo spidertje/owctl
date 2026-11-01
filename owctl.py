@@ -6845,6 +6845,11 @@ async def users_create(request: Request):
     role = (d.get("role") or "observer").strip()
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password required")
+    # Same min-length as first-boot setup, self-service password-change, and the
+    # dashboard: a 1-3 char password is accepted here but rejected on every other
+    # password-setting path, so an admin could mint a trivially weak account.
+    if len(password) < 4:
+        raise HTTPException(status_code=400, detail="password must be at least 4 characters")
     if role not in _ROLES:
         raise HTTPException(status_code=400, detail=f"role must be one of {_ROLES}")
     if _user_by_username(username):
