@@ -76,6 +76,10 @@ main{padding:18px 20px;max-width:1200px;margin:0 auto}
 .b-CRITICAL{background:#4a1020;color:var(--crit)}
 .b-bad{background:#4a1020;color:var(--crit)} .b-error{background:#4a1020;color:var(--crit)}
 .bad{color:var(--bad)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle;flex:none}
+.dot-online{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.dot-offline{background:var(--bad);box-shadow:0 0 5px var(--bad)}
+.dot-unknown{background:var(--mut)}
 button.act{background:var(--panel2);color:var(--tx);border:1px solid var(--line);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:13px}
 .act[style*="flex-direction:column"]{flex-direction:column;align-items:flex-start;text-align:left;min-width:140px;padding:10px 12px}
 button.act:hover{border-color:var(--acc)}
@@ -1027,7 +1031,7 @@ async function renderDevices(){
         <input type="checkbox" class="bulk-cb" data-id="${d.id}" onchange="updateBulkBtn()">
         <span class="small muted">${esc(d.host)}</span>
       </div>
-      <h3>${esc(d.name)} <span>${badge}${hs}${tags}</span></h3>
+      <h3><span class="dot dot-${d.status||'unknown'}" title="${esc(d.status||'unknown')}"></span>${esc(d.name)} <span>${badge}${hs}${tags}</span></h3>
       <div class="kv"><span>Last checked</span><span class="small">${esc(d.last_checked||'never')}</span></div>
       <div id="devinfo-${d.id}"></div>
       <div class="row fsec">
