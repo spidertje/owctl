@@ -1318,16 +1318,17 @@ def parse_openwrt_release(text: str) -> dict:
         result["description"] = ""
         return result
 
-    # Try to parse DISTRIB_* lines
+    # Try to parse DISTRIB_* lines. OpenWrt emits these either one per line
+    # (classic) or space-separated across one/few lines (e.g. 192.168.30.1);
+    # finditer + quote-alternation handles both, quoted or unquoted values.
     distrib = {}
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        m = re.match(r"DISTRIB_(\w+)='?(.*?)'?$", line)
-        if m:
+        for m in re.finditer(r"DISTRIB_(\w+)=(?:'([^']*)'|\"([^\"]*)\"|(\S+))", line):
             key = m.group(1).lower()
-            val = m.group(2)
+            val = m.group(2) or m.group(3) or m.group(4) or ""
             distrib[key] = val
 
     if distrib:

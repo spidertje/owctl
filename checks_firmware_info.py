@@ -46,7 +46,21 @@ check("parse: single-line revision extracted", res2["revision"] == "r24046-85e40
 check("parse: single-line arch is None", res2["arch"] is None, str(res2))
 check("parse: single-line target is None", res2["target"] is None, str(res2))
 
-# 3) Empty string
+# 3) Space-separated (one DISTRIB_* per token, not per line) — the 192.168.30.1
+#    lantiq/xrx200 format. Regression guard: the old $-anchored re.match only
+#    grabbed the first key on a line and swallowed the rest into a garbage value.
+space_sep = (
+    "DISTRIB_ID='OpenWrt' DISTRIB_RELEASE='24.10.4' DISTRIB_REVISION='r28959-29397011cc' DISTRIB_TARGET='lantiq/xrx200'\n"
+    "DISTRIB_ARCH='mips_24kc' DISTRIB_DESCRIPTION='OpenWrt 24.10.4 r28959-29397011cc' DISTRIB_TAINTS=''"
+)
+res_ss = owctl.parse_openwrt_release(space_sep)
+check("parse: space-sep description", res_ss["description"] == "OpenWrt 24.10.4 r28959-29397011cc", str(res_ss))
+check("parse: space-sep version", res_ss["version"] == "24.10.4", str(res_ss))
+check("parse: space-sep arch", res_ss["arch"] == "mips_24kc", str(res_ss))
+check("parse: space-sep target", res_ss["target"] == "lantiq/xrx200", str(res_ss))
+check("parse: space-sep revision", res_ss["revision"] == "r28959-29397011cc", str(res_ss))
+
+# 4) Empty string
 res3 = owctl.parse_openwrt_release("")
 check("parse: empty string returns all None except description", res3["description"] == "" and all(v is None for k, v in res3.items() if k != "description"), str(res3))
 
