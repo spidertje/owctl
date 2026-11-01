@@ -2353,6 +2353,47 @@ def build_digest():
     return subject, body
 
 
+# --------------------------------------------------- digest scheduling
+# Server-side cadence for the digest. `digest_schedule` (daily|weekly|never,
+# default never) is read/written through /api/settings and drives the
+# background scheduler. The digest CONTENT is untouched — build_digest +
+# send_digest are called exactly as the manual POST /api/digest path does.
+_DIGEST_CADENCES = {"daily", "weekly", "never"}
+
+
+def digest_schedule() -> str:
+    """Return the validated cadence ('daily'|'weekly'|'never').
+
+    Invalid/missing values fall back to 'never' — a typo never schedules an
+    unexpected run, and the GET /api/settings always returns a known value.
+    """
+    v = (get_setting("digest_schedule", "never") or "never").strip().lower()
+    if v not in _DIGEST_CADENCES:
+        return "never"
+    return v
+
+
+def digest_should_fire(cadence, last_sent_ts, now_ts=None) -> bool:
+    """Pure decision: should the digest fire now?
+
+    cadence:     'daily' | 'weekly' | 'never'
+    last_sent_ts: epoch seconds of the last successful send (0 = never sent)
+    now_ts:       epoch seconds of 'now' (default time.time(); injectable so
+                  the cadence logic is unit-testable without touching the clock)
+
+    'daily'  = at least 24h since the last send.
+    'weekly' = at least 7 days since the last send.
+    Boundary (exactly the interval) fires — consistent with the old weekly
+    trigger that compared against 7 * 24 * 3600.
+    """
+    if cadence not in _DIGEST_CADENCES or cadence == "never":
+        return False
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    last_sent_ts = float(last_sent_ts or 0)
+    interval = 24 * 3600 if cadence == "daily" else 7 * 24 * 3600
+    return now_ts - last_sent_ts >= interval
+
+
 def send_digest():
     cfg = get_alert_cfg()
     ch = (cfg.get("channels") or {}).get("email") or {}
@@ -3725,17 +3766,20 @@ def _scheduler():
     while not _shutdown_event.is_set():
         cycle += 1
         logger.info("scheduler cycle %d: starting (audit + maintenance)", cycle)
-        # 1) weekly email digest (unchanged behavior)
+        # 1) digest scheduling (daily|weekly|never). The digest CONTENT is
+        #    untouched — build_digest + send_digest are the same path the
+        #    manual POST /api/digest uses. Wrapped so a failure never raises
+        #    into the scheduler loop.
         try:
-            last = int(get_setting("digest_last_sent", "0") or "0")
-            cfg = get_alert_cfg()
-            em = (cfg.get("channels") or {}).get("email") or {}
-            if time.time() - last > 7 * 24 * 3600 and em.get("enabled") and em.get("to") and em.get("smtp_host"):
-                try:
-                    send_digest()
-                except Exception as e:
-                    logger.warning("weekly digest failed: %s", e)
-                set_setting("digest_last_sent", str(int(time.time())))
+            cadence = digest_schedule()
+            if cadence != "never":
+                last = int(get_setting("digest_last_sent", "0") or "0")
+                if digest_should_fire(cadence, last):
+                    try:
+                        send_digest()
+                    except Exception as e:
+                        logger.warning("scheduled digest failed: %s", e)
+                    set_setting("digest_last_sent", str(int(time.time())))
         except Exception as e:
             logger.warning("digest check failed: %s", e)
         # 2) maintenance: DB backup + retention, every cycle
@@ -6745,7 +6789,8 @@ def settings_get():
             gw = None
     return {"audit_interval_min": get_setting("audit_interval_min", "30"),
             "admin_password_set": bool(ensure_admin_password()),
-            "network_gateway": gw}
+            "network_gateway": gw,
+            "digest_schedule": digest_schedule()}
 
 
 @app.get("/api/auth/status")
@@ -6967,6 +7012,11 @@ async def settings_put(request: Request):
                 set_setting("network_gateway", str(int(v)))
             except (TypeError, ValueError):
                 set_setting("network_gateway", "")
+    if "digest_schedule" in d:
+        v = str(d.get("digest_schedule") or "").strip().lower()
+        if v and v not in _DIGEST_CADENCES:
+            raise HTTPException(400, f"invalid digest_schedule: {d.get('digest_schedule')!r} (expected daily|weekly|never)")
+        set_setting("digest_schedule", v or "never")
     return {"ok": True}
 
 
