@@ -707,6 +707,112 @@ def _exec_capture(client, cmd, timeout=300):
     return b"".join(out_q).decode(errors="replace"), b"".join(err_q).decode(errors="replace"), status
 
 
+def enrich_device_error(dev, err_text: str, failed_cmd: str) -> str:
+    """
+    Enrich a device-side exec error with actionable context.
+
+    Detects common failure signatures in err_text and composes a detail string
+    containing: which command failed, on which device (host), firmware when
+    available, and a hint. Falls back to the original err_text if no known
+    signature is detected. Never raises.
+    """
+    # Handle bytes input
+    if isinstance(err_text, bytes):
+        err_text = err_text.decode(errors="replace")
+    if not err_text:
+        return err_text or failed_cmd or "unknown error"
+
+    # Extract firmware string from device status if available
+    firmware = ""
+    if isinstance(dev, dict):
+        # dev may be a raw sqlite row with firmware/firmware_info keys
+        fw_info = dev.get("firmware_info") or {}
+        if isinstance(fw_info, dict):
+            desc = fw_info.get("description") or ""
+            ver = fw_info.get("version") or ""
+            rev = fw_info.get("revision") or ""
+            parts = [p for p in [desc, ver, rev] if p]
+            firmware = " ".join(parts) if parts else ""
+        elif dev.get("firmware"):
+            firmware = dev.get("firmware")
+
+    host = dev.get("host") if isinstance(dev, dict) else ""
+    name = dev.get("name") if isinstance(dev, dict) else ""
+
+    # Extract the binary/command that was not found
+    # Common patterns: "ash: base64: not found", "/bin/ash: base64: not found", "command not found: base64"
+    cmd_token = None
+    lower_err = err_text.lower()
+
+    # Pattern: "... binary_name: not found" or "... command not found: binary_name"
+    import re
+    # Match 'ash: base64: not found' or 'base64: not found' or 'command not found: base64'
+    m = re.search(r'(?:^|[:\s])([a-zA-Z0-9_.+-]+):\s*not found', err_text)
+    if m:
+        cmd_token = m.group(1)
+    else:
+        m = re.search(r'command not found:\s*([a-zA-Z0-9_.+-]+)', err_text, re.IGNORECASE)
+        if m:
+            cmd_token = m.group(1)
+
+    # Compose enriched detail
+    parts = []
+    action = "command failed"
+    if "push" in failed_cmd.lower() or "key" in failed_cmd.lower():
+        action = "push-key failed"
+    elif "backup" in failed_cmd.lower():
+        action = "backup failed"
+    elif "restore" in failed_cmd.lower():
+        action = "restore failed"
+    elif "vlan" in failed_cmd.lower():
+        action = "VLAN operation failed"
+    elif "routing" in failed_cmd.lower():
+        action = "routing operation failed"
+    elif "switch" in failed_cmd.lower():
+        action = "switch operation failed"
+    elif "wifi" in failed_cmd.lower() or "wireless" in failed_cmd.lower():
+        action = "WiFi operation failed"
+    elif "mesh" in failed_cmd.lower():
+        action = "mesh operation failed"
+    elif "upgrade" in failed_cmd.lower():
+        action = "upgrade failed"
+    elif "reboot" in failed_cmd.lower():
+        action = "reboot failed"
+
+    if cmd_token:
+        hint = f"Hint: opkg install {cmd_token}"
+        if firmware:
+            parts.append(f"{action}: command not found on {host} ({firmware}): {cmd_token}. {hint}")
+        else:
+            parts.append(f"{action}: command not found on {host}: {cmd_token}. {hint}")
+    elif "permission denied" in lower_err:
+        if firmware:
+            parts.append(f"{action} on {host} ({firmware}): Permission denied")
+        else:
+            parts.append(f"{action} on {host}: Permission denied")
+    elif "connection refused" in lower_err:
+        if firmware:
+            parts.append(f"{action} on {host} ({firmware}): Connection refused")
+        else:
+            parts.append(f"{action} on {host}: Connection refused")
+    elif "no such file or directory" in lower_err:
+        # Could be missing file or missing command
+        if firmware:
+            parts.append(f"{action} on {host} ({firmware}): No such file or directory")
+        else:
+            parts.append(f"{action} on {host}: No such file or directory")
+    elif "timeout" in lower_err or "timed out" in lower_err:
+        if firmware:
+            parts.append(f"{action} on {host} ({firmware}): Timeout")
+        else:
+            parts.append(f"{action} on {host}: Timeout")
+    else:
+        # No recognized signature — fall back to original behavior
+        return err_text
+
+    return " ".join(parts)
+
+
 def _build_status(dev, backend, s):
     st = {"backend": backend, "online": True, "host": dev["host"], "name": dev["name"]}
     st["firmware"] = s.get("release", "")
@@ -2545,8 +2651,8 @@ def push_ssh_key(dev):
         )
         out, err, status = _exec_capture(c, cmd, timeout=60)
         if status != 0:
-            raise RuntimeError(f"key push exec failed (exit {status}): "
-                               f"{(err or out).strip()[:200]}")
+            enriched = enrich_device_error(dev, (err or out).strip(), "push_ssh_key")
+            raise RuntimeError(enriched)
     finally:
         c.close()
     execute("UPDATE devices SET key_path=? WHERE id=?", (key_path, dev["id"]))
@@ -4515,7 +4621,7 @@ def device_check(did: int):
     except Exception as e:
         record_heartbeat(cur[0], False)
         execute("UPDATE devices SET status='offline' WHERE id=?", (did,))
-        raise HTTPException(502, f"device check failed: {e}")
+        raise HTTPException(502, enrich_device_error(cur[0], str(e), "device_check"))
 
 
 @app.post("/api/devices/{did}/test")
@@ -4544,7 +4650,7 @@ def device_push_key(did: int):
         raise
     except Exception as e:
         log_action(cur[0], 'push_key', '', ok=False, error=str(e))
-        raise HTTPException(502, f"key push failed: {e}")
+        raise HTTPException(502, str(e))
 
 
 @app.post("/api/devices/{did}/backup")
@@ -4558,7 +4664,7 @@ def device_backup(did: int):
         raise
     except Exception as e:
         log_action(cur[0], 'backup', '', ok=False, error=str(e))
-        raise HTTPException(502, f"backup failed: {e}")
+        raise HTTPException(502, enrich_device_error(cur[0], str(e), "backup"))
 
 
 @app.post("/api/devices/{did}/restore")
@@ -4576,7 +4682,7 @@ async def device_restore(request: Request, did: int):
         raise
     except Exception as e:
         log_action(cur[0], 'restore', '', ok=False, error=str(e))
-        raise HTTPException(502, f"restore failed: {e}")
+        raise HTTPException(502, enrich_device_error(cur[0], str(e), "restore"))
 
 
 @app.post("/api/vlans/apply")
@@ -4619,7 +4725,7 @@ def read_vlan_state_endpoint(did: int, vid: int):
     if r.get("error"):
         if r["error"].startswith("luci-only"):
             return {"device": dev["name"], "vlan_id": str(vid), "configured": False}
-        raise HTTPException(502, f"VLAN read failed on {dev['name']}: {r['error']}")
+        raise HTTPException(502, enrich_device_error(dev, r["error"], "vlan_read"))
     configured = bool(r.get("subnet") or r.get("dhcp") or r.get("zone"))
     return {"device": dev["name"], "vlan_id": str(vid), "configured": configured,
             "subnet": r.get("subnet"), "dhcp": r.get("dhcp"), "zone": r.get("zone")}
@@ -4669,7 +4775,7 @@ def read_routing_endpoint(did: int):
     if r.get("error"):
         if r["error"].startswith("luci-only"):
             return {"device": dev["name"], "configured": False}
-        raise HTTPException(502, f"routing read failed on {dev['name']}: {r['error']}")
+        raise HTTPException(502, enrich_device_error(dev, r["error"], "routing_read"))
     configured = bool(r.get("interfaces") or r.get("ip_routes") or r.get("policy") or (r.get("bgp") or {}).get("present"))
     return {"device": dev["name"], "configured": configured, **r}
 
@@ -6061,7 +6167,7 @@ def get_switch_ports(did: int):
         # A missing switch package is a normal, non-fatal condition.
         if r["error"].startswith("luci-only") or r["error"] == "no switch":
             return {"device": dev["name"], "switches": {}}
-        raise HTTPException(502, f"switch read failed on {dev['name']}: {r['error']}")
+        raise HTTPException(502, enrich_device_error(dev, r["error"], "switch_read"))
     return {"device": dev["name"], "switches": r.get("switches") or {}}
 
 
@@ -6285,7 +6391,7 @@ async def device_guest_wifi(request: Request, did: int):
         raise
     except Exception as e:
         log_action(cur[0], 'guest_wifi', '', ok=False, error=str(e))
-        raise HTTPException(502, f"guest WiFi failed: {e}")
+        raise HTTPException(502, enrich_device_error(cur[0], str(e), "guest_wifi"))
 
 
 @app.get("/api/devices/{did}/wifi-config")
@@ -6525,7 +6631,7 @@ async def device_mesh(request: Request, did: int):
         raise
     except Exception as e:
         log_action(cur[0], 'mesh', '', ok=False, error=str(e))
-        raise HTTPException(502, f"mesh apply failed: {e}")
+        raise HTTPException(502, enrich_device_error(cur[0], str(e), "mesh_apply"))
 
 
 @app.get("/api/devices/{did}/mesh")
@@ -6567,7 +6673,7 @@ async def device_upgrade(request: Request, did: int):
         raise
     except Exception as e:
         log_action(cur[0], 'upgrade', '', ok=False, error=str(e))
-        raise HTTPException(502, f"upgrade failed: {e}")
+        raise HTTPException(502, enrich_device_error(cur[0], str(e), "upgrade"))
 
 
 @app.get("/api/devices/{did}/config-history")
@@ -6658,7 +6764,7 @@ def device_reboot(did: int):
         raise
     except Exception as e:
         log_action(cur[0], 'reboot', '', ok=False, error=str(e))
-        raise HTTPException(502, f"reboot failed: {e}")
+        raise HTTPException(502, enrich_device_error(cur[0], str(e), "reboot"))
 
 
 @app.post("/api/sweep")
@@ -7104,7 +7210,7 @@ def dyndns_force(eid: int):
     try:
         st = dyndns_update_device(dev[0])
     except Exception as e:
-        raise HTTPException(502, f"device check failed: {e}")
+        raise HTTPException(502, enrich_device_error(dev[0], str(e), "dyndns_force"))
     after = q("SELECT last_ip, last_update, last_result FROM dyndns WHERE id=?", (eid,))
     return {"ok": True, "wan_ip": st.get("wan_ip"), **after[0]}
 
