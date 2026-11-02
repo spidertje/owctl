@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -6745,51 +6745,52 @@ def diff_snapshots(old_text: str, new_text: str) -> str:
 
 
 @app.get("/api/devices/{did}/config-history")
-def get_config_history(did: int, from_: str = None, to: str = None):
+def get_config_history(did: int, request: Request):
     """Return config history for diff view.
 
-    When both ``from`` and ``to`` are supplied, those snapshot ids or ISO
-    timestamps are used to fetch the two snapshots from ``config_history`` and
-    return a unified diff under a ``diff`` key, plus ``from``/``to`` echo keys.
-
-    When either param is absent the EXACT current response shape (list of
-    snapshots) is returned unchanged so no existing test breaks.
+    Accepts ``from`` or ``from_`` (and ``to`` or ``to_``) as snapshot ids or
+    ISO timestamps.  When both are supplied, returns a unified diff under the
+    ``diff`` key with ``from``/``to`` echo keys.  Otherwise returns the
+    unchanged list shape so existing callers are unaffected.
     """
+    qp = request.query_params
+    from_val = qp.get("from") or qp.get("from_")
+    to_val = qp.get("to") or qp.get("to_")
     rows = q(
         "SELECT ts, hash FROM config_history WHERE device_id=? ORDER BY ts DESC LIMIT 20",
         (did,),
     )
 
-    if from_ is not None and to is not None:
+    if from_val is not None and to_val is not None:
         # Find the two snapshots by id or ISO timestamp
         # Accept a snapshot id (row id) or an ISO timestamp (ts column value)
         snapshot_a = None
         snapshot_b = None
 
         # Resolve from snapshot
-        if from_.strip().isdigit():
+        if from_val.strip().isdigit():
             row = q(
                 "SELECT ts, hash FROM config_history WHERE device_id=? AND id=?",
-                (did, int(from_.strip())),
+                (did, int(from_val.strip())),
             )
         else:
             row = q(
                 "SELECT ts, hash FROM config_history WHERE device_id=? AND ts=?",
-                (did, from_.strip()),
+                (did, from_val.strip()),
             )
         if row:
             snapshot_a = {"ts": row[0]["ts"], "hash": row[0]["hash"]}
 
         # Resolve to snapshot
-        if to.strip().isdigit():
+        if to_val.strip().isdigit():
             row = q(
                 "SELECT ts, hash FROM config_history WHERE device_id=? AND id=?",
-                (did, int(to.strip())),
+                (did, int(to_val.strip())),
             )
         else:
             row = q(
                 "SELECT ts, hash FROM config_history WHERE device_id=? AND ts=?",
-                (did, to.strip()),
+                (did, to_val.strip()),
             )
         if row:
             snapshot_b = {"ts": row[0]["ts"], "hash": row[0]["hash"]}

@@ -2314,12 +2314,16 @@ async function renderDhcp(target){
   let html=`<h2>DHCP Server</h2>
     <p class="muted">Manage every DHCP setting per VLAN section — pool, DHCP options, static leases, behavior flags and IPv6. Applies to the router.</p>
     ${netTemplatePills('dhcp')}`;
-  if(NET_ADVANCED){
+  if(sshDevs.length){
+    // Device selector is always visible (was hidden behind Advanced): a novice must
+    // be able to pick which SSH box to read/write, not silently target the first one.
     html+=`<div class="row" style="margin-bottom:12px;align-items:flex-end">
-      <div><label>Device</label><select id="dhcp-did">${sshDevs.map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
+      <div><label>Device</label><select id="dhcp-did" onchange="renderDhcp()">${sshDevs.map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
       <button class="act" onclick="renderDhcp()">Refresh</button>
-    </div>
-    <div class="grid" style="margin-bottom:16px"><div class="card" style="max-width:560px">${dhcpNewCard()}</div></div>`;
+    </div>`;
+  }
+  if(NET_ADVANCED){
+    html+=`<div class="grid" style="margin-bottom:16px"><div class="card" style="max-width:560px">${dhcpNewCard()}</div></div>`;
   }
   html+=`<div id="dhcp-results" style="margin-top:8px"></div><div id="dhcp-grid" class="grid"></div>`;
   el.innerHTML=html;
@@ -2520,10 +2524,17 @@ async function renderDns(target){
   let html=`<h2>DNS</h2>
     <p class="muted">Configure upstream DNS servers for the network. Applies to all DHCP clients.</p>
     ${netTemplatePills('dns')}`;
+  if(devs.filter(d=>d.access==='ssh').length){
+    // Always-visible device selector (was hidden behind Advanced) so a novice can
+    // choose which SSH box to read/write instead of silently targeting the first.
+    html+=`<div class="row" style="margin-bottom:12px;align-items:flex-end">
+      <div><label>Device</label><select id="dns-did" onchange="renderDns()">${devs.filter(d=>d.access==='ssh').map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
+      <button class="act" onclick="renderDns()">Refresh</button>
+    </div>`;
+  }
   if(NET_ADVANCED){
     html+=`<div class="card">
       <h3>Configure DNS</h3>
-      <div style="margin-bottom:12px"><label>Device</label><select id="dns-did">${devs.filter(d=>d.access==='ssh').map(d=>`<option value="${d.id}" ${d.id===router?.id?'selected':''}>${esc(d.name)} (${esc(d.host)})</option>`).join('')}</select></div>
       <div style="margin-bottom:12px"><label>DNS Servers (one per line, or 'router' for local only)</label>
         <textarea id="dns-servers" rows="2" style="width:100%;box-sizing:border-box">1.1.1.1
 8.8.8.8</textarea></div>
