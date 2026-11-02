@@ -22,6 +22,7 @@ config backups, and configurable alerting (dashboard / email / Telegram / webhoo
 Run:  python owctl.py   (serves API + dashboard, default 0.0.0.0:8090)
 """
 import base64
+import difflib
 import faulthandler
 import logging
 import sys
@@ -6684,10 +6685,98 @@ async def device_upgrade(request: Request, did: int):
         raise HTTPException(502, enrich_device_error(cur[0], str(e), "upgrade"))
 
 
+def diff_snapshots(old_text: str, new_text: str) -> str:
+    """Return a unified diff string between two snapshot texts.
+
+    Pure (no I/O), unit-testable. Uses stdlib difflib.unified_diff with
+    no external dependencies. Each input is the serialized snapshot content
+    (e.g. sorted-key JSON lines).
+    """
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        old_lines, new_lines, lineterm="", fromfile="old", tofile="new"
+    )
+    return "".join(diff)
+
+
 @app.get("/api/devices/{did}/config-history")
-def get_config_history(did: int):
-    """Return config history for diff view."""
-    rows = q("SELECT ts, hash FROM config_history WHERE device_id=? ORDER BY ts DESC LIMIT 20", (did,))
+def get_config_history(did: int, from_: str = None, to: str = None):
+    """Return config history for diff view.
+
+    When both ``from`` and ``to`` are supplied, those snapshot ids or ISO
+    timestamps are used to fetch the two snapshots from ``config_history`` and
+    return a unified diff under a ``diff`` key, plus ``from``/``to`` echo keys.
+
+    When either param is absent the EXACT current response shape (list of
+    snapshots) is returned unchanged so no existing test breaks.
+    """
+    rows = q(
+        "SELECT ts, hash FROM config_history WHERE device_id=? ORDER BY ts DESC LIMIT 20",
+        (did,),
+    )
+
+    if from_ is not None and to is not None:
+        # Find the two snapshots by id or ISO timestamp
+        # Accept a snapshot id (row id) or an ISO timestamp (ts column value)
+        snapshot_a = None
+        snapshot_b = None
+
+        # Resolve from snapshot
+        if from_.strip().isdigit():
+            row = q(
+                "SELECT ts, hash FROM config_history WHERE device_id=? AND id=?",
+                (did, int(from_.strip())),
+            )
+        else:
+            row = q(
+                "SELECT ts, hash FROM config_history WHERE device_id=? AND ts=?",
+                (did, from_.strip()),
+            )
+        if row:
+            snapshot_a = {"ts": row[0]["ts"], "hash": row[0]["hash"]}
+
+        # Resolve to snapshot
+        if to.strip().isdigit():
+            row = q(
+                "SELECT ts, hash FROM config_history WHERE device_id=? AND id=?",
+                (did, int(to.strip())),
+            )
+        else:
+            row = q(
+                "SELECT ts, hash FROM config_history WHERE device_id=? AND ts=?",
+                (did, to.strip()),
+            )
+        if row:
+            snapshot_b = {"ts": row[0]["ts"], "hash": row[0]["hash"]}
+
+        if snapshot_a is not None and snapshot_b is not None:
+            # Serialize each snapshot's hash field deterministically:
+            # the hash column stores "path=hash;path=hash" — split into pairs,
+            # build an ordered dict (sorted by path) and re-join so the diff is
+            # deterministic regardless of storage order.
+            def _serialize(hash_str: str) -> str:
+                pairs = []
+                for part in hash_str.split(";"):
+                    if "=" in part:
+                        path, h = part.split("=", 1)
+                        pairs.append((path, h))
+                pairs.sort(key=lambda kv: kv[0])
+                return ";".join(f"{p}={h}" for p, h in pairs)
+
+            text_a = _serialize(snapshot_a["hash"])
+            text_b = _serialize(snapshot_b["hash"])
+            unified = diff_snapshots(text_a, text_b)
+            return {
+                "diff": unified,
+                "from": snapshot_a["ts"],
+                "to": snapshot_b["ts"],
+            }
+
+        # If we couldn't resolve both, fall through to the list view
+        pass
+
+    # Normal list-return path (no from/to, or resolution failed)
     return [{"ts": r["ts"], "files": r["hash"].split(";")} for r in rows]
 
 
