@@ -514,6 +514,26 @@ async function renderNet(activeSection){
         <h3>Routing <span class="pill">→</span></h3>
         <p class="small muted">Static routes, policy routing and BGP.</p>
       </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='mesh'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('mesh')">
+        <h3>Mesh Topology <span class="pill">→</span></h3>
+        <p class="small muted">802.11s / batman interfaces and connectivity.</p>
+      </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='offline'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('offline')">
+        <h3>Offline Uptime <span class="pill">→</span></h3>
+        <p class="small muted">Device downtime timeline, last 24h.</p>
+      </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='backups'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('backups')">
+        <h3>Backups <span class="pill">→</span></h3>
+        <p class="small muted">DB + device config snapshots. Restore to roll back.</p>
+      </div>
+      <div class="card" style="cursor:pointer" onclick="rebaselinePreview()">
+        <h3>Fleet Re-baseline <span class="pill">↻</span></h3>
+        <p class="small muted">Preview firmware/package drift, then apply to lagging devices.</p>
+      </div>
+      <div class="card" style="cursor:pointer;border-color:${_currentNetSection==='apiref'?'var(--pri)':'var(--line)'}" onclick="loadNetSection('apiref')">
+        <h3>API Reference <span class="pill">⧉</span></h3>
+        <p class="small muted">Copy-as-curl for every endpoint the dashboard uses.</p>
+      </div>
     </div>
     <div id="net-detail"></div>`;
   el.innerHTML=html;
@@ -557,6 +577,14 @@ async function loadNetSection(name){
     await renderSwitchMap(box);
   }else if(name==='routing'){
     await renderRouting(box);
+  }else if(name==='mesh'){
+    await renderMesh(box);
+  }else if(name==='offline'){
+    await renderOfflineChart(box);
+  }else if(name==='backups'){
+    await renderBackups();
+  }else if(name==='apiref'){
+    box.innerHTML=apiCardRows();
   }
 }
 
@@ -1754,7 +1782,8 @@ async function renderThreats(){
       <span class="badge b-${a.severity}">${a.severity}</span><strong>${esc(a.device_name)} (${esc(a.device_id)})</strong></div>
       <div style="margin:4px 0">${esc(a.message)}${a.detail?`<div class="small muted">${esc(a.detail)}</div>`:''}</div>
       ${a.rec?`<div class="small">→ ${esc(a.rec)}</div>`:''}
-      <div class="row fsec"><button class="act" onclick="ack(${a.device_id},'${esc(a.rule_id)}')">Acknowledge</button></div></div>`;
+      <div class="row fsec"><button class="act" onclick="ack(${a.device_id},'${esc(a.rule_id)}')">Acknowledge</button>
+      <button class="act" onclick="showConfigHistory(${a.device_id})">Config history</button></div></div>`;
   }
   const hist=(f.history||[]).slice(0,50);
   if(hist.length){
@@ -1984,7 +2013,7 @@ async function tryLogin(){
     if(err)err.textContent=j.detail||'Sign-in failed';
   }catch(e){if(err)err.textContent='Network error';}
 }
-function showAdminUI(){document.querySelectorAll('.adm-only').forEach(el=>el.style.display='')}
+function showAdminUI(){document.querySelectorAll('.adm-only').forEach(el=>el.style.display='');onboarding&&onboarding()}
 function bootApp(){
   if(TOKEN){
     verifySession(TOKEN).then(ok=>{
@@ -2011,6 +2040,56 @@ async function _freshGate(){
   }
 }
 function toggleTheme(){document.body.classList.toggle('light')}
+/* ── Onboarding: first-run guided setup ─────────────────────────────────
+   Shows once per browser (owctl_onboarded in localStorage). Walks a novice
+   through: add a device → run a check → review threats → set alerting.
+   Each step is a button that navigates to the relevant tab; the step
+   completes when the user visits that tab. Skippable at any point. */
+function onboarding(){
+  if(localStorage.getItem('owctl_onboarded'))return;
+  const steps=[
+    {id:1,label:'Add your first device',hint:'Devices tab → "+ Add device"',tab:'devices'},
+    {id:2,label:'Run a device check',hint:'Click "Check now" on your device',tab:'devices'},
+    {id:3,label:'Review threats & findings',hint:'Threats tab',tab:'threats'},
+    {id:4,label:'Set up alerting',hint:'Alerting tab → save your config',tab:'alerts'},
+  ];
+  const m=document.createElement('div');
+  m.id='onboard-modal';
+  m.style.cssText='position:fixed;inset:0;z-index:3000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+  m.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;max-width:460px;width:100%">
+    <h2 style="margin:0 0 4px;font-size:18px">Welcome to owctl</h2>
+    <p class="small muted" style="margin:0 0 16px">A 4-step setup gets you from zero to a monitored network. You can come back to any step later.</p>
+    <div id="ob-steps" style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
+      ${steps.map(s=>`<div class="ob-step" data-step="${s.id}" style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;cursor:pointer" onclick="obGo(${s.id})">
+        <span class="ob-num" style="width:26px;height:26px;border-radius:50%;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;flex-shrink:0">${s.id}</span>
+        <div style="flex:1;min-width:0"><strong style="font-size:13px">${s.label}</strong><div class="small muted">${s.hint}</div></div>
+        <span class="ob-check" style="color:var(--ok);font-size:16px;display:none">✓</span>
+      </div>`).join('')}
+    </div>
+    <div class="row" style="justify-content:flex-end;gap:8px">
+      <button class="act" onclick="obSkip()">Skip for now</button>
+      <button class="act pri" onclick="obGo(1)">Start</button>
+    </div>
+  </div>`;
+  document.body.appendChild(m);
+  m.onclick=e=>{if(e.target===m)obSkip()};
+}
+function obGo(stepId){
+  const tabs={1:'devices',2:'devices',3:'threats',4:'alerts'};
+  const tab=tabs[stepId]||'devices';
+  // Mark step done
+  const el=document.querySelector(`.ob-step[data-step="${stepId}"]`);
+  if(el){el.querySelector('.ob-num').style.background='var(--ok)';el.querySelector('.ob-check').style.display='';el.style.borderColor='var(--ok)';}
+  // Navigate
+  const btn=document.querySelector(`nav button[data-tab="${tab}"]`);
+  if(btn)btn.click();
+  // Check if all steps done → close
+  const total=document.querySelectorAll('.ob-step').length;
+  const done=document.querySelectorAll('.ob-num[style*="--ok"]').length;
+  if(done>=total){localStorage.setItem('owctl_onboarded','1');setTimeout(()=>obClose(),1200);}
+}
+function obSkip(){localStorage.setItem('owctl_onboarded','1');obClose();}
+function obClose(){document.getElementById('onboard-modal')?.remove();}
 bootApp();
 
 // Bulk actions
@@ -3495,6 +3574,279 @@ async function dyndnsDelete(id){
   if(!confirm('Delete this DDNS entry?'))return;
   try{await api('/dyndns/'+id,{method:'DELETE'});toast('Deleted');renderDyndns();}
   catch(e){toast(e.message,true);}
+}
+
+/* ─────────────────────────── API reference + copy-as-curl ────────────────
+   A novice/intermediate user can copy the exact curl for any endpoint the
+   dashboard uses, so they can reproduce or automate it outside the browser.
+   The token is read from localStorage (never hard-coded) and the URL uses the
+   current origin so it works over self-signed TLS too. */
+function copyCurl(method, path, body){
+  const origin=location.origin.replace(/^http:/,'https:');
+  const token=localStorage.getItem('owctl_session')||'';
+  let cmd=`curl -sk -X ${method.toUpperCase()} '${origin}/api${path}'`;
+  cmd+=` -H 'Content-Type: application/json'`;
+  if(token)cmd+=` -H 'Authorization: Bearer ${token}'`;
+  if(body)cmd+=` -d '${JSON.stringify(body)}'`;
+  return cmd;
+}
+async function copyText(txt){
+  try{await navigator.clipboard.writeText(txt);return true;}
+  catch(e){
+    const ta=document.createElement('textarea');ta.value=txt;
+    ta.style.cssText='position:fixed;opacity:0';document.body.appendChild(ta);
+    ta.select();let ok=false;try{ok=document.execCommand('copy');}catch(_){}
+    ta.remove();return ok;
+  }
+}
+async function curlCopy(method,path,body){
+  const ok=await copyText(copyCurl(method,path,body));
+  toast(ok?'curl copied to clipboard':'Copy failed — clipboard blocked',!ok);
+}
+function apiCardRows(){
+  const R=[
+    ['GET','/network','Network status summary',{}],
+    ['GET','/devices','List all devices',{}],
+    ['POST','/devices','Add a device',{name:'router',host:'192.168.1.1',role:'router',access:'ssh',ssh_user:'root'}],
+    ['POST','/devices/{id}/check','Run a device check',{id:1}],
+    ['POST','/devices/{id}/backup','Take a backup',{id:1}],
+    ['GET','/findings','Active + history findings',{}],
+    ['GET','/alerts/config','Alerting configuration',{}],
+    ['POST','/bulk','Bulk check/backup/reboot',{ids:[1,2],action:'check'}],
+    ['GET','/rebaseline/preview','Firmware/package drift vs baseline',{}],
+    ['GET','/offline-events','Recent offline events',{}],
+    ['GET','/backups','DB backup list',{}],
+    ['POST','/backup','Take a new DB backup',{}],
+  ];
+  return `<div class="card" style="max-width:560px"><h3>API reference <span class="pill">copy-as-curl</span></h3>
+    <p class="small muted">Copy the exact <code>curl</code> for any endpoint. Your session token is included; paste into a terminal to reproduce the call.</p>
+    <div style="display:flex;flex-direction:column;gap:4px;margin-top:8px">
+      ${R.map(([m,p,desc,b])=>`<div class="row" style="justify-content:space-between;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid var(--line)">
+        <div style="min-width:0"><code class="small" style="color:var(--acc)">${m}</code> <code class="small">${p}</code><div class="small muted">${desc}</div></div>
+        <button class="act" style="flex-shrink:0" onclick='curlCopy(${JSON.stringify(m)},${JSON.stringify(p)},${JSON.stringify(b)})'>⧉ curl</button>
+      </div>`).join('')}
+    </div></div>`;
+}
+
+/* ─────────────────────────── Offline uptime chart (24h) ──────────────────
+   SVG timeline of device offline events over the last 24h. Each event is a
+   horizontal bar: x = time, width = offline duration. Uses only var(--*)
+   tokens so it renders correctly in light mode. Data: /api/offline-events. */
+function _fmtRel(ts){
+  const d=new Date(String(ts).replace(' ','T'));
+  if(isNaN(d))return ts;
+  return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+}
+async function renderOfflineChart(box){
+  let evs=[];try{evs=await api('/offline-events?limit=50');}catch(e){box.innerHTML=`<p class="muted">Could not load offline events.</p>`;return;}
+  const now=Date.now();
+  const DAY=24*3600*1000;
+  const win=[now-DAY,now];
+  evs=evs.filter(e=>e.went_offline).slice(0,30);
+  if(!evs.length){box.innerHTML=`<p class="muted">No offline events in the last 24h — all devices stayed up. 🎉</p>`;return;}
+  // SVG: one row per device, bars positioned by time over the 24h window.
+  const W=760,rowH=26,padL=120,padR=16;
+  const t2x=t=>{const d=new Date(String(t).replace(' ','T'));const ms=d.getTime();
+    const f=Math.max(0,Math.min(1,(ms-win[0])/(win[1]-win[0])));
+    return padL+(W-padL-padR)*f;};
+  const durW=e=>{const o=new Date(String(e.went_offline).replace(' ','T')).getTime();
+    const on=e.went_online?new Date(String(e.went_online).replace(' ','T')).getTime():now;
+    return Math.max(3,(on-o)/(win[1]-win[0])*(W-padL-padR));};
+  // Group by device, newest first.
+  const byDev={};
+  evs.forEach(e=>{(byDev[e.device_name||('dev'+e.device_id)] ||= []).push(e);});
+  const names=Object.keys(byDev);
+  const H=names.length*rowH+8;
+  let grid='';
+  for(let h=0;h<=24;h+=6){
+    const x=padL+(W-padL-padR)*(h/24);
+    const lbl=new Date(now-DAY+h*3600*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    grid+=`<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--line)" stroke-dasharray="2 3"/>
+           <text x="${x}" y="${H+14}" fill="var(--mut)" font-size="10" text-anchor="middle">${lbl}</text>`;
+  }
+  let bars='';
+  names.forEach((name,i)=>{
+    const y=i*rowH+4;
+    bars+=`<text x="4" y="${y+rowH/2}" fill="var(--tx)" font-size="11">${name.length>16?name.slice(0,15)+'…':name}</text>`;
+    byDev[name].forEach(e=>{
+      const x=t2x(e.went_offline),w=durW(e);
+      const _o=new Date(String(e.went_offline).replace(' ','T')).getTime();
+      const _n=e.went_online?new Date(String(e.went_online).replace(' ','T')).getTime():now;
+      const mins=Math.max(0,Math.round((_n-_o)/60000));
+      bars+=`<title>${name}: offline ${_fmtRel(e.went_offline)} → ${e.went_online?_fmtRel(e.went_online):'now'} (${mins}m)</title>
+             <rect x="${x}" y="${y}" width="${w}" height="${rowH-8}" rx="4" fill="var(--bad)" fill-opacity="0.75"/>`;
+    });
+  });
+  box.innerHTML=`<svg viewBox="0 0 ${W} ${H+22}" width="100%" style="max-width:${W}px;font-family:system-ui" role="img" aria-label="Offline events last 24h">${grid}${bars}</svg>`;
+}
+
+/* ─────────────────────────── Mesh topology graph ─────────────────────────
+   Renders the mesh (802.11s / batman / meshd) interfaces of a device as an
+   inline SVG topology: one node per mesh interface, edges between interfaces
+   that share a mesh SSID/bridge. Uses var(--*) tokens. Data:
+   /api/devices/{id}/mesh  →  {interfaces:[{...}], meshd:"meshd|batmand|..."} */
+function _meshNodes(ifaces){
+  // Group interfaces by a "network" key (ssid or bridge) to derive edges.
+  const net={};
+  ifaces.forEach((it,i)=>{
+    const key=(it.ssid||it.bridge||it.ifname||('iface'+i)).toLowerCase();
+    (net[key] ||= {key,label:it.ssid||it.bridge||it.ifname||('iface '+i),nodes:[]}).nodes.push(i);
+  });
+  const groups=Object.values(net);
+  const nodes=ifaces.map((it,i)=>({i,label:it.ifname||it.ssid||('iface'+i),ssid:it.ssid||'',ch:it.channel||'',mode:it.mode||'mesh',x:0,y:0}));
+  // Lay out on a circle.
+  const cx=200,cy=170,r=ifaces.length>1?110:0;
+  nodes.forEach((n,i)=>{const a=(i/Math.max(1,ifaces.length))*2*Math.PI-Math.PI/2;n.x=cx+(ifaces.length>1?r:0)*Math.cos(a);n.y=cy+(ifaces.length>1?r:0)*Math.sin(a);});
+  const edges=[];
+  groups.forEach(g=>{if(g.nodes.length>1)for(let a=0;a<g.nodes.length-1;a++)edges.push([g.nodes[a],g.nodes[a+1]]);});
+  return {nodes,edges};
+}
+async function renderMesh(box){
+  const devs=await api('/devices');
+  const ssh=devs.filter(d=>d.access==='ssh');
+  if(!ssh.length){box.innerHTML=`<p class="muted">No SSH-accessible devices to inspect mesh on.</p>`;return;}
+  const opts=ssh.map(d=>`<option value="${d.id}">${esc(d.name)} (${esc(d.host)})</option>`).join('');
+  box.innerHTML=`<h2>Mesh topology</h2>
+    <p class="muted">802.11s / batman / meshd interfaces and how they connect. Pick a device to inspect its live mesh config.</p>
+    <div class="row" style="margin-bottom:16px;align-items:flex-end;gap:8px">
+      <div><label>Device</label><select id="mesh-did" onchange="renderMeshBox()">${opts}</select></div>
+      <button class="act" onclick="renderMeshBox()">Inspect</button>
+    </div><div id="mesh-box"><p class="muted">Loading…</p></div>`;
+  await renderMeshBox();
+}
+async function renderMeshBox(){
+  const did=parseInt((document.getElementById('mesh-did')||{}).value||'0');
+  const box=document.getElementById('mesh-box');
+  if(!did||!box)return;
+  box.innerHTML='<p class="muted">Loading…</p>';
+  let m;try{m=await api(`/devices/${did}/mesh`);}catch(e){box.innerHTML=`<p class="bad">Could not read mesh: ${esc(String(e))}</p>`;return;}
+  const ifaces=m.interfaces||[];
+  const meshd=m.meshd||'';
+  if(!ifaces.length){box.innerHTML=`<p class="muted">No mesh interfaces on this device. ${meshd?`Mesh daemon present: <code>${esc(meshd)}</code>.`:'No mesh daemon detected (meshd/batmand).'} To enable: <code>opkg install batman-adv</code> or configure an 802.11s interface.</p>`;return;}
+  const {nodes,edges}= _meshNodes(ifaces);
+  const W=400,H=360;
+  let svg=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px" role="img" aria-label="mesh topology">`;
+  // edges first
+  edges.forEach(([a,b])=>{svg+=`<line x1="${nodes[a].x}" y1="${nodes[a].y}" x2="${nodes[b].x}" y2="${nodes[b].y}" stroke="var(--acc)" stroke-width="2" stroke-opacity="0.5"/>`;});
+  // nodes
+  nodes.forEach(n=>{
+    svg+=`<g><circle cx="${n.x}" cy="${n.y}" r="26" fill="var(--panel2)" stroke="var(--acc)" stroke-width="1.5"/>
+      <text x="${n.x}" y="${n.y-2}" fill="var(--tx)" font-size="10" text-anchor="middle" font-weight="600">${(n.label.length>8?n.label.slice(0,7)+'…':n.label)}</text>
+      <text x="${n.x}" y="${n.y+10}" fill="var(--mut)" font-size="8" text-anchor="middle">ch ${n.ch||'—'}</text>
+      <title>iface: ${n.label}\nmode: ${n.mode}\nssid: ${n.ssid||'—'}\nchannel: ${n.ch||'—'}</title></g>`;
+  });
+  svg+=`<text x="${W/2}" y="16" fill="var(--mut)" font-size="11" text-anchor="middle">meshd: ${meshd?esc(meshd):'none'}</text>`;
+  // legend
+  svg+=`</svg>`;
+  box.innerHTML=svg+`
+    <div class="grid" style="margin-top:12px">
+      ${ifaces.map((it,i)=>`<div class="card" style="max-width:320px"><h3>${esc(it.ifname||it.ssid||('iface '+i))}</h3>
+        <div class="kv"><span>Mode</span><strong>${esc(it.mode||'—')}</strong></div>
+        <div class="kv"><span>SSID</span><span>${esc(it.ssid||'—')}</span></div>
+        <div class="kv"><span>Channel</span><span>${esc(it.channel||'—')}</span></div>
+        <div class="kv"><span>Encryption</span><span>${esc(it.encryption||'—')}</span></div>
+      </div>`).join('')}
+    </div>
+    ${meshd?`<p class="small muted" style="margin-top:8px">Mesh daemon: <code>${esc(meshd)}</code></p>`:''}`;
+}
+
+/* ─────────────────────────── Backups management ──────────────────────────
+   Global view of all DB + per-device backups. List (/api/backups), restore
+   (per device, reuses pickBackup), and take a new DB backup (POST /api/backup).
+   No delete endpoint exists in the backend, so we don't offer one (honest). */
+async function renderBackups(){
+  const box=document.getElementById('tab-backups')||document.getElementById('net-detail');
+  if(!box)return;
+  box.innerHTML='<p class="muted">Loading backups…</p>';
+  let bks=[],devs=[];
+  try{bks=await api('/backups');}catch(e){box.innerHTML=`<p class="bad">Could not load backups: ${esc(String(e))}</p>`;return;}
+  try{devs=await api('/devices');}catch(e){devs=[];}
+  const devName=id=>{const d=devs.find(x=>x.id===id);return d?d.name+` (${d.host})`:('dev #'+id);};
+  const rows=bks.length?bks.map(b=>`<tr>
+    <td class="small">${esc(b.ts)}</td>
+    <td>${b.kind==='device'?esc(b.device_name||'device'):'<span class="pill">database</span>'}</td>
+    <td class="small">${b.device_id?esc(devName(b.device_id)):'—'}</td>
+    <td class="small">${b.size?Math.round(b.size/1024)+' KB':'—'}</td>
+    <td>${b.device_id?`<button class="act" onclick="restoreFromBackup(${b.device_id},'${esc(b.path)}')">Restore</button>`:'<span class="small muted">n/a</span>'}</td>
+  </tr>`).join(''):'<tr><td colspan="5" class="muted">No backups yet. Take one below.</td></tr>';
+  box.innerHTML=`<h2>Backups</h2>
+    <p class="muted">Database snapshots and per-device config backups. Restore a device backup to roll its config back to a known-good state.</p>
+    <div class="row" style="margin-bottom:16px;justify-content:flex-end">
+      <button class="act pri" onclick="newDbBackup()">+ New database backup</button>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <table><thead><tr><th>Time</th><th>Kind</th><th>Device</th><th>Size</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    </div>`;
+}
+async function newDbBackup(){
+  try{
+    const r=await api('/backup',{method:'POST'});
+    toast('Database backup created'+(r.path?` (${r.path})`:''));
+    renderBackups();
+  }catch(e){toast('Backup failed: '+String(e),true);}
+}
+async function restoreFromBackup(did,path){
+  if(!confirm('Restore this backup? The device config will be overwritten.'))return;
+  try{
+    const r=await api(`/devices/${did}/restore`,{method:'POST',body:JSON.stringify({path})});
+    toast('Restored backup');
+    renderBackups();
+  }catch(e){toast('Restore failed: '+String(e),true);}
+}
+
+/* ─────────────────────────── Fleet rebaseline diff preview ──────────────
+   Reuses /api/rebaseline/preview to show which devices lag the fleet
+   baseline (firmware + key packages) and the exact per-device drift, with an
+   "Apply" that runs /rebaseline/apply scoped to the lagging devices. */
+async function rebaselinePreview(){
+  let p;try{p=await api('/rebaseline/preview');}catch(e){toast('Could not load preview: '+String(e),true);return;}
+  const modal=document.createElement('div');
+  modal.className='rebaseline-modal';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px';
+  const base=p.baseline_firmware||'—';
+  const basePkgs=Object.entries(p.baseline||{}).map(([k,v])=>`${k} ${v}`).join(' · ')||'—';
+  const lag=(p.lagging||[]);
+  const rows=lag.length?lag.map(l=>`
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line)">
+      <div><strong>${esc(l.name)}</strong> <span class="muted small">${esc(l.host)}</span>
+        <div class="small" style="margin-top:2px">${Object.entries(l.differs||{}).map(([k,v])=>`<span class="pill">${k}: ${v||'—'} → ${esc((k==='firmware'?base:p.baseline[k]))||''}</span>`).join(' ')}</div>
+      </div>
+      <button class="act" onclick="rebaselineApplyOne(${l.device_id},'${esc(l.name)}')">Re-baseline</button>
+    </div>`).join(''):'<p class="muted">All devices are at the fleet baseline. Nothing to re-baseline.</p>';
+  modal.innerHTML=`<div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;min-width:440px;max-width:680px;max-height:80vh;overflow:auto">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 style="margin:0">Fleet re-baseline preview <span class="pill">${lag.length} lagging</span></h3>
+      <button class="act" onclick="document.querySelector('.rebaseline-modal')?.remove()">Close</button>
+    </div>
+    <div class="card fsec" style="margin-bottom:12px">
+      <div class="kv"><span>Baseline firmware</span><strong>${esc(base)}</strong></div>
+      <div class="kv"><span>Baseline packages</span><span class="small">${esc(basePkgs)}</span></div>
+      <div class="kv"><span>Devices compared</span><span>${p.device_count}</span></div>
+    </div>
+    ${p.note?`<p class="small muted">${esc(p.note)}</p>`:''}
+    <div>${rows}</div>
+    <div class="row" style="justify-content:flex-end;margin-top:12px;gap:8px">
+      <button class="act" onclick="document.querySelector('.rebaseline-modal')?.remove()">Close</button>
+      ${lag.length?`<button class="act pri" onclick="rebaselineApplyAll('${lag.map(l=>l.device_id).join(',')}')">Apply to all ${lag.length}</button>`:''}
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.onclick=e=>{if(e.target===modal)modal.remove();};
+}
+async function rebaselineApplyOne(did,name){
+  try{
+    const r=await api('/rebaseline/apply',{method:'POST',body:JSON.stringify({devices:[did]})});
+    toast(r.failed?name+': re-baseline failed':name+': re-baselined');
+    document.querySelector('.rebaseline-modal')?.remove();
+  }catch(e){toast(String(e),true);}
+}
+async function rebaselineApplyAll(ids){
+  try{
+    const r=await api('/rebaseline/apply',{method:'POST',body:JSON.stringify({devices:ids.split(',').map(Number)})});
+    toast(`Re-baselined ${r.ok} device(s), ${r.failed} failed`,!!r.failed);
+    document.querySelector('.rebaseline-modal')?.remove();
+  }catch(e){toast(String(e),true);}
 }
 </script>
 </body>
