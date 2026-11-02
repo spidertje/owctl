@@ -4329,6 +4329,10 @@ async def token_guard(request, call_next):
     if os.environ.get("OWCTL_ALLOW_OPEN") == "1":
         return await call_next(request)
     path = request.url.path
+    # Documentation paths are public (Swagger UI + OpenAPI spec). Exact match only —
+    # not a prefix, so /api/* still requires a session token.
+    if path in ("/docs", "/docs/oauth2-redirect", "/openapi.json"):
+        return await call_next(request)
     if path.startswith("/api/auth") or path == "/api/health":
         return await call_next(request)
     # Auth: password-login session token only. On first boot an `admin` account
