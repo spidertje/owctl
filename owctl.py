@@ -4323,8 +4323,12 @@ async def token_guard(request, call_next):
     if request.url.path.startswith("/api/"):
         allowed, retry_after = _rate_limiter.allow(_client_key(request))
         if not allowed:
-            return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
-                                headers={"Retry-After": str(retry_after)})
+            return JSONResponse(
+                {"error": "rate limit exceeded",
+                 "retry_after": retry_after,
+                 "message": f"rate limit exceeded: retry after {retry_after}s"},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)})
     # OWCTL_ALLOW_OPEN=1 disables auth (dev/tests only). Production should leave it unset.
     if os.environ.get("OWCTL_ALLOW_OPEN") == "1":
         return await call_next(request)
