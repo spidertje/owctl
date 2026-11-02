@@ -3250,14 +3250,76 @@ async function editWifi(did){
 }
 function renderUsers(){
   const el=document.getElementById('tab-users');if(!el)return;
+  // SETTINGS_HELP: human-readable descriptions shown next to each setting so a
+  // novice knows what a number/field actually controls (was: bare keys, no hints).
+  const SETTINGS_HELP={
+    audit_interval_min:'How often owctl scans devices for config drift and re-runs the threat audit (minutes).',
+    network_gateway:'The device that represents the network gateway — used by the Network tab and gateway-specific views.',
+    admin_password:'Reset the built-in admin account password. Only one admin may hold a password at a time.',
+  };
   el.innerHTML='<div class="panel"><h2>User management</h2><div id="user-list"></div><h3>Add user</h3><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
     '<input id="u-new-name" placeholder="Username" style="padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)">'+
     '<input id="u-new-pass" type="password" placeholder="Password" style="padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)">'+
     '<select id="u-new-role" style="padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)">'+
     '<option value="observer">Observer</option><option value="admin">Admin</option></select>'+
     '<button onclick="addUser()" style="padding:6px 14px;border-radius:6px;border:none;background:var(--acc);color:#08101e;cursor:pointer">Add</button>'+
-    '</div></div>';
+    '</div></div>'+
+    '<div class="panel" style="margin-top:16px"><h2>Settings</h2>'+
+      '<div class="card fsec" style="margin-bottom:12px">'+
+        '<label style="font-weight:600">Audit interval (minutes)</label>'+
+        '<p class="small muted" style="margin:4px 0 8px">'+SETTINGS_HELP.audit_interval_min+'</p>'+
+        '<input id="st-audit" type="number" min="5" max="1440" step="5" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)">'+
+      '</div>'+
+      '<div class="card fsec" style="margin-bottom:12px">'+
+        '<label style="font-weight:600">Network gateway</label>'+
+        '<p class="small muted" style="margin:4px 0 8px">'+SETTINGS_HELP.network_gateway+'</p>'+
+        '<select id="st-gw" style="min-width:220px;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)"><option value="">— (not set) —</option></select>'+
+      '</div>'+
+      '<div class="card fsec" style="margin-bottom:12px">'+
+        '<label style="font-weight:600">Admin password</label>'+
+        '<p class="small muted" style="margin:4px 0 8px">'+SETTINGS_HELP.admin_password+'</p>'+
+        '<div class="row" style="gap:8px"><input id="st-apw" type="password" placeholder="new admin password (leave blank to keep)" style="flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--tx)"><button class="act pri" onclick="saveSettings()">Save settings</button></div>'+
+        '<p id="st-apw-state" class="small muted" style="margin-top:6px"></p>'+
+      '</div>'+
+      '<div id="st-result"></div>'+
+    '</div>';
   loadUsers();
+  loadSettings();
+}
+async function loadSettings(){
+  const el=document.getElementById('tab-users');if(!el)return;
+  try{
+    const cfg=await api('/settings').catch(()=>({}));
+    const devs=await api('/devices').catch(()=>[]);
+    const audit=document.getElementById('st-audit');
+    const gw=document.getElementById('st-gw');
+    const apwState=document.getElementById('st-apw-state');
+    if(audit) audit.value=(cfg.audit_interval_min!=null?cfg.audit_interval_min:30);
+    if(gw){
+      const cur=cfg.network_gateway||'';
+      devs.forEach(d=>{ const o=document.createElement('option');o.value=d.id;o.textContent=`${d.name} (${d.host})`;if(String(d.id)===String(cur))o.selected=true;gw.appendChild(o); });
+    }
+    if(apwState){ apwState.textContent=cfg.admin_password_set?'A password is currently set.':'No admin password is set yet.'; }
+  }catch(e){ toast('Could not load settings: '+e.message,true); }
+}
+async function saveSettings(){
+  const auditEl=document.getElementById('st-audit');
+  const gwEl=document.getElementById('st-gw');
+  const apwEl=document.getElementById('st-apw');
+  const result=document.getElementById('st-result');
+  if(!auditEl||!gwEl||!apwEl){ toast('Settings not ready yet',true); return; }
+  const body={ audit_interval_min:parseInt(auditEl.value||0)||30, network_gateway:(gwEl.value===''?null:parseInt(gwEl.value)) };
+  const pw=(apwEl.value||'').trim();
+  if(pw && pw.length<4){ result.innerHTML='<p class="bad small">Admin password must be at least 4 characters (or leave blank to keep current).</p>'; return; }
+  if(pw) body.admin_password=pw;
+  result.innerHTML='<p class="small muted">Saving…</p>';
+  try{
+    await api('/settings',{method:'PUT',body:JSON.stringify(body)});
+    apwEl.value='';
+    result.innerHTML='<p class="small" style="color:var(--ok)">Settings saved.</p>';
+    toast('Settings saved');
+    loadSettings();
+  }catch(e){ result.innerHTML='<p class="bad small">'+esc(String(e.message||e))+'</p>'; toast(String(e),true); }
 }
 async function loadUsers(){
   const el=document.getElementById('user-list');if(!el)return;
