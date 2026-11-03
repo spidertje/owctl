@@ -189,13 +189,13 @@ accept the current state as the new baseline.
 
 ## Testing
 
-A self-contained end-to-end harness (`test_e2e.py`) stands up an in-process
+A self-contained end-to-end harness (`tests/test_e2e.py`) stands up an in-process
 paramiko SSH server (password + SFTP) and an HTTP server emulating LuCI, then
 drives the real code paths (gather over both backends, threat audit, push-key,
 backup, large-output exec, error messaging). No real router or network needed:
 
 ```bash
-.venv/bin/python test_e2e.py     # 33 checks; exits non-zero on any failure
+.venv/bin/python tests/test_e2e.py     # 33 checks; exits non-zero on any failure
 ```
 
 ## Notes on the LuCI backend
@@ -210,8 +210,8 @@ backup, large-output exec, error messaging). No real router or network needed:
 
 - `owctl.py` — backend (94 API routes, scheduler, threat engine)
 - `static/index.html` — dashboard (8 tabs, no build step)
-- `test_e2e.py` — in-process mock-device test harness
-- `checks_*.py` — ~60 focused integration checks (one per feature)
+- `tests/test_e2e.py` — in-process mock-device test harness
+- `tests/checks_*.py` — ~60 focused integration checks (one per feature)
 - `data/` — sqlite DB, config backups, TLS certs, created at runtime
 
 ## Install via Hermes Agent

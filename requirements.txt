@@ -23,5 +23,5 @@ uvicorn>=0.54.0,<0.55
 paramiko>=5.0.0,<6
 bcrypt>=5.0.0,<6
 cryptography>=50.0.1,<51
-# Test-only: starlette TestClient (test_e2e.py, checks_*.py) needs a real httpx.
+# Test-only: starlette TestClient (tests/test_e2e.py, tests/checks_*.py) needs a real httpx.
 httpx>=0.28.1,<0.29
