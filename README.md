@@ -25,11 +25,11 @@
 Single-file backend (FastAPI) + zero-dependency dashboard. Manages multiple
 OpenWrt boxes over **SSH** (primary) or the **LuCI API** (fallback), with
 config-hygiene threat auditing, package upgrades, config backups, LAN sweep,
-and configurable alerting.
+dynamic DNS, mesh WiFi, and configurable alerting.
 
 | | |
 |---|---|
-| ![Devices](docs/screenshot.png) | ![Network features](docs/screenshot-net.png) |
+| ![Home](docs/screenshot.png) | ![Network features](docs/screenshot-net.png) |
 | ![Network Map](docs/screenshot-map.png) | ![Alerting](docs/screenshot-alerts.png) |
 
 ## Philosophy
@@ -60,7 +60,7 @@ The philosophy is **one pane of glass, read by default, write with intent**:
 cd owctl
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python owctl.py                 # http://<this-host>:8090
+python owctl.py                 # https://<this-host>:8090 (TLS auto-generated)
 ```
 
 Useful env:
@@ -70,7 +70,9 @@ Useful env:
 - `OWCTL_TRUST_PROXY` — set `1` only when owctl sits behind a trusted reverse
   proxy. Then the rate limiter keys on the rightmost `X-Forwarded-For` hop
   instead of the (proxy's) TCP address. Leave unset to rate-limit by real IP.
-- `OWCTL_SSL_CERT` / `OWCTL_SSL_KEY` — serve over HTTPS (both must be set).
+- `OWCTL_SSL_CERT` / `OWCTL_SSL_KEY` — serve over HTTPS with your own certs.
+  If both are unset, a self-signed pair is generated at first boot in the data
+  dir (`data/cert.pem` / `data/key.pem`).
 - `OWCTL_RATELIMIT_MAX` / `OWCTL_RATELIMIT_WINDOW` — API rate limit
   (default 120 req / 60 s per client IP).
 - `OWCTL_ALLOW_OPEN` — set `1` to disable auth (dev/tests only).
@@ -84,22 +86,45 @@ Useful env:
   submitted to `POST /api/auth/setup`, which seeds the `admin` account and
   returns a session. `GET /api/auth/status` reports `needs_setup` so the UI
   picks the right screen. After setup, the normal username/password sign-in
-  applies. Two roles: `admin` (everything) and `observer` (read-only). There is
-  no bearer-token back-door.
-- **Device credentials are redacted**: `GET /api/devices` returns
-  `has_ssh_password` / `has_luci_pass` booleans, never the raw passwords.
+  applies. Two roles: `admin` (everything) and `observer` (read-only).
+  There is no bearer-token back-door.
+- **Users**: `GET/POST /api/users`, `PUT/DELETE /api/users/{uid}`,
+  `POST /api/users/me/password-change` — admin can create users with
+  either role; any user can change their own password.
+- **Device credentials are redacted** and encrypted at rest (Fernet via
+  `OWCTL_CRED_KEY`): `GET /api/devices` returns `has_ssh_password` /
+  `has_luci_pass` booleans, never the raw passwords.
 - **Rate limiting** (429 + `Retry-After`) protects the token endpoint from brute force.
 - **Audit log**: mutating requests (POST/PUT/DELETE/PATCH) are recorded —
   method, path, client IP, timestamp, status — readable at `GET /api/audit/api`.
 - **Hardening headers** on every response: `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY`, `Referrer-Policy: same-origin`.
-- **TLS** is optional via `OWCTL_SSL_CERT` / `OWCTL_SSL_KEY`; otherwise serve
+- **TLS** is auto-generated (self-signed) at first boot if no certs are
+  provided; override with `OWCTL_SSL_CERT` / `OWCTL_SSL_KEY`, or serve
   behind a TLS-terminating reverse proxy (Caddy/nginx).
+
+## Dashboard tabs
+
+| Tab | What it does |
+|---|---|
+| **Home** | Fleet overview: device cards with status, uptime, findings badge, pending changes, offline events. |
+| **Devices** | Per-device detail: SSH/LuCI access, packages (opkg list + fleet diff), config history & restore, traffic, bandwidth, reboot, push-key, guest WiFi, WiFi clone, mesh. Subtab: **Sweep** for LAN discovery. |
+| **Threats** | All findings across the fleet, severity-tagged (critical → info), acknowledge individually or in bulk. Re-audit on demand. |
+| **Alerting** | Channel config (Email/SMTP, Telegram, Pushover, Discord, Webhook), minimum severity threshold, alert log, and **Digest** (scheduled summary report). |
+| **Network Map** | SVG topology of devices and interconnections. |
+| **Network** | Sub-sections: VLANs (discover/apply/delete), DHCP (leases, reservations, apply), DNS, QoS/SQM (fq_codel/cake), Firewall (forwards, inter-zone rules, per-zone policies), Routing (static routes, policy routes, BGP), Switch ports & map, Dynamic DNS. |
+| **Device Logs** | Read `/var/log/messages` from any SSH device. |
+| **Users** | Admin-only: list, create, edit, delete users; change own password. |
+
+Global controls: **pending changes** queue (apply/revert per-device),
+**drift** detection vs baseline, **rebaseline** (preview + apply),
+**fleet package upgrade**, **bulk actions**, **uptime** monitor,
+**offline events** feed.
 
 ## Add devices
 
 - **Manual**: Devices tab → + Add device (name, IPv4, role, access mode).
-- **Sweep**: Sweep tab → enter `192.168.1.0/24` or `192.168.1.1-192.168.1.250`;
+- **Sweep**: Sweep subtab → enter `192.168.1.0/24` or `192.168.1.1-192.168.1.250`;
   live hosts come back with port hints; OpenWrt/LuCI boxes are flagged, one-click add.
 
 Access modes:
@@ -108,33 +133,59 @@ Access modes:
 
 ## QoS / SQM
 
-QoS tab (SSH devices only): read live SQM (`luci-app-sqm`) or `nft-qos` config,
-then apply `{enabled, interface, download_kbps, upload_kbps, qdisc (fq_codel|cake), ecn}`
-with optional package auto-install. Applies idempotently via a named `wan` uci
-section, then `uci commit sqm && sqm restart`.
+QoS section (SSH devices only): read live SQM (`luci-app-sqm`) or `nft-qos`
+config, then apply `{enabled, interface, download_kbps, upload_kbps, qdisc
+(fq_codel|cake), ecn}` with optional package auto-install. Applies idempotently
+via a named `wan` uci section, then `uci commit sqm && sqm restart`.
 
 ## Firewall
 
-Firewall tab (SSH devices only): port forwards, inter-zone rules and per-zone
-default policies (input/forward). Reads live `uci show firewall`; applies via
-named uci sections (idempotent re-apply + delete-by-name), then
+Firewall section (SSH devices only): port forwards, inter-zone rules and
+per-zone default policies (input/forward). Reads live `uci show firewall`;
+applies via named uci sections (idempotent re-apply + delete-by-name), then
 `uci commit firewall && fw4 restart`. Saved state is tracked per device for
 diffing against the live box.
 
-![Firewall](docs/screenshot-firewall.png)
+![Network features](docs/screenshot-net.png)
 
 ## Threat engine
 
 Checks per device: telnet enabled, SSH password auth, firewall default
 INPUT/FORWARD=ACCEPT, NTP disabled, clock drift, outdated packages, firmware
-(sysupgrade) updates, WAN down, port forwards, QoS (SQM) not enabled.
-New findings fire alerts once, re-alert if they disappear and return.
-Scheduler re-audits every 30 min (configurable in code via `audit_interval_min`).
+(sysupgrade) updates, WAN down, port forwards, QoS (SQM) not enabled, DNS
+misconfiguration, DHCP misconfig, WiFi/mesh issues, guest WiFi exposure,
+switch port issues, routing anomalies, traffic anomalies, offline/heartbeat,
+dyndns staleness, backup freshness, config drift from baseline, and obsolete
+packages. New findings fire alerts once, re-alert if they disappear and
+return. Scheduler re-audits every 30 min (configurable in code via
+`audit_interval_min`).
 
 ## Alerting
 
-Dashboard (always on), plus optional: Email (SMTP), Telegram (bot token +
-chat_id), and a JSON Webhook. Minimum-severity threshold configurable.
+Dashboard (always on), plus optional channels:
+- **Email** (SMTP)
+- **Telegram** (bot token + chat_id)
+- **Pushover** (user key + app token)
+- **Discord** (webhook URL)
+- **JSON Webhook** (any URL)
+
+Minimum-severity threshold configurable. **Digest** reports: `POST /api/digest`
+generates a fleet-wide summary; `PUT /api/alerts/config` schedules it on a
+cron expression.
+
+## Pending changes & drift
+
+Mutations via the UI are **staged**, not immediate: they land in a pending
+queue (`GET /api/pending`, `POST /api/pending/apply`). Each device tracks its
+baseline config; `GET /api/drift` shows what has changed since the last
+rebaseline. `GET /api/rebaseline/preview` + `POST /api/rebaseline/apply`
+accept the current state as the new baseline.
+
+## Dynamic DNS
+
+`GET /api/dyndns` lists configured ddns entries; `POST /api/dyndns` adds one;
+`POST /api/dyndns/{eid}/force` triggers an immediate update;
+`DELETE /api/dyndns/{eid}` removes.
 
 ## Testing
 
@@ -157,10 +208,11 @@ backup, large-output exec, error messaging). No real router or network needed:
 
 ## Files
 
-- `owctl.py` — backend (API + scheduler)
-- `static/index.html` — dashboard
+- `owctl.py` — backend (94 API routes, scheduler, threat engine)
+- `static/index.html` — dashboard (8 tabs, no build step)
 - `test_e2e.py` — in-process mock-device test harness
-- `data/` — sqlite DB, config backups, created at runtime
+- `checks_*.py` — ~60 focused integration checks (one per feature)
+- `data/` — sqlite DB, config backups, TLS certs, created at runtime
 
 ## Install via Hermes Agent
 
@@ -173,11 +225,11 @@ git clone https://github.com/spidertje/owctl.git
 cd owctl
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python owctl.py            # dashboard on http://<host>:8090
+.venv/bin/python owctl.py            # dashboard on https://<host>:8090
 ```
 
 Hermes-friendly run modes (terminal tool):
-- Foreground while working: `terminal(command="cd owctl && .venv/bin/python owctl.py", background=true)` — the agent then opens `http://<host>:8090` via the browser tool, adds devices, pushes SSH keys, and configures alerting through the UI or the JSON API.
+- Foreground while working: `terminal(command="cd owctl && .venv/bin/python owctl.py", background=true)` — the agent then opens `https://<host>:8090` via the browser tool, adds devices, pushes SSH keys, and configures alerting through the UI or the JSON API.
 - Persistent daemon: see **ROBUSTNESS.md** — `./launch.sh` (any OS, auto-restart on crash), `com.spidertje.owctl.plist` (macOS launchd), or `owctl.service` (Linux systemd). The app also logs to `<data dir>/owctl.log` (rotating), serves `GET /api/health` for liveness, auto-backs up the DB each cycle, and exits with a human-readable reason (exit code 2/3/4) on a bad start instead of a bare traceback.
 
 Agent workflow after boot:
@@ -185,7 +237,7 @@ Agent workflow after boot:
 2. `POST /api/devices/{id}/test` to verify credentials surface immediately.
 3. `POST /api/devices/{id}/push-key` so subsequent access is key-only.
 4. `POST /api/devices/{id}/check` to run the threat audit; review `GET /api/findings`.
-5. `PUT /api/alerts/config` to enable Email / Telegram / Webhook channels.
-6. Auth is password-login only: `POST /api/auth/login` sets the admin password
-   on first boot and returns a 24h session token; send it as
+5. `PUT /api/alerts/config` to enable Email / Telegram / Pushover / Discord / Webhook channels.
+6. Auth is password-login only: `POST /api/auth/setup` on first boot sets the
+   admin password and returns a 24h session token; send it as
    `Authorization: Bearer *** on subsequent `/api/*` calls.
