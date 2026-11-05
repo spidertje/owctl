@@ -44,8 +44,12 @@ check("nonexistent.invalid -> verified required", f("nonexistent.invalid") is Fa
 # a loopback hostname (resolves to 127.0.0.1) stays unverified-ok
 check("localhost -> unverified ok", f("localhost") is True)
 
-# The policy is actually wired into both CERT_NONE sites:
-src = open(os.path.join(BASE, "owctl.py"), encoding="utf-8").read()
+# The policy is actually wired into both CERT_NONE sites. The backend is now
+# the ``owctl`` package (owctl.py is a shim); the two call sites live in
+# luci.py and sweep.py, with the policy def in luci.py.
+src = ""
+for _mod in ("owctl/luci.py", "owctl/sweep.py"):
+    src += open(os.path.join(BASE, _mod), encoding="utf-8").read()
 cert_none_sites = src.count("ctx.verify_mode = ssl.CERT_NONE")
 gates = src.count("_unverified_tls_ok(")  # 1 def + 2 call sites
 check("exactly the 2 CERT_NONE sites remain (both now gated)", cert_none_sites == 2, f"CERT_NONE sites={cert_none_sites}")

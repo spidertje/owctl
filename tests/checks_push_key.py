@@ -69,6 +69,11 @@ def _fake_ssh_test(d):
 owctl._ssh_connect = _fake_connect
 owctl._exec_capture = _fake_exec
 owctl.ssh_test = _fake_ssh_test
+# push_ssh_key resolves ssh_test from its own module (owctl.operations), so
+# patch there too — otherwise the real ssh_test runs and its exec command
+# overwrites captured["cmd"].
+import owctl.operations as _ops  # noqa: E402
+_ops.ssh_test = _fake_ssh_test
 
 r = owctl.push_ssh_key(dict(dev))
 cmd = captured.get("cmd", "")
