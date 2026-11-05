@@ -41,6 +41,17 @@ _ADMIN_ONLY_PATHS = {
     "/api/devices/{did}/routes", "/api/devices/{did}/routes/delete",
     "/api/devices/{did}/policy-routes", "/api/devices/{did}/bgp",
     "/api/routes/apply", "/api/routes/delete",
+    # Explicitly categorized 2026-11-05 (audit info finding): every mutating
+    # route is now listed here OR in _OBSERVER_OK_POST — token_guard's
+    # deny-by-default still protects, but an explicit list is auditable and
+    # survives future middleware refactors. tests/checks_route_roles.py
+    # fails if a mutating route is ever added without being categorized.
+    "/api/devices/{did}/mesh", "/api/devices/{did}/packages/remove",
+    "/api/devices/{did}/switch-ports",
+    "/api/dhcp/reserve", "/api/vlans/delete", "/api/pending/apply",
+    "/api/dyndns", "/api/dyndns/{eid}", "/api/dyndns/{eid}/force",
+    "/api/firewall/{did}/rule/{name}", "/api/firewall/{did}/forward/{name}",
+    "/api/users", "/api/users/{uid}",
 }
 
 
@@ -125,8 +136,16 @@ def _ensure_default_admin():
 
 
 def _normalize_path(pattern):
-    """/api/devices/{did} -> regex for /api/devices/123."""
-    return re.sub(r"/\{[^/}]+\}", "/[^/]+", re.escape(pattern)) + r"$"
+    """/api/devices/{did} -> regex for /api/devices/123.
+
+    The {param} placeholders are substituted BEFORE escaping the rest —
+    re.escape('{') emits '\\{' which the substitution below would never see,
+    so escaping-first-then-substituting silently broke every parameterized
+    entry (observer-allowed /api/devices/{did}/check never matched)."""
+    parts = re.split(r"(/\{[^/}]+\})", pattern)
+    out = ["/[^/]+" if re.fullmatch(r"/\{[^/}]+\}", p) else re.escape(p)
+         for p in parts]
+    return "".join(out) + "$"
 
 
 _ADMIN_ONLY_RE = [re.compile(_normalize_path(p)) for p in _ADMIN_ONLY_PATHS]
