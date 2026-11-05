@@ -143,12 +143,20 @@ def _exec_capture(client, cmd, timeout=300):
     chan = client.get_transport().open_session()
     chan.exec_command(cmd)
     out_q, err_q = [], []
+    # Cap output so a runaway remote command (cat a 200MB log) cannot OOM us.
+    _CAP = 8 * 1024 * 1024
+
+    def _count(q):
+        return sum(len(b) for b in q)
 
     def drain(f, q):
         try:
             while True:
                 b = f.read(65536)
                 if not b:
+                    break
+                if _count(q) >= _CAP:
+                    q.append(b"[owctl: output truncated at 8MB]")
                     break
                 q.append(b)
         except Exception:

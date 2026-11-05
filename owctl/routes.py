@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from fastapi import FastAPI, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -254,7 +255,7 @@ async def rebaseline_apply(request: Request):
             continue
         dev = cur[0]
         try:
-            out = owctl.do_rebaseline(dev, packages, sysupgrade=sysupgrade)
+            out = await run_in_threadpool(owctl.do_rebaseline, dev, packages, sysupgrade=sysupgrade)
             results.append({"device_id": did, "name": dev["name"], "ok": True,
                             "output": out[-4000:]})
         except Exception as e:
@@ -570,7 +571,7 @@ async def device_restore(request: Request, did: int):
     if not path:
         raise HTTPException(400, "backup path required")
     try:
-        return owctl.do_restore(cur[0], path)
+        return await run_in_threadpool(owctl.do_restore, cur[0], path)
     except HTTPException:
         raise
     except Exception as e:
@@ -592,13 +593,16 @@ async def apply_vlan(request: Request):
     apply = d.get("apply") is not False  # True unless explicitly false
     if not vlan_id or not devices:
         raise HTTPException(400, "vlan_id and devices required")
+    # Validate BEFORE the per-device loop so mocks/SSH never see a raw value
+    # (injection choke point: vlan_id lands in uci shell text on the device).
+    vlan_id = owctl._valid_vlan_id(vlan_id)
     results = []
     for did in devices:
         cur = owctl.q("SELECT * FROM devices WHERE id=?", (did,))
         if not cur:
             continue
         try:
-            r = owctl.do_vlan(cur[0], vlan_id, name, subnet, dhcp, devices, router_id, apply=apply)
+            r = await run_in_threadpool(owctl.do_vlan, cur[0], vlan_id, name, subnet, dhcp, devices, router_id, apply=apply)
             results.append(r)
         except Exception as e:
             results.append({"device": cur[0]["name"], "ok": False, "error": str(e)})
@@ -634,6 +638,7 @@ async def delete_vlan(request: Request):
     vlan_id = d.get("vlan_id")
     if not vlan_id:
         raise HTTPException(400, "vlan_id required")
+    vlan_id = owctl._valid_vlan_id(vlan_id)
     apply = d.get("apply") is not False
     devs = [int(x) for x in (d.get("devices") or [])]
     if not devs:
@@ -648,7 +653,7 @@ async def delete_vlan(request: Request):
         if not cur:
             continue
         try:
-            r = owctl.do_vlan_delete(cur[0], vlan_id, apply=apply)
+            r = await run_in_threadpool(owctl.do_vlan_delete, cur[0], vlan_id, apply=apply)
             owctl.delete_vlan_membership(vlan_id, did)
             results.append(r)
         except Exception as e:
@@ -688,7 +693,7 @@ async def add_route_endpoint(request: Request, did: int):
     apply = d.get("apply") is not False
     if not dst or not via:
         raise HTTPException(400, "dst and via are required")
-    r = owctl.do_route(dev, dst, via, metric, iface, apply=apply)
+    r = await run_in_threadpool(owctl.do_route, dev, dst, via, metric, iface, apply=apply)
     row = owctl.q("SELECT id FROM routes WHERE dst=? AND policy='default'", (dst,))
     if row:
         owctl._record_route_realization(row[0]["id"], dev["id"], "applied" if apply else "pending")
@@ -705,7 +710,7 @@ async def delete_route_endpoint(request: Request, did: int):
     apply = d.get("apply") is not False
     if not dst:
         raise HTTPException(400, "dst is required")
-    return owctl.do_route_delete(dev, dst, iface, apply=apply)
+    return await run_in_threadpool(owctl.do_route_delete, dev, dst, iface, apply=apply)
 
 
 @owctl.app.post("/api/devices/{did}/policy-routes")
@@ -722,7 +727,7 @@ async def policy_route_endpoint(request: Request, did: int):
     apply = d.get("apply") is not False
     if not (match_dst and route_dst and via):
         raise HTTPException(400, "match_dst, route_dst and via are required")
-    return owctl.do_policy_route(dev, table, match_dst, route_dst, via, iface, apply=apply)
+    return await run_in_threadpool(owctl.do_policy_route, dev, table, match_dst, route_dst, via, iface, apply=apply)
 
 
 @owctl.app.post("/api/devices/{did}/bgp")
@@ -737,7 +742,7 @@ async def bgp_endpoint(request: Request, did: int):
     apply = d.get("apply") is not False
     if not peers:
         raise HTTPException(400, "at least one BGP peer is required")
-    return owctl.do_bgp(dev, asn, peers, apply=apply)
+    return await run_in_threadpool(owctl.do_bgp, dev, asn, peers, apply=apply)
 
 
 @owctl.app.get("/api/routes")
@@ -791,7 +796,7 @@ async def fleet_routes_apply(request: Request):
             results.append({"device_id": did, "name": "?", "ok": False, "error": "unknown device"})
             continue
         try:
-            r = owctl.do_route(cur[0], dst, via, metric, None, apply=apply)
+            r = await run_in_threadpool(owctl.do_route, cur[0], dst, via, metric, None, apply=apply)
             owctl._record_route_realization(rid, did, "applied" if apply else "pending")
             results.append({"device_id": did, "name": cur[0]["name"], "ok": True, **r})
         except Exception as e:
@@ -823,7 +828,7 @@ async def fleet_routes_delete(request: Request):
         if not cur:
             continue
         try:
-            owctl.do_route_delete(cur[0], dst, None, apply=apply)
+            await run_in_threadpool(owctl.do_route_delete, cur[0], dst, None, apply=apply)
             if rid:
                 owctl.execute("DELETE FROM routes_devices WHERE route_id=? AND device_id=?", (rid, did))
             results.append({"device_id": did, "name": cur[0]["name"], "ok": True})
@@ -931,7 +936,7 @@ async def apply_dhcp(request: Request):
         "ipv6": {k: v for k, v in ip6.items() if v not in (None, "")},
     }
 
-    c = owctl._ssh_connect(dev)
+    c = await run_in_threadpool(owctl._ssh_connect, dev)
     try:
         apply = d.get("apply") is not False
         if enabled:
@@ -993,9 +998,9 @@ async def get_dhcp_leases(request: Request):
     dev = cur[0]
     if dev["access"] != "ssh":
         raise HTTPException(400, "DHCP leases require SSH access")
-    c = owctl._ssh_connect(dev)
+    c = await run_in_threadpool(owctl._ssh_connect, dev)
     try:
-        _, out, _ = owctl._exec_capture(c, "cat /tmp/dhcp.leases 2>/dev/null", timeout=10)
+        _, out, _ = await run_in_threadpool(owctl._exec_capture, c, "cat /tmp/dhcp.leases 2>/dev/null", timeout=10)
         leases = []
         for line in out.strip().splitlines():
             p = line.split()
@@ -1022,9 +1027,9 @@ async def dhcp_known_devices(request: Request):
         raise HTTPException(400, "known-devices requires SSH access")
     leases = []
     try:
-        c = owctl._ssh_connect(dev)
+        c = await run_in_threadpool(owctl._ssh_connect, dev)
         try:
-            _, out, _ = owctl._exec_capture(c, "cat /tmp/dhcp.leases 2>/dev/null", timeout=10)
+            _, out, _ = await run_in_threadpool(owctl._exec_capture, c, "cat /tmp/dhcp.leases 2>/dev/null", timeout=10)
         finally:
             c.close()
         leases = owctl.parse_dhcp_leases(out)
@@ -1116,9 +1121,9 @@ async def dhcp_reserve(request: Request):
     else:
         new_leases = owctl.merge_leases(current, name, mac, ip)
     cmd = owctl.build_lease_cmds(iface, new_leases, apply=apply)
-    c = owctl._ssh_connect(dev)
+    c = await run_in_threadpool(owctl._ssh_connect, dev)
     try:
-        out, err_out, status = owctl._exec_capture(c, cmd, timeout=60)
+        out, err_out, status = await run_in_threadpool(owctl._exec_capture, c, cmd, timeout=60)
         if status != 0:
             raise RuntimeError(f"reservation failed on {dev['name']}: {(err_out or out).strip()[:200]}")
         owctl.set_pending(dev, "dhcp", apply)
@@ -1155,10 +1160,10 @@ async def apply_dns(request: Request):
     servers = [s for s in raw_servers if s != "router"]
     if not raw_servers:
         raise HTTPException(400, "provide at least one upstream server (or 'router' for local-only)")
-    c = owctl._ssh_connect(dev)
+    c = await run_in_threadpool(owctl._ssh_connect, dev)
     try:
         # ponytail: backend detection by uci keys; add other backends here if seen.
-        detect, _e, _s = owctl._exec_capture(c, "uci show dhcp 2>/dev/null; true", timeout=30)
+        detect, _e, _s = await run_in_threadpool(owctl._exec_capture, c, "uci show dhcp 2>/dev/null; true", timeout=30)
         # odhcpd (OpenWrt 22.03+) runs DHCP when a section has dhcpv4='server'
         backend = "odhcpd" if re.search(r"^dhcp\.\w+\.dhcpv4='?server'?$", detect, re.M) else "dnsmasq"
         apply = d.get("apply") is not False
@@ -1235,7 +1240,7 @@ async def qos_apply(request: Request):
         "qdisc": d.get("qdisc") or "fq_codel",
         "ecn": bool(d.get("ecn", False)),
     }
-    owctl.do_qos(dev, cfg, install_if_missing=bool(d.get("install_if_missing", False)),
+    await run_in_threadpool(owctl.do_qos, dev, cfg, install_if_missing=bool(d.get("install_if_missing", False)),
            apply=d.get("apply") is not False)
     owctl.execute("""INSERT INTO qos(device_id, enabled, interface, download_kbps, upload_kbps, qdisc, ecn, ts)
                VALUES(?,?,?,?,?,?,?,?)
@@ -1265,7 +1270,7 @@ async def firewall_apply(request: Request):
     kind = (d.get("kind") or "").strip()
     if kind == "forward":
         rule = d.get("rule") or {}
-        owctl.do_fw_forward(dev, rule, apply=apply)
+        await run_in_threadpool(owctl.do_fw_forward, dev, rule, apply=apply)
         owctl.execute("""INSERT INTO fw_rules(device_id, kind, name, proto, src_dport, dest_ip, dest_port, ts)
                    VALUES(?,?,?,?,?,?,?,?)
                    ON CONFLICT(device_id, kind, name) DO UPDATE SET proto=excluded.proto,
@@ -1276,7 +1281,7 @@ async def firewall_apply(request: Request):
                  rule.get("dest_port"), owctl.now()))
     elif kind == "rule":
         rule = d.get("rule") or {}
-        owctl.do_fw_rule(dev, rule, apply=apply)
+        await run_in_threadpool(owctl.do_fw_rule, dev, rule, apply=apply)
         owctl.execute("""INSERT INTO fw_rules(device_id, kind, name, src_zone, dst_zone, target, ts)
                    VALUES(?,?,?,?,?,?,?)
                    ON CONFLICT(device_id, kind, name) DO UPDATE SET src_zone=excluded.src_zone,
@@ -1286,7 +1291,7 @@ async def firewall_apply(request: Request):
     elif kind == "zone":
         zone = (d.get("zone") or "").strip()
         policies = d.get("policies") or {}
-        owctl.do_zone_policy(dev, zone, policies, apply=apply)
+        await run_in_threadpool(owctl.do_zone_policy, dev, zone, policies, apply=apply)
     else:
         raise HTTPException(400, "kind must be one of: forward, rule, zone")
     return {"ok": True, "device": dev["name"], "kind": kind}
@@ -1366,7 +1371,7 @@ async def apply_switch_ports(request: Request, did: int):
     vlan_id = d.get("vlan_id")
     if not vlan_id:
         raise HTTPException(400, "vlan_id required")
-    r = owctl.do_vlan_port(dev, d.get("switch", "switch0"), vlan_id,
+    r = await run_in_threadpool(owctl.do_vlan_port, dev, d.get("switch", "switch0"), vlan_id,
                      d.get("ports") or [], d.get("tag"), apply=apply)
     return r
 
@@ -1504,7 +1509,7 @@ async def fleet_upgrade(request: Request):
             continue
         dev = cur[0]
         try:
-            out = owctl.do_upgrade(dev, packages)
+            out = await run_in_threadpool(owctl.do_upgrade, dev, packages)
             results.append({"device_id": did, "name": dev["name"], "ok": True,
                             "output": out[-4000:]})
         except Exception as e:
@@ -1549,7 +1554,7 @@ async def device_guest_wifi(request: Request, did: int):
     apply = d.get("apply") is not False
     if method == "delete":
         # Delete guest WiFi config
-        c = owctl._ssh_connect(cur[0])
+        c = await run_in_threadpool(owctl._ssh_connect, cur[0])
         try:
             iface_name = f"guest_{ssid.replace(' ', '_').replace('-', '_')}" if ssid else None
             if not iface_name:
@@ -1568,7 +1573,7 @@ async def device_guest_wifi(request: Request, did: int):
     if not ssid or not password:
         raise HTTPException(400, "ssid and password required")
     try:
-        return owctl.do_guest_wifi(cur[0], ssid, password, vlan_id, apply=apply)
+        return await run_in_threadpool(owctl.do_guest_wifi, cur[0], ssid, password, vlan_id, apply=apply)
     except HTTPException:
         raise
     except Exception as e:
@@ -1615,9 +1620,9 @@ async def wifi_clone(request: Request, did: int):
     apply = body.get("apply") is not False
     if not targets:
         raise HTTPException(400, "target_ids required")
-    c = owctl._ssh_connect(src)
+    c = await run_in_threadpool(owctl._ssh_connect, src)
     try:
-        out, _e, _s = owctl._exec_capture(c, "uci show wireless 2>/dev/null", timeout=10)
+        out, _e, _s = await run_in_threadpool(owctl._exec_capture, c, "uci show wireless 2>/dev/null", timeout=10)
     finally:
         c.close()
     ifaces = [i for i in owctl._parse_wifi_ifaces(out) if i.get("mode") == "ap" or not i.get("mode")]
@@ -1641,7 +1646,7 @@ async def wifi_clone(request: Request, did: int):
                                 "detail": "target has no wireless radios"})
                 continue
             applied, skipped = [], []
-            cc = owctl._ssh_connect(t)
+            cc = await run_in_threadpool(owctl._ssh_connect, t)
             try:
                 # Resolve each source iface to a target radio and build its uci
                 # script (no commit yet). Bandless sources are reported, not
@@ -1675,7 +1680,7 @@ async def wifi_clone(request: Request, did: int):
                     # are safe to re-upsert (idempotent re-clone).
                     safe = []
                     for ssid, radio, slug, cmd in plans:
-                        o, _e, _st = owctl._exec_capture(cc,
+                        o, _e, _st = await run_in_threadpool(owctl._exec_capture, cc,
                             f"uci -q get wireless.{slug} 2>/dev/null", timeout=15)
                         typ = (o or "").strip()
                         if typ and typ != "wifi-iface":
@@ -1685,7 +1690,7 @@ async def wifi_clone(request: Request, did: int):
                     if safe:
                         tail = "uci commit wireless\n" + ("wifi reload\n" if apply else "")
                         script = "".join(p[3] for p in safe) + tail
-                        o, e, st = owctl._exec_capture(cc, script, timeout=60)
+                        o, e, st = await run_in_threadpool(owctl._exec_capture, cc, script, timeout=60)
                         if st != 0:
                             for ssid, radio, slug, _cmd in safe:
                                 skipped.append(f"{ssid} (uci failed: {(e or o)[:80]})")
@@ -1737,7 +1742,7 @@ async def device_mesh(request: Request, did: int):
         raise HTTPException(400, f"invalid mesh id {cfg['mesh_id']!r}")
     apply = d.get("apply") is not False
     try:
-        return owctl.do_mesh(cur[0], cfg, apply=apply)
+        return await run_in_threadpool(owctl.do_mesh, cur[0], cfg, apply=apply)
     except HTTPException:
         raise
     except Exception as e:
@@ -1776,7 +1781,7 @@ async def device_upgrade(request: Request, did: int):
     d = await request.json()
     pkgs = d.get("packages") or []
     try:
-        return {"output": owctl.do_upgrade(cur[0], pkgs)}
+        return {"output": await run_in_threadpool(owctl.do_upgrade, cur[0], pkgs)}
     except HTTPException:
         raise
     except Exception as e:
@@ -1890,7 +1895,7 @@ def get_traffic_history(did: int):
 @owctl.app.get("/api/devices/{did}/bandwidth")
 def get_bandwidth(did: int):
     """Calculate current Mbps from latest traffic samples."""
-    rows = owctl.q("SELECT ts, iface, rx_bytes, tx_bytes FROM traffic_samples WHERE device_id=? ORDER BY ts DESC", (did,))
+    rows = owctl.q("SELECT ts, iface, rx_bytes, tx_bytes FROM traffic_samples WHERE device_id=? ORDER BY ts DESC LIMIT 200", (did,))
     if len(rows) < 2:
         return {"ifaces": {}}
     by_iface = {}
@@ -1930,11 +1935,11 @@ async def bulk_actions(request: Request):
         dev = cur[0]
         try:
             if action == "check":
-                owctl.check_device(dev)
+                await run_in_threadpool(owctl.check_device, dev)
             elif action == "backup":
-                owctl.do_backup(dev)
+                await run_in_threadpool(owctl.do_backup, dev)
             elif action == "reboot":
-                owctl.do_reboot(dev)
+                await run_in_threadpool(owctl.do_reboot, dev)
             results.append({"id": did, "name": dev["name"], "ok": True})
             owctl.log_action(dev, action or 'unknown', '', ok=True)
         except Exception as e:
@@ -2007,10 +2012,10 @@ def alerts_log():
 async def api_digest(request: Request):
     d = await request.json()
     dry_run = bool(d.get("dry_run"))
-    subject, body = owctl.build_digest()
+    subject, body = await run_in_threadpool(owctl.build_digest)
     if dry_run:
         return {"subject": subject, "body": body}
-    result = owctl.send_digest()
+    result = await run_in_threadpool(owctl.send_digest)
     return {"subject": subject, "body": body, **result}
 
 
@@ -2075,6 +2080,8 @@ async def auth_setup(request: Request):
     confirm = (d.get("confirm") or "").strip()
     if len(password) < 4:
         raise HTTPException(status_code=400, detail="password must be at least 4 characters")
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="password must be at most 72 bytes (UTF-8)")
     if password != confirm:
         raise HTTPException(status_code=400, detail="passwords do not match")
     # Seed the default admin if not present, then set the password.
@@ -2149,11 +2156,11 @@ async def users_create(request: Request):
     role = (d.get("role") or "observer").strip()
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password required")
-    # Same min-length as first-boot setup, self-service password-change, and the
-    # dashboard: a 1-3 char password is accepted here but rejected on every other
-    # password-setting path, so an admin could mint a trivially weak account.
-    if len(password) < 4:
-        raise HTTPException(status_code=400, detail="password must be at least 4 characters")
+    # Same policy as first-boot setup, self-service password-change, and the
+    # dashboard: min 4 chars, max 72 bytes (bcrypt truncation guard).
+    err = owctl._password_policy_error(password)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
     if role not in owctl._ROLES:
         raise HTTPException(status_code=400, detail=f"role must be one of {owctl._ROLES}")
     if owctl._user_by_username(username):
@@ -2177,15 +2184,36 @@ async def users_update(uid: int, request: Request):
     if "enabled" in d:
         updates["enabled"] = int(bool(d["enabled"]))
     if "password" in d and d["password"]:
-        updates["password_hash"] = owctl._hash_password(d["password"])
+        pw = str(d["password"])
+        err = owctl._password_policy_error(pw)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        updates["password_hash"] = owctl._hash_password(pw)
     if updates:
         owctl.execute(f"UPDATE users SET {', '.join(k+'=?' for k in updates)} WHERE id=?",
                 (*updates.values(), uid))
+    if "password_hash" in updates:
+        # credential changed: every existing session for this user is now stale
+        owctl.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    if updates.get("enabled") == 0:
+        # disabled account: drop its live sessions too
+        owctl.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
     return {"ok": True}
 
 
 @owctl.app.delete("/api/users/{uid}")
 def users_delete(uid: int):
+    # Never allow deleting the last enabled admin: that would silently re-seed
+    # a passwordless 'admin' on next boot (first-boot seeding fires when the
+    # users table is empty), i.e. an accidental lockout/reset of all access.
+    victim = owctl._user_by_id(uid)
+    if victim is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    if victim["role"] == "admin" and victim["enabled"]:
+        rows = owctl.q("SELECT id FROM users WHERE role='admin' AND enabled=1")
+        if len(rows) <= 1:
+            raise HTTPException(400, detail="cannot delete the last enabled admin")
+    owctl.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
     owctl.execute("DELETE FROM users WHERE id=?", (uid,))
     return {"ok": True}
 
@@ -2240,6 +2268,10 @@ async def users_me_password_change(request: Request):
     if not new_password:
         raise HTTPException(status_code=400, detail="new_password required")
     
+    err = owctl._password_policy_error(new_password)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    
     # Verify current password
     if not caller.get("password_hash") or not owctl._verify_password(current_password, caller["password_hash"]):
         raise HTTPException(status_code=400, detail="current password is incorrect")
@@ -2248,11 +2280,14 @@ async def users_me_password_change(request: Request):
     if len(new_password) < 4:
         raise HTTPException(status_code=400, detail="new password must be at least 4 characters")
     
-    # Update the caller's password
+    # Update the caller's password — and kill every session for this user so
+    # an old token cannot survive a credential change (login + self-change +
+    # admin reset all invalidate sessions now).
     new_hash = owctl._hash_password(new_password)
     owctl.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, caller["id"]))
-    
-    return {"ok": True}
+    owctl.execute("DELETE FROM sessions WHERE user_id=?", (caller["id"],))
+
+    return {"ok": True, "relogin_required": True}
 
 
 @owctl.app.put("/api/settings")
@@ -2261,7 +2296,13 @@ async def settings_put(request: Request):
     if "audit_interval_min" in d:
         owctl.set_setting("audit_interval_min", str(int(d["audit_interval_min"])))
     if "admin_password" in d and d["admin_password"]:
+        ap_err = owctl._password_policy_error(str(d["admin_password"]))
+        if ap_err:
+            raise HTTPException(400, ap_err)
         owctl.set_setting("admin_password_hash", owctl._hash_password(d["admin_password"]))
+        # credential changed: every session for every admin is now stale
+        for _r in owctl.q("SELECT id FROM users WHERE role='admin'"):
+            owctl.execute("DELETE FROM sessions WHERE user_id=?", (_r["id"],))
     if "network_gateway" in d:
         v = d["network_gateway"]
         if v in (None, ""):

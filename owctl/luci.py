@@ -23,6 +23,13 @@ def _luci_schemes(host):
         except Exception:
             pass
     owctl._LUCI_SCHEMES[host] = open_schemes or ["https", "http"]
+    if "http" in owctl._LUCI_SCHEMES[host] and "https" not in owctl._LUCI_SCHEMES[host]:
+        # HTTPS closed but 80 open: Basic-auth creds will travel in cleartext.
+        # This is a real credential exposure on LAN — make it visible in the
+        # log so an operator can fix the device, not a silent downgrade.
+        logging.getLogger("owctl").warning(
+            "LuCI %s: only HTTP is open — device credentials sent over plaintext "
+            "for this host; enable HTTPS on the device to protect them", host)
     return owctl._LUCI_SCHEMES[host]
 
 

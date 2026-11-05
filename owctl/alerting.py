@@ -26,6 +26,21 @@ DEFAULT_ALERTS = {
 }
 
 
+def _chan_fail(name, e):
+    """Channel-failure marker for alert_log WITHOUT leaking secrets.
+
+    urllib/SMTP exception strings can embed the full request URL, which for
+    these channels contains credentials (telegram bot token in the path,
+    webhook/discord URLs are bearer secrets, SMTP errors can echo the host).
+    Keep the class name + a redacted message only.
+    """
+    msg = str(e)
+    # belt-and-braces: strip URL userinfo/paths and obvious token shapes
+    msg = re.sub(r"https?://[^\s'\"]*", "[url]", msg)
+    msg = re.sub(r"[A-Za-z0-9_-]{6,32}:[A-Za-z0-9_-]{20,}", "[cred]", msg)
+    return f"{name}:FAIL({type(e).__name__}: {msg[:200]})"
+
+
 def get_alert_cfg():
     raw = owctl.get_setting("alerts", "")
     merged = json.loads(json.dumps(DEFAULT_ALERTS))
@@ -80,7 +95,7 @@ def fire_alert(dev, finding):
                 s.send_message(msg)
             used.append("email")
         except Exception as e:
-            used.append(f"email:FAIL({e})")
+            used.append(_chan_fail("email", e))
     tg = ch.get("telegram") or {}
     if tg.get("enabled") and tg.get("token") and tg.get("chat_id"):
         try:
@@ -92,7 +107,7 @@ def fire_alert(dev, finding):
                 r.read()
             used.append("telegram")
         except Exception as e:
-            used.append(f"telegram:FAIL({e})")
+            used.append(_chan_fail("telegram", e))
     wh = ch.get("webhook") or {}
     if wh.get("enabled") and wh.get("url"):
         try:
@@ -103,7 +118,7 @@ def fire_alert(dev, finding):
                 r.read()
             used.append("webhook")
         except Exception as e:
-            used.append(f"webhook:FAIL({e})")
+            used.append(_chan_fail("webhook", e))
     nf = ch.get("ntfy") or {}
     if nf.get("enabled") and nf.get("topic"):
         try:
@@ -117,7 +132,7 @@ def fire_alert(dev, finding):
                 r.read()
             used.append("ntfy")
         except Exception as e:
-            used.append(f"ntfy:FAIL({e})")
+            used.append(_chan_fail("ntfy", e))
     po = ch.get("pushover") or {}
     if po.get("enabled") and po.get("token") and po.get("user_key"):
         try:
@@ -131,7 +146,7 @@ def fire_alert(dev, finding):
                 r.read()
             used.append("pushover")
         except Exception as e:
-            used.append(f"pushover:FAIL({e})")
+            used.append(_chan_fail("pushover", e))
     dc = ch.get("discord") or {}
     if dc.get("enabled") and dc.get("webhook_url") and dc["webhook_url"].startswith("https://"):
         try:
@@ -143,7 +158,7 @@ def fire_alert(dev, finding):
                 r.read()
             used.append("discord")
         except Exception as e:
-            used.append(f"discord:FAIL({e})")
+            used.append(_chan_fail("discord", e))
     if used:
         owctl.execute("UPDATE alert_log SET channels=? WHERE id=?", (",".join(used), log_id))
     return used

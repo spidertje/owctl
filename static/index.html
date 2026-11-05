@@ -852,7 +852,7 @@ async function renderConsistency(box){
         const diffs=Object.entries(l.differs).map(([k,v])=>`${k}: <strong>${esc(String(v))}</strong>`).join(' · ');
         return `<div class="small" style="margin:3px 0"><strong>${esc(l.name)}</strong> <span class="muted">${esc(l.host)}</span> — ${diffs}</div>`;
       }).join('');
-      el.innerHTML=`<div class="muted small">Baseline: ${bl.join(' · ')||'—'}</div>
+      el.innerHTML=`<div class="muted small">Baseline: ${esc(bl.join(' · '))||'—'}</div>
         <div class="muted small" style="margin-top:4px">${pv.lagging.length} device(s) lagging:</div>${lag}`;
     }
   }catch(e){/* preview is best-effort */}
@@ -2639,7 +2639,7 @@ async function renderDns(target){
       const dnsBox = document.getElementById('dns-results');
       if(dns.live && (dns.live.servers?.length || dns.live.resolver)){
         const live=dns.live;
-        dnsBox.innerHTML = `<div class="card"><h3>Live DNS (${router.name})</h3>
+        dnsBox.innerHTML = `<div class="card"><h3>Live DNS (${esc(router.name)})</h3>
           <div class="kv"><span>Resolver</span><span><b>${esc(live.resolver||'none detected')}</b></span></div>
           ${live.dhcp?`<div class="kv"><span>DHCP → clients</span><span><b>${esc(live.dhcp.servers?.join(', ')||'none')}</b></span></div>`:''}
           ${live.dhcp?.search_domains?.length?`<div class="kv"><span>DHCP search</span><span>${esc(live.dhcp.search_domains.join(', '))}</span></div>`:''}
@@ -2754,7 +2754,7 @@ async function applyDns(apply=true){
   try{
     toast('Applying DNS ('+scope+')...');
     const r=await api('/dns/apply',{method:'POST',body:JSON.stringify({did:parseInt(did),servers,search_domains,scope,apply})});
-    document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>${apply?'DNS applied':'DNS saved (not applied)'}</strong> on ${r.device}: ${r.servers.join(', ')}</div>`;
+    document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--ok)"><strong>${apply?'DNS applied':'DNS saved (not applied)'}</strong> on ${esc(r.device)}: ${esc(r.servers.join(', '))}</div>`;
     refreshPendingBadge();
   }catch(e){
     document.getElementById('dns-results').innerHTML=`<div class="card" style="border-color:var(--bad)">${esc(e.message||e)}</div>`;
@@ -3475,7 +3475,10 @@ async function submitMyPass(){
   try{
     await api('/users/me/password-change',{method:'POST',body:JSON.stringify({current_password:cur,new_password:nw})});
     document.getElementById('pass-modal').remove();
-    toast('Password updated');
+    // server rotates sessions on password change -> re-auth with the new password
+    localStorage.removeItem('owctl_session'); TOKEN='';
+    toast('Password updated — please log in again');
+    showLogin && showLogin();
   }catch(e){err.textContent=e.message||String(e);go.disabled=false;}
 }
 async function resetUserPass(uid){

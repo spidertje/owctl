@@ -56,6 +56,15 @@ check("observer login with NEW password -> 200", r.status_code == 200, f"{r.stat
 r = client.post("/api/auth/login", json={"username": "obs", "password": "obs-pw-123"})
 check("observer login with OLD password -> 401", r.status_code == 401, f"{r.status_code}")
 
+# The fix ALSO killed the caller's live session (password-change rotates
+# sessions): the old token must now be rejected. Then re-login to keep
+# exercising role enforcement with a fresh token.
+r = client.get("/api/devices", headers=H_obs)
+check("old session dead after own password change -> 401", r.status_code == 401, f"{r.status_code}")
+r = client.post("/api/auth/login", json={"username": "obs", "password": "obs-new-456"})
+check("observer re-login with NEW password -> 200", r.status_code == 200, f"{r.status_code}")
+H_obs = {"Authorization": "Bearer " + (r.json() or {}).get("session", "")}
+
 # --- Observer is still DENIED a genuinely admin-only mutation ---
 r = client.post("/api/bulk", json={"action": "check", "devices": []}, headers=H_obs)
 check("observer denied admin-only /api/bulk -> 403", r.status_code == 403, f"{r.status_code}")

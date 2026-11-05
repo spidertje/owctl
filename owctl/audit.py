@@ -445,11 +445,15 @@ def _store_device_cred(value: str) -> str:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         key = _load_cred_key()
         if not key:
+            logging.getLogger("owctl").warning(
+                "credential encryption unavailable (no key); storing device credential in plaintext")
             return value
         nonce = secrets.token_bytes(12)
         ct = AESGCM(key).encrypt(nonce, str(value).encode(), None)
         return _ENC_PREFIX + base64.b64encode(nonce + ct).decode()
-    except Exception:
+    except Exception as e:
+        logging.getLogger("owctl").warning(
+            "credential encryption failed (%s); storing device credential in plaintext", e)
         return value
 
 

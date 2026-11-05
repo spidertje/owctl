@@ -1,0 +1,232 @@
+{
+  "findings": [
+    {
+      "id": "sql-injection-1",
+      "severity": "info",
+      "category": "sql-injection",
+      "title": "All SQL queries use parameterized ? placeholders",
+      "file": "owctl/db.py",
+      "line": "39,48",
+      "evidence": "q() and execute() use c.execute(sql, args) with ? markers; no f-strings/% formatting near SQL statements",
+      "impact": "No risk of SQL injection from user input",
+      "recommendation": "Maintain parameterized queries — already correctly done"
+    },
+    {
+      "id": "sql-injection-2",
+      "severity": "medium",
+      "category": "sql-injection",
+      "title": "Dynamic column names in UPDATE users via f-string",
+      "file": "owctl/routes.py",
+      "line": "2182",
+      "evidence": "owctl.execute(f\"UPDATE users SET ... WHERE id=?\", ...); column names k come from request body dict keys allowed only from static keys",
+      "impact": "If key-allowlist is expanded unvalidated, could inject column names",
+      "recommendation": "Add explicit allowlist validation for column keys before f-string construction"
+    },
+    {
+      "id": "missing-fk-devices",
+      "severity": "high",
+      "category": "schema",
+      "title": "No FOREIGN KEY constraints on device deletion; orphaned rows persist",
+      "file": "owctl/db.py",
+      "line": "498-500",
+      "evidence": "delete_device() only deletes from active_findings and devices; rows remain in device_status, device_heartbeats, offline_events, backups, log_entries, config_history, config_hashes, traffic_samples, owctl_actions, fw_rules, dhcp, dns, qos, pending_applies, vlans_devices, routes_devices",
+      "impact": "Deleting a device leaves orphaned audit/traffic/status rows; referential integrity not enforced",
+      "recommendation": "Add CASCADE FKs or application-level cleanup on device delete, or schedule orphan-prune job"
+    },
+    {
+      "id": "missing-index-heartbeats",
+      "severity": "medium",
+      "category": "schema",
+      "title": "Missing index on device_heartbeats(device_id, ts)",
+      "file": "owctl/db.py",
+      "line": "26-33",
+      "evidence": "CREATE TABLE device_heartbeats has no index on device_id; frequent lookups by device_id will be O(n) without index",
+      "impact": "Slow heartbeat writes/reads as DB grows; scheduler contention",
+      "recommendation": "CREATE INDEX idx_device_heartbeats_device_ts ON device_heartbeats(device_id, ts)"
+    },
+    {
+      "id": "missing-index-traffic",
+      "severity": "medium",
+      "category": "schema",
+      "title": "Missing index on traffic_samples(device_id, iface, ts)",
+      "file": "owctl/db.py",
+      "line": "104-106",
+      "evidence": "traffic_samples table has no composite index; queries routinely filter by device_id + order by ts DESC LIMIT 48",
+      "impact": "Traffic chart data becomes slow as sample count grows; prune also slow",
+      "recommendation": "CREATE INDEX idx_traffic_device_iface_ts ON traffic_samples(device_id, iface, ts)"
+    },
+    {
+      "id": "missing-index-logentries",
+      "severity": "medium",
+      "category": "schema",
+      "title": "Missing index on log_entries(device_id, ts)",
+      "file": "owctl/db.py",
+      "line": "96-98",
+      "evidence": "log_entries table has no index on device_id; frequent queries by device_id for log display are table-scans",
+      "impact": "Slow log viewing on devices with many entries",
+      "recommendation": "CREATE INDEX idx_logentries_device_ts ON log_entries(device_id, ts)"
+    },
+    {
+      "id": "missing-index-offlineevents",
+      "severity": "medium",
+      "category": "schema",
+      "title": "Missing index on offline_events(device_id, went_offline)",
+      "file": "owctl/db.py",
+      "line": "110-112",
+      "evidence": "offline_events table has no index on device_id; retention prune and lookups by device offline status are table-scans",
+      "impact": "Slow prune and device status queries as offline events accumulate",
+      "recommendation": "CREATE INDEX idx_offline_events_device_ts ON offline_events(device_id, went_offline)"
+    },
+    {
+      "id": "timestamp-comparison-text",
+      "severity": "medium",
+      "category": "schema",
+      "title": "TEXT timestamp column comparison semantics in retention prune",
+      "file": "owctl/maintenance.py",
+      "line": "104",
+      "evidence": "cut = datetime.now(timezone.utc) - timedelta(days=keep_days); then DELETE WHERE ts < ?; ts columns are TEXT type — lexicographic comparison works only because all timestamps use identical format",
+      "impact": "If any row has non-standard timestamp format, prune will silently skip it or delete incorrectly",
+      "recommendation": "Store timestamps in INTEGER epoch format or add CHECK constraint on format; normalize on insert"
+    },
+    {
+      "id": "wals-network-fs",
+      "severity": "info",
+      "category": "schema",
+      "title": "WAL mode on network filesystem",
+      "file": "owctl/db.py",
+      "line": "26-31",
+      "evidence": "PRAGMA journal_mode=WAL + busy_timeout=10000; WAL can fail on some network filesystems (code catches OperationalError and falls back to rollback mode)",
+      "impact": "Backup or concurrent access on NFS/AEFS may raise OperationalError silently; DB works in rollback mode but without WAL benefits",
+      "recommendation": "Test WAL on target filesystem; if unreliable, keep rollback mode or use file-level locking"
+    },
+    {
+      "id": "connection-per-call-leak",
+      "severity": "high",
+      "category": "database",
+      "title": "Connection-per-call pattern with global _LOCK; potential bottlenecks",
+      "file": "owctl/db.py",
+      "line": "21-51",
+      "evidence": "q() opens c = db(), executes, c.commit(), c.close(); same for execute(). _LOCK is a single global threading.Lock() held for every call — under high concurrency (200 thread pool) all DB I/O is serialized, becoming a bottleneck",
+      "impact": "DB I/O serialized by _LOCK; under load this caps throughput. No connection leak per se, but GC pressure from many short-lived connections.",
+      "recommendation": "Consider aiosqlite or real connection pool; or keep current pattern but document that _LOCK must be released promptly"
+    },
+    {
+      "id": "check_same_thread_misuse",
+      "severity": "info",
+      "category": "database",
+      "title": "check_same_thread=False with global _LOCK",
+      "file": "owctl/db.py",
+      "line": "26",
+      "evidence": "c = sqlite3.connect(owctl.DB_PATH, check_same_thread=False, timeout=10); the global _LOCK serializes all access so single-threadedness is enforced externally"
+    },
+    {
+      "id": "prune-backup-race",
+      "severity": "medium",
+      "category": "maintenance",
+      "title": "_backup_lock + _last_backup_at race in _db_backup",
+      "file": "owctl/maintenance.py",
+      "line": "44-55",
+      "evidence": "TOCTOU gap between time check and lock acquire — two threads could both pass the time check before either acquires the lock",
+      "impact": "Concurrent backups could both proceed if they race past the time check; may exceed 14-copy retention briefly",
+      "recommendation": "Make the time check and lock acquisition atomic, or use a single-threaded scheduler for backups"
+    },
+    {
+      "id": "prune-delete-wrong-rows",
+      "severity": "high",
+      "category": "maintenance",
+      "title": "traffic pruning deleted wrong rows (global LIMIT vs per-interface)",
+      "file": "owctl/routing.py",
+      "line": "819-823",
+      "evidence": "Old prune used no PARTITION BY iface; new code uses ROW_NUMBER() OVER (PARTITION BY device_id, iface ORDER BY ts DESC) WHERE rn <= 48 — per-interface cap. Tested in checks_traffic_prune.py.",
+      "impact": "Old code on multi-interface device would keep only 48 rows total across all interfaces",
+      "recommendation": "The fix is already in place (partition by iface); keep the per-interface partition"
+    },
+    {
+      "id": "prune-backup-dir-traversal",
+      "severity": "high",
+      "category": "maintenance",
+      "title": "Path traversal risk in _resolve_backup_path (already fixed)",
+      "file": "owctl/operations.py",
+      "line": "132-147",
+      "evidence": "_resolve_backup_path resolves symlinks with os.path.realpath and checks real != root and not real.startswith(root + os.sep)",
+      "impact": "If realpath check were broken, arbitrary file read via backup restore path",
+      "recommendation": "The current code already has the fix; keep the realpath + startswith guard"
+    },
+    {
+      "id": "backup-throttle-skipped-too-often",
+      "severity": "info",
+      "category": "maintenance",
+      "title": "Backup throttled to 1/hour; old 30-min cycle filled 14-copy retention in ~7h",
+      "file": "owctl/maintenance.py",
+      "line": "32-51",
+      "evidence": "BACKUP_MIN_INTERVAL_S = 3600 (1h); old default 30 min filled 14-copy retention in ~7h; new 1h interval extends to ~7 days before 14 copies are filled",
+      "impact": "Less frequent backups means longer window of data loss if DB corrupts; but retention pruning no longer fills disk",
+      "recommendation": "Keep 1h interval; if tighter RPO needed, reduce BACKUP_MIN_INTERVAL_S and increase 14-copy retention count"
+    },
+    {
+      "id": "tls-self-signed-default-cn",
+      "severity": "low",
+      "category": "deployment",
+      "title": "Self-signed cert SAN uses 127.0.0.1 + configured host + localhost/owctl/owctl.local",
+      "file": "owctl/__init__.py",
+      "line": "213-233",
+      "evidence": "When no OWCTL_SSL_CERT/KEY set, _gen_selfsigned generates cert with SAN covering 127.0.0.1, the bind host if concrete IP, and DNS names localhost/owctl/owctl.local",
+      "impact": "LAN clients reaching http://<host>:8090 will get cert mismatch unless they use one of the SAN names or IP",
+      "recommendation": "In production, always set OWCTL_SSL_CERT/KEY to CA-signed cert; use OWCTL_SSL_CN to customize the CN if needed"
+    },
+    {
+      "id": "unquoted-env-launchsh",
+      "severity": "medium",
+      "category": "deployment",
+      "title": "Unquoted env var expansion in PYTHON launcher",
+      "file": "launch.sh",
+      "line": "39",
+      "evidence": "PYTHON=\"${PYTHON:-.venv/bin/python}\" — if PYTHON env var contains spaces or special chars, word-splitting could fail",
+      "impact": "Rare; typical deployments use simple paths without spaces",
+      "recommendation": "Quote the expansions; add defensive quoting if paths may contain spaces"
+    },
+    {
+      "id": "private-tmp-not-in-service-unit",
+      "severity": "low",
+      "category": "deployment",
+      "title": "systemd service lacks PrivateUsers and ReadOnlyDirectories hardening",
+      "file": "owctl.service",
+      "line": "24-44",
+      "evidence": "Unit has NoNewPrivileges=true, ProtectHome=true, PrivateTmp=true but missing ReadOnlyDirectories and ResolvConfUpdate=false; also no LockPersonality=true",
+      "impact": "Reduced sandbox; an exploit could write more freely",
+      "recommendation": "Add ReadOnlyDirectories=/opt/data/owctl, ProtectSystem=strict, and LockPersonality=true if running on newer systemd"
+    },
+    {
+      "id": "git-secrets-in-repo",
+      "severity": "critical",
+      "category": "deployment",
+      "title": "data/ (including owctl.db, cert.pem, key.pem) not in .gitignore tracked files",
+      "file": ".gitignore",
+      "line": "1-7",
+      "evidence": ".gitignore lists .venv/, venv/, __pycache__/, *.pyc but does NOT list data/; cert.pem, key.pem, owctl.db are under data/ and may be committed to git history",
+      "impact": "Database secrets, private keys, and full DB state could be exposed in git; any clone gets full credentials and data",
+      "recommendation": "Add data/ to .gitignore and git rm --cached data/ if already tracked; or better: keep certs/DB outside repo entirely"
+    }
+  ],
+  "strengths": [
+    "All SQL queries use parameterized ? placeholders — no f-string/% formatting near dynamic data",
+    "_prune_backup_copies keeps exactly 14 newest DB snapshots via VACUUM INTO + prune",
+    "_resolve_backup_path confines restore to BACKUP_DIR with realpath + startswith guard preventing path traversal",
+    "Retention prune bounds 5 unbounded tables with keep_days and lexicographic ts comparison",
+    "WAL + busy_timeout=10s prevents reader-writer blocking on SQLite",
+    "Global exception handler returns structured 500 JSON + full traceback to log",
+    "Thread pool bumped 40→200 via anyio on live uvicorn event loop",
+    "LRU eviction in rate limiter (not blanket clear()) prevents DoS window from burst of distinct IPs",
+    "Graceful shutdown: SIGTERM/SIGINT sets _shutdown_event; scheduler exits promptly",
+    "Startup diagnostics runs before uvicorn.bind — human-readable exit reasons (port, dir, TLS)",
+    "launch.sh + systemd + launchd all provide auto-restart on crash with backoff",
+    "Requirements pinned with upper caps (e.g. fastapi<0.142) to prevent breaking major updates",
+    "Token bearer auth + rate limiter on /api/ surface; OWCTL_ALLOW_OPEN=1 only dev flag",
+    "Security headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy) on every response",
+    "api_audit middleware records every mutating API call (who/when/what/result)",
+    "Self-signed cert generation with proper SAN (127.0.0.1 + host + localhost/owctl/owctl.local)",
+    "VACUUM INTO backup is consistent snapshot even while server runs",
+    "delete_device cleanup of active_findings shows awareness of cross-table cascade need",
+    "Per-interface traffic sample prune fix (partition by iface) after regression test in checks_traffic_prune.py"
+  ]
+}

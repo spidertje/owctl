@@ -300,9 +300,24 @@ async def token_guard(request, call_next):
 async def security_headers(request, call_next):
     """Hardening headers on every response (API + static) + audit mutating API calls."""
     response = await call_next(request)
+    path = request.url.path
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
+    # CSP: the dashboard is same-origin + one inline <script> block, so
+    # 'unsafe-inline' for script/style is unavoidable without hashing the
+    # block — but object/frame/worker 'none' and default-src 'self' mean an
+    # injected payload cannot exfiltrate to an external host or load
+    # remote scripts. connect-src 'self' blocks fetch() beaconing to evil.com.
+    # Upgrade to a nonce/hash CSP if the inline script is ever externalized.
+    if not path.startswith(("/docs", "/openapi.json")):
+        # Swagger UI (docs) loads scripts/styles from a CDN — CSP there would
+        # break it; the docs page holds no secrets and is read-only.
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; frame-ancestors 'none'; object-src 'none'; "
+            "base-uri 'none'; form-action 'self'")
     # Security: record mutating API requests (who/when/what, with result) for accountability.
     path = request.url.path
     if request.method in ("POST", "PUT", "DELETE", "PATCH") and path.startswith("/api/"):
@@ -404,6 +419,7 @@ _SESSION_TTL = _authmod._SESSION_TTL
 _OBSERVER_OK_POST = _authmod._OBSERVER_OK_POST
 _ADMIN_ONLY_PATHS = _authmod._ADMIN_ONLY_PATHS
 _hash_password = _authmod._hash_password
+_password_policy_error = _authmod._password_policy_error
 _verify_password = _authmod._verify_password
 ensure_admin_password = _authmod.ensure_admin_password
 _user_by_id = _authmod._user_by_id
@@ -520,6 +536,7 @@ do_backup = _operationsmod.do_backup
 _resolve_backup_path = _operationsmod._resolve_backup_path
 do_restore = _operationsmod.do_restore
 vlan_delete_cmds = _operationsmod.vlan_delete_cmds
+_valid_vlan_id = _operationsmod._valid_vlan_id
 delete_vlan_membership = _operationsmod.delete_vlan_membership
 do_rebaseline = _operationsmod.do_rebaseline
 do_vlan = _operationsmod.do_vlan
@@ -739,6 +756,15 @@ def main():
     _scheme = "https" if _tls else "http"
     logger.info("starting owctl: %s://%s:%s%s — log: %s", _scheme, HOST, PORT,
                 " (TLS)" if _tls else "", LOG_PATH or "(console only)")
+    # Least-privilege file perms: the DB holds (encrypted) device creds and
+    # usernames, the log can contain device details — keep both off other
+    # users' accounts. Only tightens; never loosens.
+    for _p in (DB_PATH, LOG_PATH):
+        try:
+            if _p and os.path.exists(_p):
+                os.chmod(_p, 0o640)
+        except Exception:
+            pass  # perms are hardening, not load-bearing
     print(f"owctl: {_scheme}://{HOST}:{PORT}" + (f" (TLS, log: {LOG_PATH})" if _tls else f" (log: {LOG_PATH})"))
     try:
         uvicorn.run(app, host=HOST, port=PORT, log_level="info", limit_concurrency=1000, **_tls)

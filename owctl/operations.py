@@ -182,12 +182,30 @@ def do_restore(dev, backup_path):
         raise RuntimeError(f"restore failed: {e}") from e
 
 
+def _valid_vlan_id(v):
+    """Coerce a user-supplied vlan_id to an int VLAN id in 1..4094 or raise 400.
+
+    do_vlan/do_vlan_delete/do_vlan_port interpolate vlan_id into uci shell
+    scripts — this is the injection choke point: only an int survives.
+    """
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(400, "vlan_id must be an integer (1-4094)")
+    if not 1 <= n <= 4094:
+        raise HTTPException(400, "vlan_id must be in 1-4094")
+    return n
+
+
 def do_vlan(dev, vlan_id, name, subnet, dhcp, devices, router_id, apply: bool = True):
     """Apply VLAN config to a device. router_id is the device that will act as router.
     apply=False commits the network/dhcp/firewall sections without restarting the
     daemons (LuCI 'Save'); apply=True (default) also restarts them so the VLAN is live."""
     if dev["access"] != "ssh":
         raise HTTPException(400, "VLAN config requires SSH access")
+    # Injection choke point: everything below interpolates vlan_id into uci
+    # shell text, so normalize to the int form once, here.
+    vlan_id = _valid_vlan_id(vlan_id)
     c = owctl._ssh_connect(dev)
     try:
         is_router = dev["id"] == router_id
@@ -275,6 +293,7 @@ def vlan_delete_cmds(vlan_id):
 def do_vlan_delete(dev, vlan_id, apply: bool = True):
     """Remove a VLAN's config from one device (network/dhcp/firewall sections).
     apply=False commits deletions without restarting (LuCI 'Save')."""
+    vlan_id = _valid_vlan_id(vlan_id)
     if dev["access"] != "ssh":
         raise HTTPException(400, "VLAN delete requires SSH access")
     vid = int(vlan_id)

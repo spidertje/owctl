@@ -45,7 +45,23 @@ _ADMIN_ONLY_PATHS = {
 
 
 def _hash_password(password: str) -> str:
+    # bcrypt silently truncates input at 72 bytes; callers must reject longer
+    # passwords instead (see _password_policy_error).
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+
+def _password_policy_error(password: str):
+    """Return a 400-detail string when a password violates policy, else None.
+
+    - min 4 chars (matches setup/change/create/dashboard)
+    - bcrypt truncates at 72 bytes, so cap explicitly rather than silently
+      hashing a truncated secret.
+    """
+    if len(password) < 4:
+        return "password must be at least 4 characters"
+    if len(password.encode("utf-8")) > 72:
+        return "password must be at most 72 bytes (UTF-8)"
+    return None
 
 
 def _verify_password(password: str, hashed: str) -> bool:

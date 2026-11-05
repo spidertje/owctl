@@ -208,6 +208,23 @@ def init_db():
         execute("UPDATE devices SET role=lower(role) WHERE role IS NOT NULL AND role != lower(role)")
     except sqlite3.OperationalError:
         pass
+    # Hot-path indexes (idempotent): findings/heartbeats/status lookups by
+    # device, and the retention prunes' ts scans. CREATE TABLE above already
+    # covers PRIMARY KEY/PK cases, so only plain single-column helpers here.
+    for _idx in (
+        "CREATE INDEX IF NOT EXISTS idx_findings_device_id ON findings(device_id)",
+        "CREATE INDEX IF NOT EXISTS idx_findings_ts ON findings(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_api_audit_ts ON api_audit(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_traffic_device_ts ON traffic_samples(device_id, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_heartbeats_device_ts ON device_heartbeats(device_id, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_offline_device_ts ON offline_events(device_id, went_offline)",
+        "CREATE INDEX IF NOT EXISTS idx_config_history_device_ts ON config_history(device_id, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_actions_ts ON owctl_actions(ts)",
+    ):
+        try:
+            execute(_idx)
+        except sqlite3.OperationalError:
+            pass  # corrupt index state must never block startup; tables still work
 
 
 def log_action(device, action, detail='', ok=None, error=''):

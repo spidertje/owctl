@@ -22,6 +22,7 @@ def _scheduler():
     cycle = 0
     while not owctl._shutdown_event.is_set():
         cycle += 1
+        cycle_started = time.monotonic()
         logger.info("scheduler cycle %d: starting (audit + maintenance)", cycle)
         # 1) digest scheduling (daily|weekly|never). The digest CONTENT is
         #    untouched — build_digest + send_digest are the same path the
@@ -42,19 +43,9 @@ def _scheduler():
         # 2) maintenance: DB backup + retention, every cycle
         owctl._db_backup()
         owctl._prune_retention()
-        # 3) audit loop (sleep in small chunks so shutdown stays responsive)
-        try:
-            interval_min = max(5, int(owctl.get_setting("audit_interval_min", "30") or 30))
-        except Exception:
-            interval_min = 30
-        slept = 0
-        while slept < interval_min * 60 and not owctl._shutdown_event.is_set():
-            time.sleep(min(5, interval_min * 60 - slept))
-            slept += 5
-        if owctl._shutdown_event.is_set():
-            logger.info("scheduler: shutdown requested, exiting loop")
-            break
-        online = offline = errors = 0
+        # 3) audit the fleet (serial; per-device try/except so one bad device
+        #    never kills the pass).
+        online = offline = 0
         for dev in owctl.q("SELECT * FROM devices WHERE access IN ('ssh','luci')"):
             try:
                 st = owctl.gather(dev)
@@ -69,4 +60,17 @@ def _scheduler():
                 offline += 1
                 logger.info("audit: %s (%s) failed: %s", dev.get("name"), dev.get("host"), e)
         logger.info("scheduler cycle %d: audit done — %d online, %d offline", cycle, online, offline)
+        # 4) sleep until the next cycle, measured from the CYCLE START
+        #    (monotonic): a slow audit pass shortens the sleep instead of
+        #    stretching the interval, so the configured audit_interval_min
+        #    stays accurate regardless of fleet size (the old `slept += 5`
+        #    loop drifted by the full pass duration every cycle). Sleep in
+        #    small chunks so shutdown (SIGTERM/Ctrl-C) stays responsive.
+        try:
+            interval_min = max(5, int(owctl.get_setting("audit_interval_min", "30") or 30))
+        except Exception:
+            interval_min = 30
+        deadline = cycle_started + interval_min * 60
+        while time.monotonic() < deadline and not owctl._shutdown_event.is_set():
+            time.sleep(min(5, max(0.1, deadline - time.monotonic())))
     logger.info("scheduler stopped (cycle %d)", cycle)
